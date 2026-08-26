@@ -1,0 +1,23 @@
+# 敏感配置(含 QQ token,不入库)
+.env
+.mcp.json
+.claude/
+
+# 运行时数据(群消息记录 / 日志 / 抽卡状态)
+agent/inbox.jsonl
+agent/processed.jsonl
+agent/daily_card.json
+agent/listener.log
+agent/*.log
+agent/tmp_*.json
+
+# SnowLuma 第三方运行时 + QQ 数据 + 日志(重装/保留本地即可)
+tools/
+
+# 卡牌卡库(体积大,可随时联网更新)
+agent/ygocard/cards.json
+agent/ygocard/cards.zip
+downloads/
+
+# 临时文件
+*.tmp

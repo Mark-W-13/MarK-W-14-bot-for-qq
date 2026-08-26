@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "snowluma-qq": {
+      "command": "npx",
+      "args": ["-y", "@snowluma/mcp"],
+      "env": {
+        "SNOWLUMA_MCP_ENDPOINT": "http://127.0.0.1:3000/",
+        "SNOWLUMA_MCP_TOKEN": "<填写 agent/.env 中的 API_TOKEN>",
+        "SNOWLUMA_MCP_MODE": "write",
+        "SNOWLUMA_MCP_STREAM_DIR": "<本地 downloads 目录,如 C:/path/mc_agent/downloads>"
+      }
+    }
+  }
+}
