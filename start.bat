@@ -17,25 +17,29 @@ echo ================================================
 
 rem ---- 1. SnowLuma backend ----
 echo [1/3] Checking SnowLuma ...
-netstat -ano | findstr ":3000 .*LISTENING" >nul 2>&1
+netstat -ano -p tcp | findstr /c:":3000 " | findstr /c:"LISTENING" >nul 2>&1
 if not errorlevel 1 goto snowluma_ok
 echo       Starting SnowLuma ...
+rem NO auto-inject: only the bot QQ window (3757588606) may hold the hook;
+rem it is loaded once via WebUI, then SnowLuma adopts the pipe on start
 start "SnowLuma" /min cmd /c "cd /d %DIR%tools\snowluma && node ./index.mjs"
 set /a tries=0
 :wait_snowluma
-ping -n 2 127.0.0.1 >nul
-netstat -ano | findstr ":3000 .*LISTENING" >nul 2>&1
+ping -n 1 127.0.0.1 >nul
+netstat -ano -p tcp | findstr /c:":3000 " | findstr /c:"LISTENING" >nul 2>&1
 if not errorlevel 1 goto snowluma_ok
 set /a tries+=1
 if %tries% lss 30 goto wait_snowluma
-echo       [WARN] SnowLuma not ready in 60s, check tools\snowluma\logs
-goto check_listener
+echo       [WARN] SnowLuma not ready, check tools\snowluma\logs
+goto monitor_check
 :snowluma_ok
 echo       SnowLuma running (port 3000/3001)
 
+:monitor_check
 rem ---- 2. monitor console ----
 echo [2/3] Checking monitor ...
-powershell -NoProfile -Command "if (Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'node.exe' -and $_.CommandLine -like '*monitor.mjs*' }) { exit 0 } else { exit 1 }" >nul 2>&1
+rem check by process commandline, not window title (tasklist /v title is unreliable)
+wmic process where "name='node.exe' and commandline like '%%monitor.mjs%%'" get processid 2>nul | findstr /r "[0-9]" >nul
 if not errorlevel 1 (
   echo       monitor already running
 ) else (
@@ -46,10 +50,10 @@ if not errorlevel 1 (
 
 rem ---- 3. login status ----
 echo [3/3] Checking QQ login status ...
-rem for /f 自动去除行尾 CR,%%b 即为纯 token 值
+rem for /f strips trailing CR, %%b is the plain token value
 for /f "usebackq tokens=1,* delims==" %%a in ("%DIR%agent\.env") do if "%%a"=="API_TOKEN" set TOKEN=%%b
 if not defined TOKEN goto no_token
-curl -s --max-time 3 -H "Authorization: Bearer %TOKEN%" http://127.0.0.1:3000/get_login_info
+curl -s --max-time 2 -H "Authorization: Bearer %TOKEN%" http://127.0.0.1:3000/get_login_info
 echo.
 goto login_done
 :no_token

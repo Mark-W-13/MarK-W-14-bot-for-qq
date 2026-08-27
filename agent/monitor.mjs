@@ -14,7 +14,9 @@ import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import readline from 'node:readline';
-import { queryAndFormat, reloadCards, getCardsPath, extractZipCardJson, loadCards, formatCard } from './ygocard/ygocard.mjs';
+import { queryAndFormat, reloadCards, getCardsPath, extractZipCardJson, loadCards, formatCard, searchCards, cardImageSegment } from './ygocard/ygocard.mjs';
+import { downloadImages } from './ygocard/download_images.mjs';
+import { pickShit, buildCardHtml, buildVideoCardHtml, pickVideoShit, renderCard, pngToSegment, appendShitVideo, addToBlacklist, removeFromShitVideos } from './shitpost/shitpost.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -39,9 +41,14 @@ if (!WS_TOKEN || !API_TOKEN) {
 const BOT_ID = (process.env.BOT_ID || '3757588606').toString();
 const TRIGGER_KEYWORD = process.env.TRIGGER_KEYWORD || '史记总结'; // 史记体触发词
 const CARD_TRIGGER = process.env.CARD_TRIGGER || '效果';            // 查卡触发词:「效果 」后跟卡名
+const CARD_IMG_TRIGGER = process.env.CARD_IMG_TRIGGER || '卡图';     // 查卡图触发词:「卡图 」后跟卡名(只发图)
 const DAILY_KEYWORD = process.env.DAILY_KEYWORD || '每日一卡';      // 每日一卡触发词(同 id 24h 内不换卡)
+const SHIT_TRIGGER = process.env.SHIT_TRIGGER || '随机一搬';        // 搬屎触发词:纯规则筛选,发截图
+const SHIT_AI_TRIGGER = process.env.SHIT_AI_TRIGGER || '精选一搬';  // 搬屎触发词:规则粗筛 + AI 精挑
+const SHIT_ENABLED = process.env.SHIT_ENABLED === '1';              // 搬屎功能总开关(默认关闭,暂不上线)
+const SHIT_EXAMPLES_PATH = process.env.SHIT_EXAMPLES_PATH
+  || 'C:/Users/hp/.claude/projects/C--Users-hp-Desktop---mc-agent/memory/shitpost-examples.md'; // 搬屎记忆样本库
 const DAILY_STATE_FILE = join(__dirname, 'daily_card.json');
-const DAILY_WINDOW_MS = 24 * 3600 * 1000;
 const INBOX = join(__dirname, 'inbox.jsonl');
 const PROCESSED = join(__dirname, 'processed.jsonl');
 const POLL_MS = 15000;          // 处理队列轮询间隔
@@ -80,14 +87,18 @@ function loadProcessed() {
   return s;
 }
 
+// bot 昵称集合(纯文本 @ 识别用):启动时从登录信息拉取,昵称变更后无需改代码
+let botNicknames = new Set(['测试bot.fd']);
+
 function isMentioningBot(ev) {
   if (ev.post_type !== 'message' || ev.message_type !== 'group') return false;
   if (String(ev.user_id) === BOT_ID) return false;
   if ((ev.message || []).some(s => s.type === 'at' && String(s.data?.qq) === BOT_ID)) return true;
   if (new RegExp(`\\[CQ:at,qq=${BOT_ID}(?:,[^\\]]*)?\\]`).test(ev.raw_message || '')) return true;
-  // 纯文本 @(QQ 端手动输入「@昵称」时没有 at 段,只有 text):@测试bot.fd 或 @BOT_ID
+  // 纯文本 @(QQ 端手动输入「@昵称」时没有 at 段,只有 text):@机器人昵称 或 @BOT_ID
   const raw = ev.raw_message || (ev.message || []).map(s => s.data?.text || '').join('');
-  return new RegExp(`@\\s*(?:${BOT_ID}|测试bot\\.fd)`).test(raw);
+  const nicks = [...botNicknames].map(n => n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
+  return new RegExp(`@\\s*(?:${BOT_ID}|${nicks})`).test(raw);
 }
 
 async function api(action, params) {
@@ -219,6 +230,14 @@ async function updateCardDb() {
     renameSync(tmp, path);                           // 原子替换(失败不会损坏旧卡库)
     const n = reloadCards();
     log(`卡库更新完成: ${n} 张卡 → ${path}`, '', C.green);
+    // 卡图同步更新:卡库文件已换新,补下载新卡/缺失卡图(已有自动跳过,增量很快)
+    try {
+      log('卡图更新:下载缺失卡图(跳过已有)...', '', C.cyan);
+      const img = await downloadImages();
+      log(`卡图更新完成: 新增 ${img.ok} 张, 失败 ${img.fail} 张, 已有 ${img.skipped} 张, 用时 ${img.elapsedSec}s`, '', C.green);
+    } catch (e) {
+      log('卡图更新失败:', e.message, C.red);   // 不影响卡库本身
+    }
   } catch (e) {
     log('卡库更新失败:', e.message, C.red);
   } finally {
@@ -226,28 +245,36 @@ async function updateCardDb() {
   }
 }
 
-// ---------- 发送回复(at 触发者 + 正文) ----------
-async function sendReply(entry, text) {
+// ---------- 发送回复(at 触发者 + 正文;message 可为字符串或消息段数组,如含图片段) ----------
+async function sendReply(entry, message) {
+  // 兼容三种形态: 字符串(文本) / 段数组(如文本+图片) / 单个段对象(如仅图片)
+  const segs = Array.isArray(message)
+    ? message
+    : typeof message === 'string'
+      ? [{ type: 'text', data: { text: '\n' + message } }]
+      : [message];
   if (DRY_RUN) {
-    log(`  [DRY_RUN] 不发送: ${text.split('\n')[0].slice(0, 50)} ...`, '', C.yellow);
+    const first = segs.find(s => s.type === 'text')?.data?.text || '(图片)';
+    log(`  [DRY_RUN] 不发送: ${first.split('\n')[0].slice(0, 50)} ...`, '', C.yellow);
     return;
   }
   const r = await api('send_group_msg', {
     group_id: entry.group_id,
     message: [
       { type: 'at', data: { qq: String(entry.user_id) } },
-      { type: 'text', data: { text: '\n' + text } },
+      ...segs,
     ],
   });
   if (r.status !== 'ok') throw new Error(`发送失败: ${JSON.stringify(r).slice(0, 120)}`);
   log('  已发送', `message_id=${r.data?.message_id}`, C.green);
+  return r.data?.message_id;                        // 供反馈机制关联
 }
 
-// ---------- 卡牌查询(纯本地,无 AI) ----------
-// 触发:「效果 」后跟卡名(须带空白,防「效果怪兽」等误触发);返回 { triggered, raw }
-function extractCardQuery(entry) {
+// ---------- 卡牌/卡图查询(纯本地,无 AI) ----------
+// 触发:「效果 」/「卡图 」后跟卡名(须带空白,防「效果怪兽」等误触发);返回 { triggered, raw }
+function extractCardQuery(entry, trigger = CARD_TRIGGER) {
   const text = (entry.text || '').replace(/\[at\]/g, ' ');   // at 段标记
-  const m = text.match(new RegExp(`${CARD_TRIGGER}[\\s　]+([\\s\\S]*)`));
+  const m = text.match(new RegExp(`${trigger}[\\s　]+([\\s\\S]*)`));
   return { triggered: !!m, raw: m ? m[1].trim() : '' };
 }
 
@@ -262,7 +289,31 @@ async function processCardQuery(entry, raw) {
   appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
 }
 
-// ---------- 每日一卡(同 id 24h 内重复申请返回同一张) ----------
+// ---------- 卡图查询(与「效果」同一检索逻辑,只发对应卡图) ----------
+async function processCardImageQuery(entry, raw) {
+  log(`  查卡图「${raw}」...`, '', C.dim);
+  const hit = searchCards(raw, 5)[0];               // 同一套多关键词 AND 打分,取最匹配
+  if (!hit) {
+    const text = `未找到与「${raw}」相关的卡牌。可试试:更完整的卡名,或用空格分隔多个关键词。`;
+    log('  回复:', text.split('\n')[0], C.green);
+    await sendReply(entry, text);
+  } else {
+    const img = cardImageSegment(hit);              // base64:// 图片段;无本地卡图 → 退化为文字说明
+    const text = img
+      ? ''
+      : `「${formatCard(hit).split('\n')[0]}」暂无本地卡图,可用「${CARD_TRIGGER} 」查文字信息。`;
+    log('  回复:', img ? `卡图 ${hit.id}.jpg` : text.split('\n')[0], C.green);
+    await sendReply(entry, img || text);
+  }
+  appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
+}
+
+// ---------- 每日一卡(同 id 当日重复申请返回同一张,每日 0 点刷新) ----------
+// 本地时区日期字符串作为「当日」键
+function dayKey(ts = Date.now()) {
+  const d = new Date(ts);
+  return `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`;
+}
 function loadDailyState() {
   try { return JSON.parse(readFileSync(DAILY_STATE_FILE, 'utf8')); } catch { return {}; }
 }
@@ -274,22 +325,147 @@ async function processDailyCard(entry) {
   const st = loadDailyState();
   const cards = loadCards();
   const uid = String(entry.user_id);
-  const now = Date.now();
+  const today = dayKey();
   const prev = st[uid];
   let cid = null;
-  if (prev && now - prev.ts < DAILY_WINDOW_MS && cards[prev.cid]) cid = prev.cid;
-  // 超过 24h 或卡库更新后旧卡不存在 → 重抽
+  // 同一自然日返回同卡;过 0 点(或卡库更新后旧卡不存在) → 重抽
+  if (prev && prev.day === today && cards[prev.cid]) cid = prev.cid;
   const fresh = !cid;
   if (fresh) {
     const ids = Object.keys(cards);
     cid = ids[Math.floor(Math.random() * ids.length)];
-    st[uid] = { ts: now, cid };
+    st[uid] = { day: today, cid };
     saveDailyState(st);
   }
   const header = fresh ? '【每日一卡】今日之卡:' : '【每日一卡】今日还是这张:';
   const text = `${header}\n${formatCard(cards[cid])}`;
-  log('  回复:', (fresh ? '新卡 ' : '同卡 ') + text.split('\n')[1].slice(0, 40), C.green);
-  await sendReply(entry, text);
+  const segs = [{ type: 'text', data: { text: '\n' + text } }];
+  const img = cardImageSegment(cards[cid]);         // 先文字后卡图;无本地卡图则纯文字
+  if (img) segs.push(img);
+  log('  回复:', (fresh ? '新卡 ' : '同卡 ') + text.split('\n')[1].slice(0, 40) + (img ? ' +卡图' : ''), C.green);
+  await sendReply(entry, segs);
+}
+
+// ---------- 随机一搬 / 精选一搬(B站热评截图,纯规则 / AI 精挑) ----------
+const shitCooldown = new Map();   // uid -> 上次触发时间戳(30s 冷却防刷屏)
+
+// 读取搬屎记忆样本库(用户投喂的优质屎),供精筛作参考成色
+function loadShitExamples() {
+  try {
+    const text = readFileSync(SHIT_EXAMPLES_PATH, 'utf8');
+    const out = [];
+    for (const line of text.split('\n')) {
+      const m = line.match(/^-\s*评论[:：]\s*(.+)$/);
+      if (m && m[1].trim()) out.push(m[1].trim());
+    }
+    return out;
+  } catch { return []; }
+}
+
+// AI 精挑:把候选列表给 claude,让它选最有梗的一条(只回序号)
+function claudePickShit(candidates) {
+  const list = candidates.map((x, i) =>
+    `#${i} | 视频《${x.v.title.slice(0, 30)}》 | ${x.c.member?.uname || '?'} (赞${x.c.like}/回${x.c.rcount || 0}) | ${(x.c.content?.message || '').replace(/\n/g, ' ').slice(0, 90)}`
+  ).join('\n');
+  const examples = loadShitExamples();
+  const exampleBlock = examples.length
+    ? `\n参考样本(你认可的优质屎,候选的成色/风格要接近这些):
+${examples.map((e, i) => `${i + 1}. ${e}`).join('\n')}\n`
+    : '';
+  const prompt = `你是B站评论区"屎学家",专门挑选值得搬运的"屎"——最有梗、最逆天、最有引战乐子的评论。${exampleBlock}
+候选热评(格式: #序号 | 视频 | 评论者(赞/回复) | 内容):
+${list}
+
+规则:
+- 只选 1 条: 最有梗 / 最逆天 / 最有引战乐子${examples.length ? ',成色接近参考样本' : ''}
+- 排除: 普通科普、纯吹捧、无信息吐槽、大段道理、粉丝向小作文
+- 只回复一个序号数字,不要任何其他内容`;
+  return runClaude(prompt).then(reply => {
+    const m = String(reply || '').match(/\d+/);
+    return m ? candidates[Number(m[0])] || null : null;
+  }).catch(() => null);
+}
+
+async function processShitPost(entry, ai) {
+  const uid = String(entry.user_id);
+  const last = shitCooldown.get(uid);
+  if (last && Date.now() - last < 30000) {
+    await sendReply(entry, `${ai ? SHIT_AI_TRIGGER : SHIT_TRIGGER}冷却中,${Math.ceil((30000 - (Date.now() - last)) / 1000)} 秒后再试。`);
+    appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
+    return;
+  }
+  shitCooldown.set(uid, Date.now());
+  try {
+    let png, bvid = null, title = '';
+    if (ai) {
+      log('  抓屎(AI 精挑)...', '', C.dim);
+      const shit = await pickShit('ai', claudePickShit);
+      png = await renderCard(buildCardHtml(shit, '精选一搬'));   // 评论截图
+      bvid = shit.v.bvid; title = shit.v.title;
+      log('  回复:', `屎截图 ${png} (${shit.s.toFixed(1)}分)`, C.green);
+    } else {
+      log('  随机屎视频 ...', '', C.dim);
+      const { v } = await pickVideoShit();                       // 源库随机抽视频
+      png = await renderCard(buildVideoCardHtml(v, '随机一搬')); // 封面截图
+      bvid = v.bvid; title = v.title;
+      log('  回复:', `视频封面 ${v.bvid} (${v.title.slice(0, 30)})`, C.green);
+    }
+    const mid = await sendReply(entry, [pngToSegment(png)]);      // 只发截图(图上含全部信息)
+    if (mid && bvid) rememberShitSent(mid, entry.group_id, { bvid, title });
+  } catch (e) {
+    log('  抓屎失败:', e.message, C.red);
+    await sendReply(entry, '今日无屎可搬,改日再来。');
+  }
+  appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
+}
+
+// ---------- 搬屎反馈:表情回应点赞 ≥2 人 → 自动入库种子库 ----------
+const SHIT_PENDING_FILE = join(__dirname, 'shitpost', 'pending.json');
+const SHIT_VOTE_THRESHOLD = 1;                 // 不同用户点赞数达此值入库
+const SHIT_FEEDBACK_WINDOW = 24 * 3600 * 1000; // 搬屎后 24h 内有效,过期清理
+const SHIT_WAVE_EMOJI_ID = process.env.SHIT_WAVE_EMOJI_ID || '129'; // 👋 挥手 = 负反馈
+
+function loadPendingShits() {
+  try {
+    const list = JSON.parse(readFileSync(SHIT_PENDING_FILE, 'utf8'));
+    const now = Date.now();
+    return Array.isArray(list) ? list.filter(p => now - p.time < SHIT_FEEDBACK_WINDOW) : [];
+  } catch { return []; }
+}
+function savePendingShits(list) {
+  writeFileSync(SHIT_PENDING_FILE + '.tmp', JSON.stringify(list), 'utf8');
+  renameSync(SHIT_PENDING_FILE + '.tmp', SHIT_PENDING_FILE);
+}
+// 搬屎发出后记录待反馈条目
+function rememberShitSent(messageId, groupId, video) {
+  const pending = loadPendingShits();
+  pending.push({ message_id: messageId, group_id: groupId, video, voters: [], time: Date.now() });
+  savePendingShits(pending);
+  log('  反馈登记:', `待点赞反馈 ${video.title.slice(0, 30)} (mid=${messageId})`, C.dim);
+}
+// WS 表情回应事件(notice_type=group_msg_emoji_like)
+// 挥手 👋(emoji 129)= 负反馈 → 黑名单 + 移出源库;其他表情 = 正反馈投票 → 达标入库
+function handleEmojiLike(j) {
+  const pid = j.message_id ?? j.message_seq;
+  const uid = String(j.operator_id ?? j.user_id);
+  if (!pid || String(uid) === BOT_ID) return;
+  const pending = loadPendingShits();
+  const hit = pending.find(p => p.message_id === pid || p.message_seq === pid);
+  if (!hit) return;
+  pending.splice(pending.indexOf(hit), 1);               // 无论正负反馈,先移出待反馈
+  const likes = (j.likes || []).map(x => String(x.emoji_id));
+  if (likes.includes(SHIT_WAVE_EMOJI_ID)) {              // 👋 负反馈
+    savePendingShits(pending);
+    const br = addToBlacklist(hit.video);
+    const removed = removeFromShitVideos(hit.video.bvid);
+    log('🖐 负反馈黑名单:', `${br}「${hit.video.title.slice(0, 30)}」${removed ? '(已移出源库)' : '(不在源库)'}`, C.red);
+    return;
+  }
+  if (!hit.voters.includes(uid)) hit.voters.push(uid);   // 每用户一票
+  if (hit.voters.length < SHIT_VOTE_THRESHOLD) { savePendingShits(pending); return; }
+  savePendingShits(pending);
+  const r = appendShitVideo(hit.video);
+  log('📥 反馈入库:', `${r}「${hit.video.title.slice(0, 30)}」(${hit.voters.length}人点赞)`, C.green);
 }
 
 // ---------- 处理单个请求 ----------
@@ -305,6 +481,16 @@ async function processEntry(entry) {
     appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
     return;
   }
+  if (SHIT_ENABLED && text.includes(SHIT_AI_TRIGGER)) {
+    log('▶ 处理', `${entry.group_name} @${entry.nickname} seq=${entry.seq} [精选一搬]`, C.cyan);
+    await processShitPost(entry, true);
+    return;
+  }
+  if (SHIT_ENABLED && text.includes(SHIT_TRIGGER)) {
+    log('▶ 处理', `${entry.group_name} @${entry.nickname} seq=${entry.seq} [随机一搬]`, C.cyan);
+    await processShitPost(entry, false);
+    return;
+  }
   const { triggered, raw } = extractCardQuery(entry);
   if (triggered) {
     log('▶ 处理', `${entry.group_name} @${entry.nickname} seq=${entry.seq} [卡牌查询]`, C.cyan);
@@ -316,7 +502,19 @@ async function processEntry(entry) {
     }
     return;
   }
-  log('⏭ 跳过', `seq=${entry.seq} @${entry.nickname} 无触发词("${TRIGGER_KEYWORD}" 或 "${CARD_TRIGGER} "): ${text.slice(0, 30)}`, C.dim);
+  const imgQuery = extractCardQuery(entry, CARD_IMG_TRIGGER);
+  if (imgQuery.triggered) {
+    log('▶ 处理', `${entry.group_name} @${entry.nickname} seq=${entry.seq} [卡图查询]`, C.cyan);
+    if (!imgQuery.raw) {                          // 只有「卡图 」没卡名 → 教用法
+      const text = `用法:@我 然后说「${CARD_IMG_TRIGGER} 」+卡名,如「${CARD_IMG_TRIGGER} 青眼白龙」;多个关键词用空格分隔。`;
+      await sendReply(entry, text);
+    } else {
+      await processCardImageQuery(entry, imgQuery.raw);
+    }
+    return;
+  }
+  const shitTriggers = SHIT_ENABLED ? ` / "${SHIT_TRIGGER}" / "${SHIT_AI_TRIGGER}"` : '';
+  log('⏭ 跳过', `seq=${entry.seq} @${entry.nickname} 无触发词("${TRIGGER_KEYWORD}" / "${DAILY_KEYWORD}"${shitTriggers} / "${CARD_TRIGGER} " / "${CARD_IMG_TRIGGER} "): ${text.slice(0, 30)}`, C.dim);
   appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
 }
 
@@ -483,6 +681,10 @@ function connect() {
   ws.onmessage = (ev) => {
     let j;
     try { j = JSON.parse(String(ev.data)); } catch { return; }
+    if (j.post_type === 'notice' && j.notice_type === 'group_msg_emoji_like') {
+      handleEmojiLike(j);                                 // 搬屎反馈:点赞 → 入库
+      return;
+    }
     if (j.post_type !== 'message' || !isMentioningBot(j)) return;
     const seq = j.message_seq ?? j.message_id;
     if (!seq) return;
@@ -502,6 +704,11 @@ function connect() {
   ws.onerror = (e) => log('WS 错误:', e.message || e, C.red);
 }
 connect();
+
+// 纯文本 @ 识别用昵称:启动时拉取当前 QQ 昵称加入集合
+api('get_login_info').then(r => {
+  if (r?.data?.nickname) { botNicknames.add(r.data.nickname); log('bot 昵称:', r.data.nickname, C.dim); }
+}).catch(() => {});
 
 // 定时兜底轮询(处理队列兜底)
 setInterval(processQueue, POLL_MS);
@@ -527,4 +734,4 @@ setInterval(async () => {
 // 启动参数 --update-cards: 启动即更新一次卡库
 if (process.argv.includes('--update-cards')) updateCardDb();
 
-log(`${DRY_RUN ? '[DRY_RUN] ' : ''}QQ Agent 监控终端启动 (bot=${BOT_ID} | ${TRIGGER_KEYWORD}=史记 | ${CARD_TRIGGER} 卡名=查卡 | u=更新卡库)`);
+log(`${DRY_RUN ? '[DRY_RUN] ' : ''}QQ Agent 监控终端启动 (bot=${BOT_ID} | ${TRIGGER_KEYWORD}=史记 | ${CARD_TRIGGER} 卡名=查卡 | ${CARD_IMG_TRIGGER} 卡名=查卡图 | ${DAILY_KEYWORD}=每日一卡+图 | ${SHIT_ENABLED ? `${SHIT_TRIGGER}=搬屎 | ${SHIT_AI_TRIGGER}=AI精选屎 | ` : ''}u=更新卡库)`);

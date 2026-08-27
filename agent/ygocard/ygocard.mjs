@@ -12,6 +12,7 @@ import { inflateRawSync } from 'node:zlib';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const CARDS_PATH = process.env.YGOCARDS_PATH || join(__dirname, 'cards.json');
+const IMG_DIR = process.env.YGOCARD_IMG_DIR || join(__dirname, 'cards_img'); // 卡图目录(按官方密码 id 命名的 jpg)
 
 // 可搜索的名称字段(别名也算:简中官方名、MD名、NWBBS译名等)
 const NAME_FIELDS = ['cn_name', 'sc_name', 'md_name', 'nwbbs_n', 'cnocg_n', 'jp_name', 'jp_ruby', 'en_name'];
@@ -43,6 +44,21 @@ export function cardCount() {
 }
 
 export function getCardsPath() { return CARDS_PATH; }
+
+// ---------- 卡图 ----------
+// 本地卡图文件路径(不存在返回 null)。卡无官方密码(id=0)或无图文件时无卡图。
+export function cardImagePath(c) {
+  if (!c?.id) return null;
+  const p = join(IMG_DIR, `${c.id}.jpg`);
+  return existsSync(p) ? p : null;
+}
+
+// 构造 OneBot 图片消息段(base64://,无需 SnowLuma 读本地路径);无本地卡图返回 null
+export function cardImageSegment(c) {
+  const p = cardImagePath(c);
+  if (!p) return null;
+  return { type: 'image', data: { file: `base64://${readFileSync(p).toString('base64')}` } };
+}
 
 // 重载卡库(卡库文件被更新后调用)
 export function reloadCards() {

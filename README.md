@@ -4,9 +4,12 @@ QQ 机器人「测试bot.fd」(QQ 3757588606)的自动回复系统,两个功能:
 
 1. **史记总结**:群里 **@机器人 且消息含「史记总结」** 时,拉取该群最近 100 条消息,用**史记体文言文**总结/回答(走 Claude,无头生成)。
 2. **卡牌查询**:**@机器人 + 「效果 」+卡名**(触发词「效果」后须带空格,防「效果怪兽」等误触发;如 `@机器人 效果 青眼白龙` 或 `@机器人 效果 青眼 白龙` 空格分隔多关键词 AND 查询)时,从**本地卡库**查询并输出**最匹配的一张**的卡牌信息(中文名/日文名/类型/星级/攻防/效果文本)。纯本地运行,不依赖 AI。卡库来自百鸽 ygocdb 全量数据(14260 张,2026-08 更新)。@消息可识别真 @ 或纯文本「@昵称」。
-3. **每日一卡**:群里 **@机器人 且消息含「每日一卡」** 时,从卡库随机抽一张卡回复完整信息;**同一 QQ 24 小时内重复申请返回同一张卡**(状态持久化于 `agent/daily_card.json`)。
+3. **卡图查询**:**@机器人 + 「卡图 」+卡名**,检索逻辑与「效果」完全相同(多关键词空格分隔 AND,取最匹配一张),但**只发送该卡的卡图**(图片段,base64 直发)。卡图数据库来自 ygoprodeck 全量图片,按官方密码 id 存于 `agent/ygocard/cards_img/{id}.jpg`,由 `agent/ygocard/download_images.mjs` 下载(可重跑续传,失败清单 `cards_img/failed.log`)。
+4. **每日一卡**:群里 **@机器人 且消息含「每日一卡」** 时,从卡库随机抽一张卡回复完整信息,**先文字后卡图**; **同一 QQ 同一自然日内重复申请返回同一张卡,每日 0 点刷新换卡**(状态持久化于 `agent/daily_card.json`)。
 
-**卡库更新**:monitor 控制台按 `u` 手动更新;或启动参数 `node monitor.mjs --update-cards` 启动即更新。流程:下载 cards.zip → 校验(JSON 完整性+卡数阈值,md5 仅参考) → 解压 → 原子替换 → 内存重载,失败不影响旧卡库。
+**卡库更新**:monitor 控制台按 `u` 手动更新;或启动参数 `node monitor.mjs --update-cards` 启动即更新。流程:下载 cards.zip → 校验(JSON 完整性+卡数阈值,md5 仅参考) → 解压 → 原子替换 → 内存重载 → **自动同步下载缺失卡图**(跳过已有,增量很快),失败不影响旧卡库。也可单独跑 `node agent/ygocard/download_images.mjs` 补卡图。
+
+> **开发中(默认关闭)**:搬屎功能(随机一搬 = 屎视频源库随机发封面截图;精选一搬 = 规则粗筛 + AI 精筛评论截图)代码在 `agent/shitpost/`,monitor 已接线但需 env `SHIT_ENABLED=1` 才启用,默认不上线。
 
 ## 系统组成
 
@@ -74,8 +77,9 @@ mc_agent/
   ```
   缺失时 monitor 启动会报错退出;`start.bat` 的登录检测也从该文件读取。
 - **`.mcp.json`**(被 `.gitignore` 排除):Claude Code MCP 配置,参考 `.mcp.example.json` 创建。
-- 环境变量可覆盖:WS_URL / API / WS_TOKEN / API_TOKEN / TRIGGER_KEYWORD / CARD_TRIGGER / DAILY_KEYWORD / BOT_ID / DRY_RUN。
+- 环境变量可覆盖:WS_URL / API / WS_TOKEN / API_TOKEN / TRIGGER_KEYWORD / CARD_TRIGGER / CARD_IMG_TRIGGER / DAILY_KEYWORD / BOT_ID / DRY_RUN。
 - **卡库**:`agent/ygocard/cards.json` 不入库(约 14MB,可重建)。monitor 窗口按 `u` 或 `node monitor.mjs --update-cards` 联网更新。
+- **卡图库**:`agent/ygocard/cards_img/` 不入库(约 2GB,14218 张,可重建)。`node agent/ygocard/download_images.mjs` 全量下载/续传(跳过已存在,失败清单 `cards_img/failed.log` 重跑自动重试)。
 
 ## 注意事项
 
