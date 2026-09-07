@@ -3,13 +3,19 @@
 .mcp.json
 .claude/
 
-# 运行时数据(群消息记录 / 日志 / 抽卡状态)
+# 运行时数据(群消息记录 / 日志 / 抽卡状态 / 功能开关 / 框神语录库)
 agent/inbox.jsonl
 agent/processed.jsonl
 agent/daily_card.json
+agent/features.json
 agent/listener.log
 agent/*.log
 agent/tmp_*.json
+agent/kuangshen/quotes.json
+agent/kuangshen/blacklist.json
+agent/kuangshen/pending.json
+agent/kuangshen/wordcloud.png
+agent/kuangshen/tmp/
 
 # SnowLuma 第三方运行时 + QQ 数据 + 日志(重装/保留本地即可)
 tools/
@@ -21,6 +27,7 @@ downloads/
 
 # 临时文件
 *.tmp
+agent/ygocard/tmp/
 
 # 卡图数据库(体积大,可重下重建)
 agent/ygocard/cards_img/
@@ -28,3 +35,6 @@ agent/ygocard/cards_img/
 # 用户投喂的屎素材 + 搬屎渲染临时文件
 屎/
 agent/shitpost/tmp/
+
+# 运行时 pid
+agent/listener.pid

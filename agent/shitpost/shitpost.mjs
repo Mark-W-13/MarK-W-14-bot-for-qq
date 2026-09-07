@@ -7,7 +7,7 @@
 //   node shitpost.mjs              # 自测:抓候选+评分+打印选中(不截图)
 //   node shitpost.mjs --image      # 自测:含截图,输出 png 路径
 //   node shitpost.mjs --dump       # 打印候选池评分明细(调词表用)
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawn } from 'node:child_process';
@@ -66,6 +66,44 @@ export function appendShitVideo({ bvid, title }) {
     writeFileSync(SHIT_VIDEOS_PATH, lines.join('\n'), 'utf8');
     return 'added';
   } catch (e) { return 'error'; }
+}
+
+// ---------- 源库 LRU 记忆(返回屎时:近期刚返回过的源库视频不返,优先返最久没被返回的) ----------
+const SEED_MEMORY_PATH = process.env.SEED_MEMORY_PATH || join(__dirname, 'seed_memory.json');
+const SEED_MEMORY_RECENT_MS = Number(process.env.SEED_MEMORY_RECENT_MS || 24 * 3600 * 1000); // 近期窗口,默认 24h
+const SHIT_LIB_CHANCE = Number(process.env.SHIT_LIB_CHANCE || 0.02);   // 源库 LRU 通道触发概率(默认 2%,0=永不——逻辑上尽量不搬源库)
+
+export function loadSeedMemory() {
+  try { return JSON.parse(readFileSync(SEED_MEMORY_PATH, 'utf8')); } catch { return {}; }
+}
+function saveSeedMemory(mem) {
+  writeFileSync(SEED_MEMORY_PATH + '.tmp', JSON.stringify(mem, null, 1), 'utf8');
+  renameSync(SEED_MEMORY_PATH + '.tmp', SEED_MEMORY_PATH);
+}
+
+// 记录刚被返回的源库视频(lastReturned/次数),顺手清掉已不在源库的旧记忆
+function rememberReturned(v, aliveBvids) {
+  const mem = loadSeedMemory();
+  const alive = new Set(aliveBvids);
+  for (const k of Object.keys(mem)) if (!alive.has(k)) delete mem[k];
+  const prev = mem[v.bvid] || {};
+  mem[v.bvid] = { lastReturned: Date.now(), count: (prev.count || 0) + 1, title: v.title.slice(0, 40) };
+  saveSeedMemory(mem);
+}
+
+// 从「近期未返回」的源库候选中挑一条:越久没被返回权重越高(72h 封顶);没用过的等同满窗口
+function pickLibraryVideo(eligible, mem) {
+  const now = Date.now();
+  const scored = eligible.map(s => {
+    const m = mem[s.bvid];
+    const hours = m ? (now - m.lastReturned) / 3600000 : SEED_MEMORY_RECENT_MS / 3600000;
+    const w = (0.5 + Math.min(hours, 72)) * (0.8 + Math.random() * 0.4);
+    return { s, w };
+  });
+  const total = scored.reduce((a, x) => a + x.w, 0);
+  let r = Math.random() * total;
+  for (const x of scored) { r -= x.w; if (r <= 0) return x.s; }
+  return scored[scored.length - 1].s;
 }
 
 // ---------- 黑名单(挥手负反馈) ----------
@@ -137,24 +175,28 @@ export async function fetchVideoDetail(bvid) {
 }
 
 // 随机一搬(主动爬取):源库随机抽 3 个种子视频 → 并行爬各自相关视频(同类抽象,高浓度)
-// → 种子+相关 加权随机;爬取失败/池过小时用 popular 池保底
+// → 相关+热门 加权随机;另设源库 LRU 通道:近期未返回的源库视频按「多久没返」加权直接出镜
+// (源库视频不混入爬取池,只在 LRU 通道出现;爬取失败/池过小时用 popular 池保底)
 export async function pickVideoShit() {
   const black = loadBlacklist();
   const blacked = new Set(black.map(x => x.bvid));
   // 种子:源库随机,黑名单跳过;最多尝试 6 个源库条目,全黑则无种子
   const srcVideos = loadShitVideos().sort(() => Math.random() - 0.5);
+  // 一次并行解析全部源库 BV,构成排除集:源库只作爬取源,任何路径都不直接出镜
+  const resolvedSrc = (await Promise.all(srcVideos.map(async s => {
+    try { return { ...s, bvid: await resolveBvid(s.url) }; } catch { return null; }
+  }))).filter(Boolean);
+  const srcSet = new Set(resolvedSrc.map(s => s.bvid));
+  // 种子:源库随机 3 个(黑名单跳过),只作爬取源
   const seeds = [];
-  for (const s of srcVideos) {
+  for (const s of resolvedSrc) {
     if (seeds.length >= 3) break;
-    try {
-      const bvid = await resolveBvid(s.url);
-      if (blacked.has(bvid)) { console.log(`  黑名单跳过种子: ${s.title}`); continue; }
-      seeds.push({ ...s, bvid });
-    } catch {}
+    if (blacked.has(s.bvid)) { console.log(`  黑名单跳过种子: ${s.title}`); continue; }
+    seeds.push(s);
   }
   const pool = [];
   if (seeds.length) {
-    // 种子只作为爬取源,不直接出镜(用户已看过的没必要再发)
+    // 种子只作为爬取源,不直接进爬取池(源库视频的出镜走下方 LRU 通道)
     await Promise.all(seeds.map(async s => {
       try {
         const rel = await fetchRelated(s.bvid);
@@ -162,6 +204,7 @@ export async function pickVideoShit() {
           if ((v.stat?.view || 0) < MIN_VIEW) continue; // 播放量下限(0 播放低质视频)
           if (isNotShit(v)) continue;               // 砍掉广告/资讯/攻略杂鱼
           if (blacked.has(v.bvid)) continue;        // 黑名单不推荐
+          if (srcSet.has(v.bvid)) continue;         // 源库视频不直接出镜(相关池会带回其他种子)
           const s = videoShitScore(v);
           if (s < 8) continue;                      // 无梗特征的低分杂鱼不进池
           pool.push({ kind: 'rel', v, w: 5 + s });
@@ -172,10 +215,29 @@ export async function pickVideoShit() {
   if (pool.length < 20) {                          // 保底:相关爬取不足时混入热门池
     for (const v of await fetchPopularPool()) {
       if ((v.stat?.view || 0) < MIN_VIEW) continue;
+      if (blacked.has(v.bvid)) continue;
+      if (srcSet.has(v.bvid)) continue;             // 源库视频走 LRU 通道,不进爬取池
       const s = videoShitScore(v);
       if (s < 8) continue;
       pool.push({ kind: 'rank', v, w: 5 + s });
     }
+  }
+  // 源库 LRU 通道:逻辑上尽量不搬源库(主通道=爬取池),仅小概率(SHIT_LIB_CHANCE,默认 2%)触发;
+  // 触发时:近期(默认 24h)刚返回过的源库视频不返,其余按「多久没被返回」加权选最久未返的
+  const mem = loadSeedMemory();
+  const now = Date.now();
+  const eligible = resolvedSrc.filter(s =>
+    !blacked.has(s.bvid)
+    && !(mem[s.bvid] && now - mem[s.bvid].lastReturned < SEED_MEMORY_RECENT_MS)
+  );
+  if (eligible.length && Math.random() < SHIT_LIB_CHANCE) {
+    try {
+      const libPick = pickLibraryVideo(eligible, mem);
+      const v = await fetchVideoDetail(libPick.bvid);
+      rememberReturned(libPick, resolvedSrc.map(s => s.bvid));
+      console.log(`  源库 LRU 通道: ${libPick.title.slice(0, 40)} (${v.bvid})`);
+      return { v: { ...v, fromSource: libPick.title } };
+    } catch (e) { console.log(`  源库通道失败,回退爬取池: ${e.message}`); }
   }
   if (!pool.length) throw new Error('无屎视频可搬');
   const total = pool.reduce((a, x) => a + x.w, 0);
@@ -485,6 +547,16 @@ export function pngToSegment(pngPath) {
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const flag = process.argv[2] || '';
   (async () => {
+    if (flag === '--seed-memory') {
+      const mem = loadSeedMemory();
+      const entries = Object.entries(mem).sort((a, b) => a[1].lastUsed - b[1].lastUsed);
+      if (!entries.length) { console.log('源库记忆为空(还没有源库视频被返回过)'); return; }
+      console.log(`源库 LRU 记忆 ${entries.length} 条(旧→新,窗口 ${SEED_MEMORY_RECENT_MS / 3600000}h,窗口内不返):`);
+      for (const [bvid, m] of entries) {
+        console.log(`  ${new Date(m.lastReturned).toLocaleString('zh-CN', { hour12: false })} | x${m.count} | ${bvid} | ${(m.title || '').slice(0, 40)}`);
+      }
+      return;
+    }
     const list = await fetchPopular();
     const videos = pickVideos(list, 5);
     console.log(`热门 ${list.length} 条,选中视频:`);

@@ -16,7 +16,9 @@ import { createHash } from 'node:crypto';
 import readline from 'node:readline';
 import { queryAndFormat, reloadCards, getCardsPath, extractZipCardJson, loadCards, formatCard, searchCards, cardImageSegment } from './ygocard/ygocard.mjs';
 import { downloadImages } from './ygocard/download_images.mjs';
+import { generateDeckListPdf, classifyDeckInput } from './ygocard/decklist.mjs';
 import { pickShit, buildCardHtml, buildVideoCardHtml, pickVideoShit, renderCard, pngToSegment, appendShitVideo, addToBlacklist, removeFromShitVideos } from './shitpost/shitpost.mjs';
+import { collectQuoteFromEvent, pickFeaturedQuote, backfillQuotes, searchQuotes, addToBlacklist as quoteBlacklist, removeQuoteBySeq } from './kuangshen/kuangshen.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -43,11 +45,39 @@ const TRIGGER_KEYWORD = process.env.TRIGGER_KEYWORD || '史记总结'; // 史记
 const CARD_TRIGGER = process.env.CARD_TRIGGER || '效果';            // 查卡触发词:「效果 」后跟卡名
 const CARD_IMG_TRIGGER = process.env.CARD_IMG_TRIGGER || '卡图';     // 查卡图触发词:「卡图 」后跟卡名(只发图)
 const DAILY_KEYWORD = process.env.DAILY_KEYWORD || '每日一卡';      // 每日一卡触发词(同 id 24h 内不换卡)
+const DECK_TRIGGER = process.env.DECK_TRIGGER || '生成卡表';        // 卡表生成触发词:「生成卡表 」+ ydk文本/卡组码/分享链接 → 上传 PDF 群文件
 const SHIT_TRIGGER = process.env.SHIT_TRIGGER || '随机一搬';        // 搬屎触发词:纯规则筛选,发截图
 const SHIT_AI_TRIGGER = process.env.SHIT_AI_TRIGGER || '精选一搬';  // 搬屎触发词:规则粗筛 + AI 精挑
-const SHIT_ENABLED = process.env.SHIT_ENABLED === '1';              // 搬屎功能总开关(默认关闭,暂不上线)
+const KUANGSHEN_TRIGGER = process.env.KUANGSHEN_TRIGGER || '框神语录'; // 框神语录触发词:从精筛语录库随机抽一条
 const SHIT_EXAMPLES_PATH = process.env.SHIT_EXAMPLES_PATH
   || 'C:/Users/hp/.claude/projects/C--Users-hp-Desktop---mc-agent/memory/shitpost-examples.md'; // 搬屎记忆样本库
+
+// ---------- 运行时功能状态(热开关总控,免重启) ----------
+// 总开关:搬屎 / 框神语录(控制台 1/2 切),状态持久化 features.json,首次运行以 .env 为初值建文件
+// (SHIT_ENABLED / KUANGSHEN_ENABLED env 常量只作首启初值,之后以文件+控制台为准)。
+const FEAT_FILE = join(__dirname, 'features.json');
+function featDefaults() {                                             // .env 初值(仅建文件时使用)
+  return {
+    shitpost: process.env.SHIT_ENABLED === '1',                    // 搬屎(随机一搬/精选一搬)
+    kuangshen: process.env.KUANGSHEN_ENABLED === '1',              // 框神语录(回复+实时采集+回填)
+    updatedAt: 0,
+  };
+}
+function loadFeatures() {
+  const d = featDefaults();
+  try {
+    const f = JSON.parse(readFileSync(FEAT_FILE, 'utf8'));
+    if (typeof f?.shitpost === 'boolean') d.shitpost = f.shitpost;
+    if (typeof f?.kuangshen === 'boolean') d.kuangshen = f.kuangshen;
+  } catch { /* 文件缺失/损坏 → 保持 .env 初值,首次变更时落盘 */ }
+  return d;
+}
+function saveFeatures() {
+  FEAT.updatedAt = Date.now();
+  writeFileSync(FEAT_FILE + '.tmp', JSON.stringify(FEAT, null, 1), 'utf8');
+  renameSync(FEAT_FILE + '.tmp', FEAT_FILE);
+}
+const FEAT = loadFeatures();
 const DAILY_STATE_FILE = join(__dirname, 'daily_card.json');
 const INBOX = join(__dirname, 'inbox.jsonl');
 const PROCESSED = join(__dirname, 'processed.jsonl');
@@ -180,13 +210,13 @@ function buildPrompt(transcript, trigger) {
   const targetText = trigger.targetNames?.length
     ? `\n本次消息中@了目标成员: ${trigger.targetNames.join('、')}(依据:消息里同时@了TA,视为指定对象)。回答聚焦于 TA 的发言/梗/行为,可从记录中定位;若无明显相关内容,如实说明。`
     : '';
-  return `你是 QQ 群里的"赛博史官"机器人,专以史记体文言文(如"太史公曰")回答群友。收到群消息记录(格式 "HH:MM 昵称|内容")和@你的问题。
+  return `你是 QQ 群里的"赛博史官"机器人,专以史记体文言文(如"太史公曰：")回答群友。收到群消息记录(格式 "HH:MM 昵称|内容")和@你的问题。
 
 规则:
 - 默认情况:用一句(最多两句)文言史记体总结最近群聊,诙谐生动,浓缩梗与人物
 - 若是提问(你是谁/某梗是什么/讨论什么):用文言答问,同样简洁
 - 只输出回复正文,不要引号、不要"at"前缀、不要多余解释
-- 太史公曰 开头
+- 太史公曰： 开头
 ${targetText}
 群消息记录(最近100条):
 ${transcript}
@@ -346,6 +376,84 @@ async function processDailyCard(entry) {
   await sendReply(entry, segs);
 }
 
+// ---------- 生成卡表(ydk文本/卡组码/分享链接 → 官方版式 PDF 卡表,上传群文件) ----------
+// 官方赛事(巡回赛/WCQ)要求赛前提交纸质卡表;生成后端见 ygocard/decklist.mjs
+// (神人科技 https://ygo.xyk.one/deck/ 与官方空白表同版式同源底图,卡名为官方简体中文全称)。
+// 回复约定(用户 2026-09-07 定调):生成并上传成功 → 不回复任何文字;失败 → 只回简短「生成失败」。
+async function processDeckList(entry, raw) {
+  const text = (raw || '').replace(/\[at\]/g, ' ').trim();
+  if (!text) { // 只有「生成卡表 」没内容 → 一行用法
+    await sendReply(entry, `${DECK_TRIGGER} + YDK文本/卡组码/分享链接`);
+    appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
+    return;
+  }
+  const cls = classifyDeckInput(text);
+  if (!cls) {
+    await sendReply(entry, '生成失败');
+    appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
+    return;
+  }
+  try {
+    log(`  生成卡表 PDF ...(${cls.kind === 'link' ? '链接' : 'ydk'})`, '', C.dim);
+    const r = await generateDeckListPdf({ raw: text });
+    if (DRY_RUN) {
+      log('  [DRY_RUN] 不上传群文件:', r.path, C.yellow);
+      return;
+    }
+    const name = `卡表_${dayKey().replace(/-/g, '')}.pdf`;
+    const up = await api('upload_group_file', { group_id: entry.group_id, file: r.path, name });
+    if (up.status !== 'ok') throw new Error(`群文件上传失败: ${JSON.stringify(up).slice(0, 120)}`);
+    log('  已上传群文件', `${name} (${(r.bytes / 1024).toFixed(0)}KB, file_id=${up.data?.file_id})`, C.green);
+    // 成功不回复文字(文件即答案)
+  } catch (e) {
+    log('  卡表生成失败:', e.message, C.red);
+    await sendReply(entry, '生成失败');
+  }
+  appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
+}
+
+// ---------- 框神语录(从精筛语录库随机抽一条;库空则先回填) ----------
+async function processKuangShen(entry) {
+  let q = pickFeaturedQuote();
+  if (!q) {
+    log('  语录库为空,尝试回填历史 ...', '', C.dim);
+    try {
+      const r = await backfillQuotes(20);
+      log(`  回填: 翻 ${r.pages} 页 / 新增 ${r.added} 条`, '', C.dim);
+      q = pickFeaturedQuote();
+    } catch (e) { log('  回填失败:', e.message, C.red); }
+  }
+  if (!q) {
+    await sendReply(entry, '语录库还是空的,改日再来。');
+    appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
+    return;
+  }
+  const d = q.time ? new Date(q.time * 1000).toISOString().slice(5, 16) : '';
+  const text = `【框神语录】\n“${q.text}”${d ? `\n—— ${d}` : ''}`;
+  log('  回复:', q.text.replace(/\n/g, ' ').slice(0, 50), C.green);
+  const mid = await sendReply(entry, text);
+  if (mid) rememberQuoteSent(mid, entry.group_id, q);   // 登记待挥手反馈
+  appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
+}
+
+// ---------- 框神语录关键词检索(「框神语录 」+ 关键词,空格分隔 AND 匹配) ----------
+async function processKuangShenSearch(entry, raw) {
+  const kws = raw.split(/[\s　]+/).filter(Boolean);
+  if (!kws.length) return processKuangShen(entry);      // 只有「框神语录 」→ 退回随机抽
+  const hits = searchQuotes(kws);
+  if (!hits.length) {
+    await sendReply(entry, `没找到同时含「${kws.join('」「')}」的语录,换几个关键词试试。`);
+    appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
+    return;
+  }
+  const q = hits[Math.floor(Math.random() * hits.length)];
+  const d = q.time ? new Date(q.time * 1000).toISOString().slice(5, 16) : '';
+  log('  检索命中:', `${hits.length} 条,示例: ${q.text.replace(/\n/g, ' ').slice(0, 50)}`, C.green);
+  const mid = await sendReply(entry, `【框神语录】\n“${q.text}”${d ? `\n—— ${d}` : ''}`);
+  if (mid) rememberQuoteSent(mid, entry.group_id, q);   // 检索结果同样支持挥手负反馈
+  appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
+}
+
 // ---------- 随机一搬 / 精选一搬(B站热评截图,纯规则 / AI 精挑) ----------
 const shitCooldown = new Map();   // uid -> 上次触发时间戳(30s 冷却防刷屏)
 
@@ -443,34 +551,119 @@ function rememberShitSent(messageId, groupId, video) {
   savePendingShits(pending);
   log('  反馈登记:', `待点赞反馈 ${video.title.slice(0, 30)} (mid=${messageId})`, C.dim);
 }
+
+// ---------- 框神语录反馈:挥手 👋 → 语录进黑名单并从库中删除 ----------
+const QUOTE_PENDING_FILE = join(__dirname, 'kuangshen', 'pending.json');
+const QUOTE_FEEDBACK_WINDOW = 24 * 3600 * 1000;                 // 发出后 24h 内有效
+const QUOTE_WAVE_EMOJI_ID = process.env.KUANGSHEN_WAVE_EMOJI_ID || '129'; // 👋 挥手 = 负反馈
+
+function loadPendingQuotes() {
+  try {
+    const list = JSON.parse(readFileSync(QUOTE_PENDING_FILE, 'utf8'));
+    const now = Date.now();
+    return Array.isArray(list) ? list.filter(p => now - p.time < QUOTE_FEEDBACK_WINDOW) : [];
+  } catch { return []; }
+}
+function savePendingQuotes(list) {
+  writeFileSync(QUOTE_PENDING_FILE + '.tmp', JSON.stringify(list), 'utf8');
+  renameSync(QUOTE_PENDING_FILE + '.tmp', QUOTE_PENDING_FILE);
+}
+// 语录发出后记录待反馈条目(DRY_RUN 不发消息,mid 为空自然不记)
+function rememberQuoteSent(messageId, groupId, quote) {
+  if (!messageId) return;
+  const pending = loadPendingQuotes();
+  pending.push({ message_id: messageId, group_id: groupId, seq: quote.seq, text: quote.text, time: Date.now() });
+  savePendingQuotes(pending);
+  log('  反馈登记:', `待挥手反馈「${quote.text.replace(/\n/g, ' ').slice(0, 20)}」(seq=${quote.seq})`, C.dim);
+}
+
 // WS 表情回应事件(notice_type=group_msg_emoji_like)
-// 挥手 👋(emoji 129)= 负反馈 → 黑名单 + 移出源库;其他表情 = 正反馈投票 → 达标入库
+// 挥手 👋(emoji 129)= 负反馈 → 屎视频黑名单+移出源库 / 语录黑名单+删库;其他表情 = 搬屎正反馈投票
 function handleEmojiLike(j) {
   const pid = j.message_id ?? j.message_seq;
   const uid = String(j.operator_id ?? j.user_id);
   if (!pid || String(uid) === BOT_ID) return;
+  const likes = (j.likes || []).map(x => String(x.emoji_id));
+  // ① 搬屎待反馈
   const pending = loadPendingShits();
   const hit = pending.find(p => p.message_id === pid || p.message_seq === pid);
-  if (!hit) return;
-  pending.splice(pending.indexOf(hit), 1);               // 无论正负反馈,先移出待反馈
-  const likes = (j.likes || []).map(x => String(x.emoji_id));
-  if (likes.includes(SHIT_WAVE_EMOJI_ID)) {              // 👋 负反馈
+  if (hit) {
+    pending.splice(pending.indexOf(hit), 1);               // 无论正负反馈,先移出待反馈
+    if (likes.includes(SHIT_WAVE_EMOJI_ID)) {              // 👋 负反馈
+      savePendingShits(pending);
+      const br = addToBlacklist(hit.video);
+      const removed = removeFromShitVideos(hit.video.bvid);
+      log('🖐 负反馈黑名单:', `${br}「${hit.video.title.slice(0, 30)}」${removed ? '(已移出源库)' : '(不在源库)'}`, C.red);
+      return;
+    }
+    if (!hit.voters.includes(uid)) hit.voters.push(uid);   // 每用户一票
+    if (hit.voters.length < SHIT_VOTE_THRESHOLD) { savePendingShits(pending); return; }
     savePendingShits(pending);
-    const br = addToBlacklist(hit.video);
-    const removed = removeFromShitVideos(hit.video.bvid);
-    log('🖐 负反馈黑名单:', `${br}「${hit.video.title.slice(0, 30)}」${removed ? '(已移出源库)' : '(不在源库)'}`, C.red);
+    const r = appendShitVideo(hit.video);
+    log('📥 反馈入库:', `${r}「${hit.video.title.slice(0, 30)}」(${hit.voters.length}人点赞)`, C.green);
     return;
   }
-  if (!hit.voters.includes(uid)) hit.voters.push(uid);   // 每用户一票
-  if (hit.voters.length < SHIT_VOTE_THRESHOLD) { savePendingShits(pending); return; }
-  savePendingShits(pending);
-  const r = appendShitVideo(hit.video);
-  log('📥 反馈入库:', `${r}「${hit.video.title.slice(0, 30)}」(${hit.voters.length}人点赞)`, C.green);
+  // ② 框神语录待反馈(挥手 = 该语录进黑名单并从语录库删除)
+  if (!FEAT.kuangshen) return;   // 功能关闭/暂停,不再处理语录反馈
+  const qp = loadPendingQuotes();
+  const qhit = qp.find(p => p.message_id === pid || p.message_seq === pid);
+  if (!qhit) return;
+  qp.splice(qp.indexOf(qhit), 1);                          // 一次反馈后关闭窗口
+  if (!likes.includes(QUOTE_WAVE_EMOJI_ID)) { savePendingQuotes(qp); return; }
+  savePendingQuotes(qp);
+  const br = quoteBlacklist(qhit.seq, qhit.text);
+  const removed = removeQuoteBySeq(qhit.seq);
+  log('🖐 语录黑名单:', `${br}「${qhit.text.replace(/\n/g, ' ').slice(0, 30)}」${removed ? '(已删出语录库)' : '(不在库中)'}`, C.red);
+}
+
+// ---------- 热开关面板(控制台总控,免重启) ----------
+// 1/2 = 副功能总开关(搬屎/框神语录);h = 重画面板;状态持久化 features.json
+function featOnText(on) {
+  return `${on ? C.green : C.red}${on ? 'ON' : 'OFF'}${C.reset}`;
+}
+function drawFeaturePanel() {
+  const line1 = `── 功能面板 ─ ${featOnText(FEAT.shitpost)} 1搬屎 | ${featOnText(FEAT.kuangshen)} 2框神语录`;
+  const line2 = `${C.dim}  1/2=切开关 h=重画 q=退出 Q=退出+停SnowLuma u=更新卡库${C.reset}`;
+  console.log(`\n${line1}\n${line2}`);
+}
+function toggleFeature(key) {
+  FEAT[key] = !FEAT[key];
+  saveFeatures();
+  const label = key === 'shitpost' ? '搬屎' : '框神语录';
+  log('功能开关:', `${label} → ${FEAT[key] ? 'ON' : 'OFF'}(已持久化 features.json)`, C.cyan);
+  drawFeaturePanel();
+}
+
+// ---------- 帮助(最简洁的功能介绍;以「/help」或「帮助」开头的消息触发) ----------
+function isHelpRequest(text) {
+  const clean = (text || '').replace(/\[at\]/g, ' ').trim();
+  return /^(?:\/help|帮助)/i.test(clean);
+}
+function buildHelpText() {
+  const shit = FEAT.shitpost
+    ? `\n${SHIT_TRIGGER} — 随机搬一条史(封面截图)`   // AI 精选一搬未完善,暂不展示
+    : '';
+  const kuangshen = FEAT.kuangshen
+    ? `\n${KUANGSHEN_TRIGGER} — 随机一条kkkm语录;\n${KUANGSHEN_TRIGGER} [关键词] — 按关键词检索语录`
+    : '';
+  return `【赛博史官·使用说明】@我 + 以下指令即可。
+
+${TRIGGER_KEYWORD} — 以史记体文言文总结最近群聊
+${DAILY_KEYWORD} — 抽今日之卡
+${DECK_TRIGGER} [卡组内容（ydk文本/卡组码/分享链接）] — 生成巡回赛PDF卡表
+${CARD_TRIGGER} [卡名] — 查卡牌效果，如「${CARD_TRIGGER} 青眼白龙」
+${CARD_IMG_TRIGGER} [卡名] — 查卡图，如「${CARD_IMG_TRIGGER} 青眼白龙」${kuangshen}${shit}`;
 }
 
 // ---------- 处理单个请求 ----------
 async function processEntry(entry) {
   const text = entry.text || '';
+  if (isHelpRequest(text)) {
+    log('▶ 处理', `${entry.group_name} @${entry.nickname} seq=${entry.seq} [帮助]`, C.cyan);
+    await sendReply(entry, buildHelpText());
+    appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
+    return;
+  }
   if (text.includes(TRIGGER_KEYWORD)) {
     log('▶ 处理', `${entry.group_name} @${entry.nickname} seq=${entry.seq} [史记总结]`, C.cyan);
     return processHistory(entry);
@@ -481,12 +674,29 @@ async function processEntry(entry) {
     appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
     return;
   }
-  if (SHIT_ENABLED && text.includes(SHIT_AI_TRIGGER)) {
+  const deckQuery = extractCardQuery(entry, DECK_TRIGGER);   // 「生成卡表 」+ ydk/卡组码/链接
+  if (deckQuery.triggered) {
+    log('▶ 处理', `${entry.group_name} @${entry.nickname} seq=${entry.seq} [生成卡表]`, C.cyan);
+    await processDeckList(entry, deckQuery.raw);
+    return;
+  }
+  if (FEAT.kuangshen && text.includes(KUANGSHEN_TRIGGER)) {
+    const { triggered, raw } = extractCardQuery(entry, KUANGSHEN_TRIGGER);  // 「框神语录 」+空格 → 关键词检索
+    if (triggered) {
+      log('▶ 处理', `${entry.group_name} @${entry.nickname} seq=${entry.seq} [框神语录检索: ${raw.slice(0, 30)}]`, C.cyan);
+      await processKuangShenSearch(entry, raw);
+    } else {
+      log('▶ 处理', `${entry.group_name} @${entry.nickname} seq=${entry.seq} [框神语录]`, C.cyan);
+      await processKuangShen(entry);
+    }
+    return;
+  }
+  if (FEAT.shitpost && text.includes(SHIT_AI_TRIGGER)) {
     log('▶ 处理', `${entry.group_name} @${entry.nickname} seq=${entry.seq} [精选一搬]`, C.cyan);
     await processShitPost(entry, true);
     return;
   }
-  if (SHIT_ENABLED && text.includes(SHIT_TRIGGER)) {
+  if (FEAT.shitpost && text.includes(SHIT_TRIGGER)) {
     log('▶ 处理', `${entry.group_name} @${entry.nickname} seq=${entry.seq} [随机一搬]`, C.cyan);
     await processShitPost(entry, false);
     return;
@@ -513,7 +723,7 @@ async function processEntry(entry) {
     }
     return;
   }
-  const shitTriggers = SHIT_ENABLED ? ` / "${SHIT_TRIGGER}" / "${SHIT_AI_TRIGGER}"` : '';
+  const shitTriggers = FEAT.shitpost ? ` / "${SHIT_TRIGGER}" / "${SHIT_AI_TRIGGER}"` : '';
   log('⏭ 跳过', `seq=${entry.seq} @${entry.nickname} 无触发词("${TRIGGER_KEYWORD}" / "${DAILY_KEYWORD}"${shitTriggers} / "${CARD_TRIGGER} " / "${CARD_IMG_TRIGGER} "): ${text.slice(0, 30)}`, C.dim);
   appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
 }
@@ -593,7 +803,11 @@ try { // 仅终端下启用按键(后台/管道运行无 tty,跳过)
   readline.emitKeypressEvents(process.stdin);
   process.stdin.setRawMode(true);
   process.stdin.on('keypress', (str, key) => {
-    if (key.name === 'q') {
+    const k = String(str || '');
+    if (k === '1') toggleFeature('shitpost');      // 1 = 搬屎总开关
+    else if (k === '2') toggleFeature('kuangshen');// 2 = 框神语录总开关
+    else if (k === 'h' || k === 'H') drawFeaturePanel();     // h = 重画功能面板
+    else if (key.name === 'q') {
       if (key.shift) shutdown(true);     // Q = 退出 + 停 SnowLuma
       else shutdown(false);              // q = 仅退出
     } else if (key.name === 'u') {
@@ -621,6 +835,9 @@ function makeEntry(j) {
   const targets = (j.message || [])
     .filter(s => s.type === 'at' && String(s.data?.qq) !== BOT_ID)
     .map(s => String(s.data.qq));
+  const allText = (j.message || []).map(s => s.type === 'text' ? s.data.text : `[${s.type}]`).join('');
+  // 常规消息截 200;含「生成卡表」的消息可能带完整 ydk 文本/卡组码,放宽到 8000
+  const text = (allText.length > 200 && allText.includes(DECK_TRIGGER)) ? allText.slice(0, 8000) : allText.slice(0, 200);
   return {
     seq,
     message_id: j.message_id,
@@ -629,7 +846,7 @@ function makeEntry(j) {
     group_name: j.group_name || '',
     user_id: j.user_id,
     nickname: j.sender?.card || j.sender?.nickname || String(j.user_id),
-    text: (j.message || []).map(s => s.type === 'text' ? s.data.text : `[${s.type}]`).join('').slice(0, 200),
+    text,
     targets: targets.length ? [...new Set(targets)] : undefined,
   };
 }
@@ -643,7 +860,9 @@ async function catchUpMissed() {
   const groups = [...groupLastSeen.keys()];
   try { // 也覆盖从未实时收到过消息的群
     const { data } = await api('get_group_list');
-    for (const g of (data || [])) if (!groups.includes(g.group_id)) groups.push(g.group_id);
+    for (const g of (data || [])) {
+      if (!groups.includes(g.group_id)) groups.push(g.group_id);
+    }
   } catch {}
   const cutoff = Math.floor(Date.now() / 1000) - 120; // 只补最近 2 分钟
   let missed = 0;
@@ -668,6 +887,12 @@ async function catchUpMissed() {
   }
   log(`补漏完成,补收 ${missed} 条`, missed ? C.green : C.dim);
   if (missed) processQueue(); // 补收到的直接进处理队列
+  if (FEAT.kuangshen) {
+    // 框神语录增量回填:覆盖 monitor 离线期间漏收的发言(遇库内已知 seq 即停,通常 1-2 页)
+    backfillQuotes(10).then(r => {
+      if (r.added) log('框神语录回填:', `+${r.added} 条 (翻 ${r.pages} 页)`, C.dim);
+    }).catch(e => log('框神语录回填失败:', e.message, C.red));
+  }
 }
 
 function connect() {
@@ -682,8 +907,17 @@ function connect() {
     let j;
     try { j = JSON.parse(String(ev.data)); } catch { return; }
     if (j.post_type === 'notice' && j.notice_type === 'group_msg_emoji_like') {
-      handleEmojiLike(j);                                 // 搬屎反馈:点赞 → 入库
+      handleEmojiLike(j);                                 // 表情反馈:搬屎点赞→入库 / 挥手→黑名单(屎视频+框神语录)
       return;
+    }
+    if (j.post_type === 'message') {
+      // 框神语录实时采集:在 @过滤之前捕获该群该用户的全部发言(不 @ 也入库)
+      if (FEAT.kuangshen) {
+        try {
+          const q = collectQuoteFromEvent(j);
+          if (q) log('📝 框神语录入库:', q.text.replace(/\n/g, ' ').slice(0, 40), C.dim);
+        } catch (e) { log('框神语录入库失败:', e.message, C.red); }
+      }
     }
     if (j.post_type !== 'message' || !isMentioningBot(j)) return;
     const seq = j.message_seq ?? j.message_id;
@@ -734,4 +968,5 @@ setInterval(async () => {
 // 启动参数 --update-cards: 启动即更新一次卡库
 if (process.argv.includes('--update-cards')) updateCardDb();
 
-log(`${DRY_RUN ? '[DRY_RUN] ' : ''}QQ Agent 监控终端启动 (bot=${BOT_ID} | ${TRIGGER_KEYWORD}=史记 | ${CARD_TRIGGER} 卡名=查卡 | ${CARD_IMG_TRIGGER} 卡名=查卡图 | ${DAILY_KEYWORD}=每日一卡+图 | ${SHIT_ENABLED ? `${SHIT_TRIGGER}=搬屎 | ${SHIT_AI_TRIGGER}=AI精选屎 | ` : ''}u=更新卡库)`);
+drawFeaturePanel();
+log(`${DRY_RUN ? '[DRY_RUN] ' : ''}QQ Agent 监控终端启动 (bot=${BOT_ID} | ${TRIGGER_KEYWORD}=史记 | ${CARD_TRIGGER}=查卡 | ${CARD_IMG_TRIGGER}=卡图 | ${DAILY_KEYWORD}=每日一卡 | 功能开关见面板 1/2)`, '', C.cyan);
