@@ -23,6 +23,7 @@ tools/
 # 卡牌卡库(体积大,可随时联网更新)
 agent/ygocard/cards.json
 agent/ygocard/cards.zip
+agent/ygocard/faq_cache.json
 downloads/
 
 # 临时文件

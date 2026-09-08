@@ -9,12 +9,13 @@
 // 配置: 下方常量或环境变量覆盖
 
 import { appendFileSync, existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { join, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import readline from 'node:readline';
 import { queryAndFormat, reloadCards, getCardsPath, extractZipCardJson, loadCards, formatCard, searchCards, cardImageSegment } from './ygocard/ygocard.mjs';
+import { fetchCardRulings, fetchFullRulings, buildRulingsPdf } from './ygocard/rulings.mjs';
 import { downloadImages } from './ygocard/download_images.mjs';
 import { generateDeckListPdf, classifyDeckInput } from './ygocard/decklist.mjs';
 import { pickShit, buildCardHtml, buildVideoCardHtml, pickVideoShit, renderCard, pngToSegment, appendShitVideo, addToBlacklist, removeFromShitVideos } from './shitpost/shitpost.mjs';
@@ -44,6 +45,8 @@ const BOT_ID = (process.env.BOT_ID || '3757588606').toString();
 const TRIGGER_KEYWORD = process.env.TRIGGER_KEYWORD || '史记总结'; // 史记体触发词
 const CARD_TRIGGER = process.env.CARD_TRIGGER || '效果';            // 查卡触发词:「效果 」后跟卡名
 const CARD_IMG_TRIGGER = process.env.CARD_IMG_TRIGGER || '卡图';     // 查卡图触发词:「卡图 」后跟卡名(只发图)
+const RULING_TRIGGER = process.env.RULING_TRIGGER || '裁定';         // 官方裁定触发词:「裁定 」后跟卡名(百鸽 ygocdb.com 镜像,日文原文)
+const RULING_FULL_TRIGGER = process.env.RULING_FULL_TRIGGER || '完整裁定'; // 完整裁定触发词:「完整裁定 」+卡名 → 全量直接裁定打包 PDF 群文件
 const DAILY_KEYWORD = process.env.DAILY_KEYWORD || '每日一卡';      // 每日一卡触发词(同 id 24h 内不换卡)
 const DECK_TRIGGER = process.env.DECK_TRIGGER || '生成卡表';        // 卡表生成触发词:「生成卡表 」+ ydk文本/卡组码/分享链接 → 上传 PDF 群文件
 const SHIT_TRIGGER = process.env.SHIT_TRIGGER || '随机一搬';        // 搬屎触发词:纯规则筛选,发截图
@@ -334,6 +337,119 @@ async function processCardImageQuery(entry, raw) {
       : `「${formatCard(hit).split('\n')[0]}」暂无本地卡图,可用「${CARD_TRIGGER} 」查文字信息。`;
     log('  回复:', img ? `卡图 ${hit.id}.jpg` : text.split('\n')[0], C.green);
     await sendReply(entry, img || text);
+  }
+  appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
+}
+
+// ---------- 官方裁定(「裁定 」+卡名 → 百鸽 ygocdb.com 镜像的官方数据库 FAQ+补充说明,日文原文,卡名中文内联) ----------
+const rulingCooldown = new Map();   // uid -> 上次触发时间戳(15s 冷却,防刷百鸽)
+const RULING_ENTRY_MAX = 2;         // 回复条数上限(百鸽按日期倒序,前几条即最新裁定)
+const RULING_ENTRY_CHARS = 1300;    // 单条 Q 或 A 的截断长度,防止超长(部分条目极长)
+
+function formatRulingsReply(hit, r) {
+  const cn = hit.cn_name || hit.sc_name || hit.md_name || hit.nwbbs_n || hit.cnocg_n || hit.en_name;
+  const jp = hit.jp_name ? `(${hit.jp_name})` : '';
+  const cut = (s, n) => s.length > n ? s.slice(0, n) + '…(内容过长,已节选)' : s;
+  const lines = [`【裁定】${cn}${jp}`];
+  if (r.entries.length) lines.push(`官方数据库相关 Q&A 共 ${r.total} 条,节选相关裁定如下:`);
+  else if (r.supplement?.length) lines.push('该卡暂无相关 Q&A 条目,官方数据库补充说明如下:');
+  r.entries.forEach((e, i) => {
+    lines.push(`\n${i + 1}. ${e.date ? `(${e.date}) ` : ''}Q: ${cut(e.q, RULING_ENTRY_CHARS)}`);
+    if (e.a) lines.push(`A: ${cut(e.a, RULING_ENTRY_CHARS)}`);
+  });
+  (r.supplement || []).forEach((s, i) => {
+    lines.push(`\n补充说明${r.supplement.length > 1 ? ` ${i + 1}` : ''}${s.date ? `(${s.date})` : ''}:\n${cut(s.a || '', RULING_ENTRY_CHARS)}`);
+  });
+  return lines.join('\n');
+}
+
+async function processRulings(entry, raw) {
+  const uid = String(entry.user_id);
+  const last = rulingCooldown.get(uid);
+  if (last && Date.now() - last < 15000) {
+    await sendReply(entry, `${RULING_TRIGGER}冷却中,${Math.ceil((15000 - (Date.now() - last)) / 1000)} 秒后再试。`);
+    appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
+    return;
+  }
+  rulingCooldown.set(uid, Date.now());
+  log(`  查裁定「${raw}」...`, '', C.dim);
+  const hit = searchCards(raw, 5)[0];
+  if (!hit) {
+    const text = `未找到与「${raw}」相关的卡牌。可试试:更完整的卡名,或用空格分隔多个关键词。`;
+    log('  回复:', text.split('\n')[0], C.green);
+    await sendReply(entry, text);
+    appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
+    return;
+  }
+  try {
+    const r = await fetchCardRulings(hit, RULING_ENTRY_MAX);
+    log(`  官裁: id=${hit.id} ${r.status} 共 ${r.total} 条${r.fromCache ? '(缓存)' : ''}`, '', C.dim);
+    if (r.status === 'ok') {
+      const text = formatRulingsReply(hit, r);
+      log('  回复:', text.split('\n')[0] + ` +${r.entries.length}条裁定`, C.green);
+      await sendReply(entry, text);
+    } else if (r.status === 'no-faq') {
+      await sendReply(entry, `官方数据库暂无「${formatCard(hit).split('\n')[0]}」的相关 Q&A 条目。`);
+    } else if (r.status === 'unlisted') {
+      await sendReply(entry, `「${formatCard(hit).split('\n')[0]}」未被官方数据库收录,查不到官方裁定。`);
+    } else {
+      log('  官裁失败:', r.error || '', C.red);
+      await sendReply(entry, `${RULING_TRIGGER}查询失败(百鸽暂不可达),稍后再试。`);
+    }
+  } catch (e) {
+    log('  官裁失败:', e.message, C.red);
+    await sendReply(entry, `${RULING_TRIGGER}查询失败,稍后再试。`);
+  }
+  appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
+}
+
+// ---------- 完整裁定(「完整裁定 」+卡名 → 百鸽卡页该卡全部相关 Q&A+补充说明 → 多页 PDF 上传群文件) ----------
+// 内容口径(用户 2026-09-08 定稿):百鸽(镜像官方库)上有啥发啥,不做直接命中过滤、不截断;
+// 补充说明(卡效果补足説明)用户 2026-09-08 要求一并填充,PDF 里置于相关 Q&A 之前
+const rulingFullCooldown = new Map();   // uid -> 上次触发时间戳(30s 冷却,生成+上传较耗时防刷)
+
+async function processFullRulings(entry, raw) {
+  const uid = String(entry.user_id);
+  const last = rulingFullCooldown.get(uid);
+  if (last && Date.now() - last < 30000) {
+    await sendReply(entry, `${RULING_FULL_TRIGGER}冷却中,${Math.ceil((30000 - (Date.now() - last)) / 1000)} 秒后再试。`);
+    appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
+    return;
+  }
+  rulingFullCooldown.set(uid, Date.now());
+  log(`  查完整裁定「${raw}」...`, '', C.dim);
+  const hit = searchCards(raw, 5)[0];
+  if (!hit) {
+    const text = `未找到与「${raw}」相关的卡牌。可试试:更完整的卡名,或用空格分隔多个关键词。`;
+    log('  回复:', text.split('\n')[0], C.green);
+    await sendReply(entry, text);
+    appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
+    return;
+  }
+  try {
+    const full = await fetchFullRulings(hit);
+    log(`  完整裁定: id=${hit.id} ${full.status} Q&A ${full.total} 条 / 补充说明 ${full.supplement?.length ?? 0} 条${full.fromCache ? '(缓存)' : ''}`, '', C.dim);
+    if (full.status === 'error') throw new Error(full.error || '百鸽不可达');
+    if (!full.entries.length && !full.supplement?.length) {
+      await sendReply(entry, `官方数据库暂无「${formatCard(hit).split('\n')[0]}」的相关 Q&A 与补充说明,不发文件。`);
+      appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
+      return;
+    }
+    const r = await buildRulingsPdf(hit, full.entries, full.total, full.supplement ?? []);
+    const cn = hit.cn_name || hit.sc_name || hit.md_name || hit.nwbbs_n || hit.cnocg_n || hit.en_name;
+    await sendReply(entry, `【${cn}】的完整裁定如下`);          // 第一条消息:@提问者 + 提示语
+    if (DRY_RUN) {
+      log('  [DRY_RUN] 不上传群文件:', basename(r.path), C.yellow);
+      appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
+      return;
+    }
+    const name = basename(r.path);                             // 完整裁定_卡名_YYYYMMDD.pdf
+    const up = await api('upload_group_file', { group_id: entry.group_id, file: r.path, name });
+    if (up.status !== 'ok') throw new Error(`群文件上传失败: ${JSON.stringify(up).slice(0, 120)}`);
+    log('  已上传群文件', `${name} (${(r.bytes / 1024).toFixed(0)}KB, Q&A ${full.entries.length} 条 + 补充说明 ${full.supplement?.length ?? 0} 条)`, C.green);
+  } catch (e) {
+    log('  完整裁定失败:', e.message, C.red);
+    await sendReply(entry, '完整裁定生成失败,稍后再试。');
   }
   appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
 }
@@ -652,7 +768,9 @@ ${TRIGGER_KEYWORD} — 以史记体文言文总结最近群聊
 ${DAILY_KEYWORD} — 抽今日之卡
 ${DECK_TRIGGER} [卡组内容（ydk文本/卡组码/分享链接）] — 生成巡回赛PDF卡表
 ${CARD_TRIGGER} [卡名] — 查卡牌效果，如「${CARD_TRIGGER} 青眼白龙」
-${CARD_IMG_TRIGGER} [卡名] — 查卡图，如「${CARD_IMG_TRIGGER} 青眼白龙」${kuangshen}${shit}`;
+${CARD_IMG_TRIGGER} [卡名] — 查卡图，如「${CARD_IMG_TRIGGER} 青眼白龙」
+${RULING_TRIGGER} [卡名] — 查官方裁定，返回部分
+${RULING_FULL_TRIGGER} [卡名] — 查完整裁定${kuangshen}${shit}`;
 }
 
 // ---------- 处理单个请求 ----------
@@ -723,8 +841,31 @@ async function processEntry(entry) {
     }
     return;
   }
+  if (text.includes(RULING_FULL_TRIGGER)) {                     // 完整裁定(须在普通「裁定」分支前,否则被其先匹配)
+    log('▶ 处理', `${entry.group_name} @${entry.nickname} seq=${entry.seq} [完整裁定PDF]`, C.cyan);
+    const { raw } = extractCardQuery(entry, RULING_FULL_TRIGGER);
+    if (!raw) {
+      const t = `用法:@我 然后说「${RULING_FULL_TRIGGER} 」+卡名,如「${RULING_FULL_TRIGGER} 增殖的G」,生成完整裁定 PDF 发到群文件。`;
+      await sendReply(entry, t);
+      appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
+    } else {
+      await processFullRulings(entry, raw);
+    }
+    return;
+  }
+  const rulingQuery = extractCardQuery(entry, RULING_TRIGGER);
+  if (rulingQuery.triggered) {
+    log('▶ 处理', `${entry.group_name} @${entry.nickname} seq=${entry.seq} [裁定查询]`, C.cyan);
+    if (!rulingQuery.raw) {                       // 只有「裁定 」没卡名 → 教用法
+      const text = `用法:@我 然后说「${RULING_TRIGGER} 」+卡名,如「${RULING_TRIGGER} 青眼白龙」;多个关键词用空格分隔。`;
+      await sendReply(entry, text);
+    } else {
+      await processRulings(entry, rulingQuery.raw);
+    }
+    return;
+  }
   const shitTriggers = FEAT.shitpost ? ` / "${SHIT_TRIGGER}" / "${SHIT_AI_TRIGGER}"` : '';
-  log('⏭ 跳过', `seq=${entry.seq} @${entry.nickname} 无触发词("${TRIGGER_KEYWORD}" / "${DAILY_KEYWORD}"${shitTriggers} / "${CARD_TRIGGER} " / "${CARD_IMG_TRIGGER} "): ${text.slice(0, 30)}`, C.dim);
+  log('⏭ 跳过', `seq=${entry.seq} @${entry.nickname} 无触发词("${TRIGGER_KEYWORD}" / "${DAILY_KEYWORD}"${shitTriggers} / "${CARD_TRIGGER} " / "${CARD_IMG_TRIGGER} " / "${RULING_TRIGGER} "): ${text.slice(0, 30)}`, C.dim);
   appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
 }
 
@@ -969,4 +1110,4 @@ setInterval(async () => {
 if (process.argv.includes('--update-cards')) updateCardDb();
 
 drawFeaturePanel();
-log(`${DRY_RUN ? '[DRY_RUN] ' : ''}QQ Agent 监控终端启动 (bot=${BOT_ID} | ${TRIGGER_KEYWORD}=史记 | ${CARD_TRIGGER}=查卡 | ${CARD_IMG_TRIGGER}=卡图 | ${DAILY_KEYWORD}=每日一卡 | 功能开关见面板 1/2)`, '', C.cyan);
+log(`${DRY_RUN ? '[DRY_RUN] ' : ''}QQ Agent 监控终端启动 (bot=${BOT_ID} | ${TRIGGER_KEYWORD}=史记 | ${CARD_TRIGGER}=查卡 | ${CARD_IMG_TRIGGER}=卡图 | ${RULING_TRIGGER}=官裁 | ${RULING_FULL_TRIGGER}=裁定PDF | ${DAILY_KEYWORD}=每日一卡 | 功能开关见面板 1/2)`, '', C.cyan);
