@@ -2,17 +2,21 @@
 //   ① @某人      → 查群名片换成「@昵称」(机器人自己被 @ → 「@你(史官)」)
 //   ② 引用消息   → get_msg 取回被引的那条,摊平成「[引用 @昵称: 内容]」(它自己带图也一并识别)
 //   ③ QQ 表情    → face id 查表换成「[表情:微笑]」(表见同目录 qq_faces.json)
-//   ④ 图片/表情包 → 两轮对话:第 1 轮把图单独交给视觉模型识别成一句话描述,
-//                  第 2 轮把描述按**原位置**拼回正文,再交给对话模型生成回复。
+//   ④ 图片/表情包 → 两轮对话:第 1 轮把图单独交给视觉模型(画面描述 + **图上文字逐字抄全**),
+//                  第 2 轮把结果按**原位置**拼回正文,再交给对话模型生成回复。
 // 素材与结论(勿重复踩):
 //   · 表情 id:OneBot face 段的 id 就是 SnowLuma 表情目录的 qSid(0=惊讶 14=微笑 5=流泪,实测对得上),
 //     原始目录在 <SnowLuma>/data/sys-face-catalog.json,已导出为同目录 qq_faces.json(283 条)。
 //   · 图片段形如 {type:'image',data:{url,file,sub_type,summary}};sub_type=1/7 是表情包(动画表情/商城表情),
 //     url 带 rkey 会过期 → 只能即时下载,别想着存库复用;file 是图片内容 md5,可当缓存键(表情包翻来覆去就那几个)。
 //   · 视觉模型 glm-4v-flash(免费)。**必须传 base64**:直接给它 QQ 的 url 会被判「图片输入格式/解析错误」;
-//     而且原图常有几 MB,同样被拒 → 先用 ffmpeg 缩到长边 ≤1024 的 JPEG(几十 KB)再传,实测稳。
+//     而且原图常有几 MB,同样被拒 → 先用 ffmpeg 转成 JPEG(几十 KB~几百 KB)再传,实测稳。
 //     注意体积集中在**动画表情**上:实测有 12MB 的表情包,画面却只有 282x500(体积全在动画帧里),
-//     所以限制按字节卡(32MB),解码内存不用担心;AI 缩放也串行做,别在这台 2GB 的共享机上并发解大图。
+//     所以限制按字节卡(32MB),解码内存不用担心;AI 转码也串行做,别在这台 2GB 的共享机上并发解大图。
+//   · **长截图要切块**(2026-09-13 实测):视觉模型 max_tokens 上限就是 1024,60 行的截图整张传过去
+//     只能抄到 46 行就断(标「…这一段没抄完」);按 ~800px 高切块后各块独立抄、再接缝去重,
+//     覆盖率 68% → 76%,普通的十几二十行截图则是 91%~100%(剩下的是小模型本身的错字/漏行,认了)。
+//     ⚠ 切块后**每块仍用同一套提示词**:一提「这是第 N/M 段、只处理这一段」,模型就只抄十来行收工。
 //   · 引用段的 id 可能是负数(实测 -1137349949),get_msg 收 int / str 都行,能取回原消息。
 // 用法:
 //   node aichat.mjs --selftest           # 自测:纯函数(段解析/正文渲染)+ 表情表 + 图片缩放
@@ -140,38 +144,124 @@ const summaryHint = tk => {
   return s && !['图片', '动画表情', '表情'].includes(s) ? `(这个表情叫「${s}」)` : '';
 };
 
-// 缩成 JPEG:GLM-4V 收不下 3MB+ 的原图,缩到长边 ≤maxSide 只剩几十 KB,又快又稳。
+// 转 JPEG **并按需切片**(用户 2026-09-13:图上的字要完整识别):
+//   · GLM-4V 收不下几 MB 的原图 → 必须转 JPEG 压体积;
+//   · 长截图(聊天记录那种)若整张按长边压到 ~1024,字会变小、错字猛增 ——
+//     实测同一张 780x1400 的群聊截图:整张认成「外印机 / 送代 / 人人要」,
+//     按 780x700 切两半后全部认对。所以**按宽度限幅、再按高度切块**,每块保持原始字号观感;
+//   · 切块顺带绕开视觉模型 max_tokens=1024 的输出上限(一块抄满了还有下一块)。
 // 没有 ffmpeg 时退化成「小图原样传,大图放弃」。
-function shrinkToJpeg(buf) {
-  if (!hasFfmpeg()) return buf.length <= 1.5 * 1024 * 1024 ? buf : null;
+const maxChunks = () => Math.max(1, Number(process.env.AI_CHAT_IMG_CHUNKS || 3));   // 单张图最多切几块
+// 一块多高:800px 实测能一次抄满 30 行(再高就会被 max_tokens 截断);块高与宽度上限分开设,
+// 宽度用 maxSide(1024)限幅 —— 按长边限幅会把长图压小才是错的。
+const chunkHeight = () => Math.max(200, Number(process.env.AI_CHAT_IMG_CHUNK_H || 800));
+
+/** 切片方案(纯函数,便于自测):按宽度限幅后,把高度切成 ≤chunkMax 的若干块,块间留 overlap 重叠防切断行 */
+export function planChunks(w, h, side = maxSide(), chunkCap = maxChunks(), chunkMax = chunkHeight()) {
+  const s = Math.min(1, side / w);                       // 只缩不放
+  const W = Math.max(2, Math.round(w * s / 2) * 2);
+  const H = Math.max(2, Math.round(h * s / 2) * 2);
+  const n = Math.min(chunkCap, Math.max(1, Math.ceil(H / chunkMax)));
+  const chunkH = Math.max(2, Math.ceil(H / n / 2) * 2);
+  const overlap = n > 1 ? Math.min(60, Math.max(2, Math.round(chunkH * 0.15 / 2) * 2)) : 0;
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    const y = i === 0 ? 0 : Math.max(0, i * chunkH - overlap);
+    const hh = Math.min(H - y, chunkH + (i === 0 ? 0 : overlap));
+    if (hh < 8) break;
+    out.push({ W, H, y, h: hh });
+  }
+  return out;
+}
+
+function ffmpegRun(args) {
+  try { return spawnSync(ffmpegBin(), args, { timeout: 30000 }).status === 0; }
+  catch { return false; }
+}
+function ffprobeSize(file) {
+  try {
+    const r = spawnSync(process.env.FFPROBE_BIN || 'ffprobe', [
+      '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height', '-of', 'csv=p=0', file,
+    ], { timeout: 15000, encoding: 'utf8' });
+    const [w, h] = String(r.stdout || '').trim().split(',').map(Number);
+    return w > 0 && h > 0 ? { w, h } : null;
+  } catch { return null; }
+}
+
+// 入:原图 buffer;出:待识别的 JPEG 块数组(≥1 块;空数组=放弃)
+function toJpegChunks(buf) {
+  if (!hasFfmpeg()) return buf.length <= 1.5 * 1024 * 1024 ? [{ buf }] : [];
   const dir = join(tmpdir(), 'aichat');
   const tag = `${process.pid}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
   const src = join(dir, `${tag}.img`);
-  const dst = join(dir, `${tag}.jpg`);
+  const made = [];
   try {
     mkdirSync(dir, { recursive: true });
     writeFileSync(src, buf);
-    const r = spawnSync(ffmpegBin(), [
-      '-y', '-loglevel', 'error', '-i', src,
-      '-vf', `scale='min(${maxSide()},iw)':-2`,   // 只缩不放(小图保持原样)
-      '-frames:v', '1', '-an', '-q:v', '4', dst,
-    ], { timeout: 20000 });
-    if (r.status !== 0 || !existsSync(dst)) return null;
-    const out = readFileSync(dst);
-    return out.length ? out : null;
+    const dim = ffprobeSize(src);
+    const chunks = dim ? planChunks(dim.w, dim.h) : [{ W: null, H: null, y: 0, h: null }];
+    const out = [];
+    for (const c of chunks) {
+      const dst = join(dir, `${tag}_${c.y}.jpg`);
+      const vf = c.W
+        ? (c.y === 0 && c.h === c.H ? `scale=${c.W}:${c.H}` : `scale=${c.W}:${c.H},crop=${c.W}:${c.h}:0:${c.y}`)
+        : `scale='min(${maxSide()},iw)':-2`;   // 探测失败 → 退回整张缩一下
+      if (!ffmpegRun(['-y', '-loglevel', 'error', '-i', src, '-vf', vf, '-frames:v', '1', '-an', '-q:v', '2', dst])) continue;
+      if (!existsSync(dst)) continue;
+      made.push(dst);
+      const jpg = readFileSync(dst);
+      if (jpg.length) out.push({ buf: jpg });
+    }
+    return out;
   } catch {
-    return null;
+    return [];
   } finally {
-    for (const f of [src, dst]) { try { unlinkSync(f); } catch {} }
+    for (const f of [src, ...made]) { try { unlinkSync(f); } catch {} }
   }
 }
 
-async function visionDescribe(buf, seg) {
-  const what = isSticker(seg) ? '一张自定义表情(表情包)' : '一张图片(可能是截图/照片/梗图)';
-  const hint = summaryHint(seg);
-  const ask = what.includes('表情包')
-    ? `${what}${hint}。用一两句中文(60 字内)说清:画面里是什么 + 它想表达什么情绪或梗。只输出描述本身,别客套。`
-    : `${what}${hint}。用一两句中文(60 字内)说清:画面里是什么;图上有文字就只挑关键的一两句读。只输出描述本身,别客套。`;
+/** 合并多块抄回来的文字:块间有重叠,按「前文后缀 == 后文前缀」去掉接缝重复 */
+export function stitchText(parts) {
+  let out = '';
+  for (const raw of parts) {
+    const t = String(raw || '').trim();
+    if (!t) continue;
+    if (!out) { out = t; continue; }
+    let cut = 0;
+    const max = Math.min(80, out.length, t.length);
+    for (let n = max; n >= 8; n--) {
+      if (out.slice(-n) === t.slice(0, n)) { cut = n; break; }
+    }
+    out += (cut ? '' : ' ') + t.slice(cut);
+  }
+  return out;
+}
+
+const DESC_MAX_CHARS = Number(process.env.AI_CHAT_IMG_TEXT_MAX || 1500);   // 单张图描述+抄字的硬上限
+
+// 图上文字**逐字抄全**(用户 2026-09-13 定):截图/聊天记录/公告/梗图上的字都要完整带回去,
+// 不许总结、不许「挑关键的一两句」——最早那版这么写,截图里的正文全被丢掉了。
+// 输出约定:第一段是画面描述,有文字时再给一段「文字:」,由 splitVision 拆开。
+// ⚠ 每一块都用**同一套**提示词,别对模型提「这是第 N/M 段、只处理这一段」——
+// 实测:同一张 780x700 的图,不提分段能抄满 29 行,一提「第 1/2 段」就只抄 11 行收工。
+// 分块对模型透明:它只看见一张图,照抄即可;拼接与去重由 stitchText 负责。
+function visionAsk(seg) {
+  const sticker = isSticker(seg);
+  const what = sticker ? '一张自定义表情(表情包)' : '一张图片(可能是截图/照片/梗图,常来自群聊或网页)';
+  return [
+    `这是 QQ 群聊消息里插的${what}${summaryHint(seg)}。`,
+    `先写画面:一两句中文说清画面里是什么${sticker ? ',以及它想表达的情绪或梗' : ''}。`,
+    `再抄文字:图上**只要有文字,就一字不差地完整抄下来**(截图里的正文、聊天记录、公告、表格、梗图上的字都算),`,
+    `不要总结、不要省略、不要改写、不要只挑几句,多长都照抄。确实没有文字,这一段就整个不写。`,
+    ``,
+    `严格按下面两段输出,不要别的内容:`,
+    `画面: <描述>`,
+    `文字: <逐字全文>`,
+  ].join('\n');
+}
+
+// 一块图 → 视觉模型原始输出(未解析)
+async function visionRaw(buf, seg) {
   const r = await fetch(glmUrl(), {
     method: 'POST',
     headers: { Authorization: `Bearer ${glmKey()}`, 'Content-Type': 'application/json' },
@@ -179,10 +269,10 @@ async function visionDescribe(buf, seg) {
       model: visionModel(),
       messages: [{ role: 'user', content: [
         { type: 'image_url', image_url: { url: buf.toString('base64') } },
-        { type: 'text', text: ask },
+        { type: 'text', text: visionAsk(seg) },
       ] }],
-      temperature: 0.6,
-      max_tokens: 300,
+      temperature: 0.3,          // 抄字要的是忠实,不是发挥
+      max_tokens: 1024,          // 抄满:视觉模型的上限就是 1024(写 2000 直接 400:max_tokens参数非法)
     }),
     signal: AbortSignal.timeout(visionTimeoutMs()),
   });
@@ -191,14 +281,42 @@ async function visionDescribe(buf, seg) {
   // 个别视觉模型会吐 <think> 推理段,去掉只留正文
   let text = (j?.choices?.[0]?.message?.content || '').replace(/<think>[\s\S]*?<\/think>/g, '').trim();
   if (!text) throw new Error('视觉模型返回空描述');
-  text = text.replace(/\s*\n\s*/g, ' ');
-  // 模型嘴上答应「60 字内」,实际常写成一段;硬截,免得把正文撑爆
-  return text.length > 160 ? text.slice(0, 160) + '…' : text;
+  // 输出被 token 上限截断 —— 标出来,免得对话模型以为图上就这么多字
+  if (j?.choices?.[0]?.finish_reason === 'length') text += '…(这一段没抄完)';
+  return text;
+}
+
+/** 单张图(可能切了多块)→ 一行「描述;文字:…」;模型不按格式来时原样压成一行(内容一条不丢) */
+export async function visionDescribe(chunks, seg) {
+  const raws = await Promise.all(chunks.map(c => visionRaw(c.buf, seg)));
+  const parts = raws.map(splitVision);
+  const desc = parts[0].desc;
+  const words = stitchText(parts.map(p => p.words));
+  const text = words ? (desc ? `${desc};文字:${words}` : `文字:${words}`) : desc;
+  // 极端图(整页小说)才截,且标明
+  return text.length > DESC_MAX_CHARS ? text.slice(0, DESC_MAX_CHARS) + '…(文字过长,后面还有,已截断)' : text;
+}
+
+/** 「画面: … / 文字: …」→ { desc, words };模型不按格式来时整段当描述收下,内容不丢 */
+export function splitVision(raw) {
+  const text = String(raw || '').trim();
+  const flat = s => s.replace(/[ \t]+/g, ' ').replace(/\s*\n\s*/g, ' ').trim();
+  const m = text.match(/(?:^|\n)\s*(?:文字|文字内容|图上文字)\s*[:：]\s*([\s\S]*)$/);
+  const desc = flat(m ? text.slice(0, m.index) : text).replace(/^画面\s*[:：]\s*/, '');
+  const words = m ? flat(m[1]).replace(/^\(无文字\)$/, '') : '';
+  return { desc, words };
+}
+
+/** 单块图(未切片)的最终文本,等价于 splitVision 的拼回形式;自测与 --image 用 */
+export function formatVision(raw) {
+  const { desc, words } = splitVision(raw);
+  if (!words) return desc;
+  return desc ? `${desc};文字:${words}` : `文字:${words}`;
 }
 
 // 识别一批图片,返回与输入等长的数组,元素为描述或 null(没识别出来)。
-// 三段分开做:下载并发(只吃网络)、缩放串行(ffmpeg 解大图吃内存,这台机器只剩 ~800MB,别并发)、
-// 识别并发(此时传的都是几十 KB 的 JPEG)。
+// 分三段做:下载并发(只吃网络)、切片串行(ffmpeg 解大图吃内存,这台机器只剩 ~800MB,别并发)、
+// 识别并发(此时传的都是几十 KB 的 JPEG;长截图的各块也并行,总耗时约等于一块)。
 async function describeImages(tokens, log = () => {}) {
   const limit = maxImages();
   const items = tokens.map((tk, i) => {
@@ -217,20 +335,22 @@ async function describeImages(tokens, log = () => {}) {
 
   for (const it of items) {
     if (!it || it.desc || !it.buf) continue;
-    it.jpg = shrinkToJpeg(it.buf);
+    it.chunks = toJpegChunks(it.buf);
     it.buf = null;   // 大 buffer 用完即弃,不等 GC
-    if (!it.jpg) log('  图片缩放失败,跳过');
+    if (!it.chunks.length) log('  图片转码失败,跳过');
+    else if (it.chunks.length > 1) log(`  长图切了 ${it.chunks.length} 块(整张的字太小,认不准)`);
   }
 
   await Promise.all(items.map(async it => {
-    if (!it || it.desc || !it.jpg) return;
+    if (!it || it.desc || !it.chunks?.length) return;
     try {
-      it.desc = await visionDescribe(it.jpg, it.tk);
+      it.desc = await visionDescribe(it.chunks, it.tk);
       if (it.ck) {
         if (descCache.size >= DESC_CACHE_MAX) descCache.delete(descCache.keys().next().value);
         descCache.set(it.ck, it.desc);
       }
-      log(`  图片识别(${Math.round(it.jpg.length / 1024)}KB): ${it.desc.slice(0, 50)}`);
+      const kb = Math.round(it.chunks.reduce((n, c) => n + c.buf.length, 0) / 1024);
+      log(`  图片识别(${kb}KB): ${it.desc.slice(0, 50)}`);
     } catch (e) {
       log(`  图片识别失败: ${e.message}`);
     }
@@ -363,10 +483,30 @@ async function selftest() {
   ] }, deps);
   assert(compact === '来 [表情:微笑][表情包(没能识别)]', `裁剪段形态: ${compact}`);
 
+  // 图上文字:模型按「画面: / 文字:」两段回,拼成一行给对话模型(文字一字不动)
+  assert(formatVision('画面: 一张群聊截图\n文字: 你好\n在吗') === '一张群聊截图;文字:你好 在吗',
+    `图文拼接: ${formatVision('画面: 一张群聊截图\n文字: 你好\n在吗')}`);
+  assert(formatVision('画面: 一只黄猫') === '一只黄猫', `无文字时只留画面: ${formatVision('画面: 一只黄猫')}`);
+  assert(formatVision('文字: 仅文字截图') === '文字:仅文字截图', `只有文字: ${formatVision('文字: 仅文字截图')}`);
+  assert(formatVision('一只猫在键盘上') === '一只猫在键盘上', `模型不按格式来时原样收下: ${formatVision('一只猫在键盘上')}`);
+
+  // 切片方案:宽 780 的长截图按宽度限幅后切块,块高不超过上限、块间有重叠
+  const cs = planChunks(780, 1400, 1024, 3);
+  assert(cs.length === 2 && cs.every(c => c.h <= 1024) && cs[1].y < cs[0].h,
+    `切片: 780x1400 → ${cs.map(c => `${c.W}x${c.h}@y${c.y}`).join(' + ')}`);
+  assert(planChunks(1200, 3000, 1024, 3).length === 3, '很高的图最多切 3 块(块内再高也保证覆盖全图)');
+  assert(planChunks(800, 600, 1024, 3).length === 1, '矮图不切');
+  assert(planChunks(4000, 3000, 1024, 3)[0].W === 1024, '超宽图按宽度限幅到 1024');
+
+  // 接缝去重:后一块开头与前一串结尾重叠的部分不重复计入
+  const st = stitchText(['8:00 小明|今天下午三点开会,记得带上上周的报表', '记得带上上周的报表和客户反馈清单']);
+  assert(st === '8:00 小明|今天下午三点开会,记得带上上周的报表和客户反馈清单', `接缝去重: ${st}`);
+
   const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==', 'base64');
-  const jpg = shrinkToJpeg(png);
-  assert(!!jpg && (!hasFfmpeg() || (jpg[0] === 0xff && jpg[1] === 0xd8)),
-    `图片缩放: ${jpg ? `${jpg.length}B${hasFfmpeg() ? ' JPEG' : ' 原样(无 ffmpeg)'}` : '失败'}(ffmpeg=${hasFfmpeg()})`);
+  const chunks = toJpegChunks(png);
+  const jpg = chunks[0]?.buf;
+  assert(chunks.length === 1 && !!jpg && (!hasFfmpeg() || (jpg[0] === 0xff && jpg[1] === 0xd8)),
+    `图片转码: ${jpg ? `1 块 ${jpg.length}B${hasFfmpeg() ? ' JPEG' : ' 原样(无 ffmpeg)'}` : '失败'}(ffmpeg=${hasFfmpeg()})`);
 }
 
 // ---------- CLI ----------
@@ -413,9 +553,9 @@ async function main() {
     if (!b) { console.log('用法: node aichat.mjs --image <路径|URL>'); process.exit(1); }
     if (!glmKey()) { Object.assign(process.env, { ZHIPU_API_KEY: cliEnv().ZHIPU_API_KEY || '' }); }
     const buf = /^https?:/.test(b) ? await downloadImage(b) : readFileSync(b);
-    const jpg = shrinkToJpeg(buf);
-    console.log(`原图 ${(buf.length / 1024).toFixed(0)}KB → ${jpg ? `${(jpg.length / 1024).toFixed(0)}KB JPEG` : '缩放失败'}`);
-    console.log('识别:', await visionDescribe(jpg || buf, { sub: 0, summary: '' }));
+    const chunks = toJpegChunks(buf);
+    console.log(`原图 ${(buf.length / 1024).toFixed(0)}KB → ${chunks.length} 块 JPEG,共 ${(chunks.reduce((n, c) => n + c.buf.length, 0) / 1024).toFixed(0)}KB`);
+    console.log('识别:', await visionDescribe(chunks, { sub: 0, summary: '' }));
     return;
   }
   if (a === '--render') {
