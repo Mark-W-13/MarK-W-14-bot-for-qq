@@ -8,6 +8,7 @@
 // 用法: node monitor.mjs   (可用 DRY_RUN=1 试运行,不真正发消息)
 // 配置: 下方常量或环境变量覆盖
 
+import './env.mjs';   // ⚠ 必须第一个:下面的模块在顶层读 process.env,而 ESM 按 import 顺序求值
 import { appendFileSync, existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -24,16 +25,9 @@ import { buildQuestion as buildAiQuestion, faceLabel } from './aichat/aichat.mjs
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-// 加载本地 .env(含 token 等敏感配置;.env 被 .gitignore 排除,不入库)
-try {
-  const envText = readFileSync(join(__dirname, '.env'), 'utf8');
-  for (const line of envText.split(/\r?\n/)) {
-    const m = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/);
-    if (m && !(m[1] in process.env)) process.env[m[1]] = m[2].replace(/^["']|["']$/g, '');
-  }
-} catch {}
-
 // ---------- 配置 ----------
+// .env 的加载挪到了 env.mjs(第一行 import),理由见那个文件的注释 —— 顶层读 env 的模块
+// (rulings / shitpost / kuangshen)必须先看到 .env,否则拿不到 CHROME_PATH / API_TOKEN。
 const WS_URL = process.env.WS_URL || 'ws://127.0.0.1:3001/';
 const WS_TOKEN = process.env.WS_TOKEN || process.env.SNOWLUMA_WS_TOKEN;
 const API = process.env.API || 'http://127.0.0.1:3000/';

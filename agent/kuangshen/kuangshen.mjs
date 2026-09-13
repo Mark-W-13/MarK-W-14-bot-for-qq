@@ -17,6 +17,7 @@
 //   node kuangshen.mjs --dump-blacklist  # 打印黑名单语录
 // 配置: KUANGSHEN_GROUP / KUANGSHEN_TARGET / KUANGSHEN_MAX_PAGES(env 可覆盖)
 
+import '../env.mjs';   // ⚠ 第一个:下面顶层要读 API_TOKEN(CLI 跑 --backfill 也靠自己加载)
 import { readFileSync, writeFileSync, existsSync, renameSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';

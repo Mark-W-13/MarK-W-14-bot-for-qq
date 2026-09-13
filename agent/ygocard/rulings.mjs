@@ -25,11 +25,13 @@
 //   加载时自动清理旧版(官网源)遗留键。
 // 用法:
 //   node rulings.mjs "增殖的G"      # 自测:中文卡名 → 拉取并打印裁定条目
+import '../env.mjs';   // ⚠ 第一个:下面的模块 / 本文件顶层要从 .env 取值(CLI 自测也靠自己加载)
 import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync, readdirSync, unlinkSync, statSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawn } from 'node:child_process';
 import { searchCards } from './ygocard.mjs';
+import { chromePath } from '../env.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const UA = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36', 'Accept-Language': 'zh-CN,zh;q=0.9' };
@@ -169,7 +171,8 @@ export async function fetchCardRulings(card, max = 2) {
 
 // ---------- 完整裁定 PDF(该卡全部相关 Q&A,Q/A 完整不截断) ----------
 // 渲染: HTML → Edge/Chrome headless --print-to-pdf(自动多页分页,中文字体本机现成)
-const PDF_EDGE = process.env.CHROME_PATH || 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe';
+// 浏览器路径走 env.mjs 的 chromePath():延迟读 CHROME_PATH —— 顶层读会在 .env 加载前执行,
+// 服务器上就回退成 Windows 的 msedge 路径、整条功能挂掉(2026-09-13 修)。
 
 // 拉取该卡完整裁定(供 PDF):百鸽卡页 FAQ 区「有啥发啥」——全部条目
 // (含泛用相关判例,不做直接命中过滤;用户 2026-09-08 定稿:官网上有就全发)。
@@ -271,7 +274,7 @@ export async function buildRulingsPdf(card, entries, total, supplement = [], tru
       `--user-data-dir=${join(tmpDir, 'edge_pdf_prof')}`,
       url,
     ];
-    const child = spawn(PDF_EDGE, args, { windowsHide: true, stdio: 'ignore' });
+    const child = spawn(chromePath(), args, { windowsHide: true, stdio: 'ignore' });
     const timer = setTimeout(() => { try { child.kill(); } catch {} }, 90000);
     child.on('error', e => { clearTimeout(timer); reject(new Error(`Edge 启动失败: ${e.message}`)); });
     child.on('exit', code => {

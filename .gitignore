@@ -18,8 +18,6 @@ agent/tmp_*.json
 agent/kuangshen/quotes.json
 agent/kuangshen/blacklist.json
 agent/kuangshen/pending.json
-agent/kuangshen/wordcloud.png
-agent/kuangshen/tmp/
 
 # SnowLuma 第三方运行时 + QQ 数据 + 日志(重装/保留本地即可)
 tools/

@@ -127,7 +127,8 @@ mc_agent/
     ├── inbox.jsonl        # @请求 队列(不入库)
     ├── processed.jsonl    # 已处理记录(不入库)
     ├── aichat/            # AI 闲聊消息解析(@/引用/表情/图片→正文)+ 表情 id 名称表
-    ├── kuangshen/         # 框神语录:采集 / 回填 / 词云
+    ├── env.mjs            # 加载 .env(必须第一个 import,见文件内注释)
+    ├── kuangshen/         # 框神语录:采集 / 回填
     ├── shitpost/          # 搬屎:随机一搬 / 精选一搬
     └── ygocard/           # 卡牌:效果查询 / 卡图 / 卡库 / 裁定 / 卡表
 ```

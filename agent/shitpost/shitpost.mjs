@@ -7,16 +7,18 @@
 //   node shitpost.mjs              # 自测:抓候选+评分+打印选中(不截图)
 //   node shitpost.mjs --image      # 自测:含截图,输出 png 路径
 //   node shitpost.mjs --dump       # 打印候选池评分明细(调词表用)
+import '../env.mjs';   // ⚠ 第一个:下面的模块 / 本文件顶层要从 .env 取值(CLI 自测也靠自己加载)
 import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawn } from 'node:child_process';
+import { chromePath } from '../env.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const UA = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' };
 const TMP = join(__dirname, 'tmp');
-// 截图浏览器:Windows 默认 Edge;Linux 服务器用 env CHROME_PATH 指 chromium/chrome
-const EDGE = process.env.CHROME_PATH || 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe';
+// 截图浏览器走 env.mjs 的 chromePath():延迟读 CHROME_PATH —— 顶层读会在 .env 加载前执行,
+// 服务器上就回退成 Windows 的 msedge 路径、搬屎截图整条挂掉(2026-09-13 修)。
 const POPULAR_CACHE_TTL = 10 * 60 * 1000;   // 热门列表缓存 10 分钟
 const REPLY_CACHE_TTL = 5 * 60 * 1000;      // 单视频热评缓存 5 分钟
 
@@ -532,7 +534,7 @@ export function renderCard(card) {
       `--user-data-dir=${join(TMP, 'edge_prof')}`,
       url,
     ];
-    const child = spawn(EDGE, args, { windowsHide: true, stdio: 'ignore' });
+    const child = spawn(chromePath(), args, { windowsHide: true, stdio: 'ignore' });
     const timer = setTimeout(() => { try { child.kill(); } catch {} }, 30000);
     child.on('error', e => { clearTimeout(timer); reject(new Error(`Edge 启动失败: ${e.message}`)); });
     child.on('exit', code => {
