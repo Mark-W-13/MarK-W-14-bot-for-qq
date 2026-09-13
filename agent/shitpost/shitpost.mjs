@@ -15,7 +15,8 @@ import { spawn } from 'node:child_process';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const UA = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' };
 const TMP = join(__dirname, 'tmp');
-const EDGE = 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe';
+// 截图浏览器:Windows 默认 Edge;Linux 服务器用 env CHROME_PATH 指 chromium/chrome
+const EDGE = process.env.CHROME_PATH || 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe';
 const POPULAR_CACHE_TTL = 10 * 60 * 1000;   // 热门列表缓存 10 分钟
 const REPLY_CACHE_TTL = 5 * 60 * 1000;      // 单视频热评缓存 5 分钟
 
@@ -29,12 +30,16 @@ async function fetchJson(url) {
   return r.json();
 }
 
+// 屎样本/源库等记忆 md:env 优先 → 本机 memory 目录(Windows 现状)→ 仓库 data/(服务器部署位)
+function memoryDefault(file) {
+  const winPath = `C:/Users/hp/.claude/projects/C--Users-hp-Desktop---mc-agent/memory/${file}`;
+  return existsSync(winPath) ? winPath : join(__dirname, '..', '..', 'data', file);
+}
+
 // 屎视频源库(用户投喂的 b23.tv 清单,随机一搬从这里抽)
-const SHIT_VIDEOS_PATH = process.env.SHIT_VIDEOS_PATH
-  || 'C:/Users/hp/.claude/projects/C--Users-hp-Desktop---mc-agent/memory/shitpost-videos.md';
+const SHIT_VIDEOS_PATH = process.env.SHIT_VIDEOS_PATH || memoryDefault('shitpost-videos.md');
 // 黑名单(挥手负反馈;随机一搬过滤,不从源库抽取)
-const SHIT_BLACKLIST_PATH = process.env.SHIT_BLACKLIST_PATH
-  || 'C:/Users/hp/.claude/projects/C--Users-hp-Desktop---mc-agent/memory/shitpost-blacklist.md';
+const SHIT_BLACKLIST_PATH = process.env.SHIT_BLACKLIST_PATH || memoryDefault('shitpost-blacklist.md');
 
 export function loadShitVideos() {
   try {
@@ -450,7 +455,7 @@ export function buildCardHtml(shit, badge = '随机一搬') {
   return {
     width: 620, height: H,
     html: `<!DOCTYPE html><html><head><meta charset="utf-8"><style>
-body{margin:0;background:#f1f2f3;font-family:"Microsoft YaHei",sans-serif;width:620px;color:#18191c}
+body{margin:0;background:#f1f2f3;font-family:"Noto Sans CJK SC","Microsoft YaHei",sans-serif;width:620px;color:#18191c}
 .card{background:#fff;margin:10px;border-radius:10px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,.06)}
 .video{display:flex;gap:10px;padding:14px;border-bottom:1px solid #eee}
 .video .cover{width:96px;height:60px;object-fit:cover;border-radius:6px;background:#e5e6e7;flex-shrink:0}

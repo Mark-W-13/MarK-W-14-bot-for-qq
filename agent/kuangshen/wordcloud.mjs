@@ -10,7 +10,10 @@ import { spawn } from 'node:child_process';
 import { loadQuotes, filterFeatured, loadBlacklist } from './kuangshen.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const EDGE = 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe';
+// 截图浏览器:Windows 默认 Edge;Linux 服务器用 env CHROME_PATH 指 chromium/chrome
+const EDGE = process.env.CHROME_PATH || 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe';
+// 分词脚本解释器:Windows 为 python;Linux 服务器无 python 命令,默认 python3(env 可覆盖)
+const PY = process.env.PYTHON_BIN || (process.platform === 'win32' ? 'python' : 'python3');
 const TMP = join(__dirname, 'tmp');
 const TEXTS_PATH = join(__dirname, 'tmp', 'wordcloud_texts.txt');
 const FREQ_PATH = join(__dirname, 'tmp', 'wordcloud_freq.json');
@@ -81,7 +84,7 @@ function buildSvg(items, totalQuotes) {
   return `<!DOCTYPE html><html><head><meta charset="utf-8"><style>
   html,body{margin:0;padding:0;background:#fcfcfb}
   </style></head><body>
-  <svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg" font-family="Microsoft YaHei,'微软雅黑',Segoe UI,sans-serif">
+  <svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg" font-family="'Noto Sans CJK SC','Microsoft YaHei','微软雅黑',Segoe UI,sans-serif">
     <rect width="100%" height="100%" fill="#fcfcfb"/>
     ${els.join('\n    ')}
     <text x="${W / 2}" y="${H - 24}" text-anchor="middle" font-size="15" fill="#898781" font-family="Segoe UI,sans-serif">框神语录 · 词云 · ${totalQuotes} 条 · ${today}</text>
@@ -123,7 +126,7 @@ async function main() {
   writeFileSync(TEXTS_PATH, texts.join('\n'), 'utf8');
 
   // 2. jieba 分词统计
-  const seg = spawn('python', [join(__dirname, 'wordcloud_seg.py'), TEXTS_PATH, FREQ_PATH, KEEP_LAUGHS ? '1' : '0'], { windowsHide: true });
+  const seg = spawn(PY, [join(__dirname, 'wordcloud_seg.py'), TEXTS_PATH, FREQ_PATH, KEEP_LAUGHS ? '1' : '0'], { windowsHide: true });
   await new Promise((res, rej) => { seg.on('exit', c => (c === 0 ? res() : rej(new Error(`分词失败 exit ${c}`)))); seg.on('error', rej); });
   const freq = JSON.parse(readFileSync(FREQ_PATH, 'utf8')).slice(0, TOP_N);
   console.log(`语录 ${texts.length} 条 / 词 ${freq.length} 个 / 词频区间 ${freq[0]?.n ?? 0} ~ ${freq[freq.length - 1]?.n ?? 0}`);

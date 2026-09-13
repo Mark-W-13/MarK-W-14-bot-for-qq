@@ -3,6 +3,10 @@
 .mcp.json
 .claude/
 
+# 服务器凭据 / 登录信息(明文密码,绝不入库)
+服务器凭据(勿外传).txt
+远程服务器信息.txt
+
 # 运行时数据(群消息记录 / 日志 / 抽卡状态 / 功能开关 / 框神语录库)
 agent/inbox.jsonl
 agent/processed.jsonl
@@ -33,9 +37,14 @@ agent/ygocard/tmp/
 # 卡图数据库(体积大,可重下重建)
 agent/ygocard/cards_img/
 
-# 用户投喂的屎素材 + 搬屎渲染临时文件
+# 用户投喂的屎素材 + 搬屎运行时数据(渲染临时文件 / 待反馈 / 源库 LRU 记忆)
 屎/
 agent/shitpost/tmp/
+agent/shitpost/pending.json
+agent/shitpost/seed_memory.json
 
 # 运行时 pid
 agent/listener.pid
+
+# 服务器部署位的屎库/样本(随数据迁移,不入库)
+data/

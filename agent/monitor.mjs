@@ -20,6 +20,7 @@ import { downloadImages } from './ygocard/download_images.mjs';
 import { generateDeckListPdf, classifyDeckInput } from './ygocard/decklist.mjs';
 import { pickShit, buildCardHtml, buildVideoCardHtml, pickVideoShit, renderCard, pngToSegment, appendShitVideo, addToBlacklist, removeFromShitVideos } from './shitpost/shitpost.mjs';
 import { collectQuoteFromEvent, pickFeaturedQuote, backfillQuotes, searchQuotes, addToBlacklist as quoteBlacklist, removeQuoteBySeq } from './kuangshen/kuangshen.mjs';
+import { buildQuestion as buildAiQuestion, faceLabel } from './aichat/aichat.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -52,8 +53,18 @@ const DECK_TRIGGER = process.env.DECK_TRIGGER || '生成卡表';        // 卡�
 const SHIT_TRIGGER = process.env.SHIT_TRIGGER || '随机一搬';        // 搬屎触发词:纯规则筛选,发截图
 const SHIT_AI_TRIGGER = process.env.SHIT_AI_TRIGGER || '精选一搬';  // 搬屎触发词:规则粗筛 + AI 精挑
 const KUANGSHEN_TRIGGER = process.env.KUANGSHEN_TRIGGER || '框神语录'; // 框神语录触发词:从精筛语录库随机抽一条
+const GLM_API_KEY = process.env.ZHIPU_API_KEY || process.env.GLM_API_KEY || ''; // 智谱 key(缺失则 AI 闲聊自动关闭)
+const GLM_MODEL = process.env.GLM_MODEL || 'glm-4-flash';                       // 免费模型(实测 1~2 秒回)
+const GLM_API_URL = process.env.GLM_API_URL || 'https://open.bigmodel.cn/api/paas/v4/chat/completions';
+const AI_CHAT_CTX = Math.max(0, Number(process.env.AI_CHAT_CTX ?? 30));         // 附带最近 N 条群聊当上下文(0=不带)
+const AI_CHAT_TIMEOUT_MS = Number(process.env.AI_CHAT_TIMEOUT_MS || 30000);     // 单次请求超时
+const AI_CHAT_COOLDOWN_MS = Number(process.env.AI_CHAT_COOLDOWN_MS || 15000);   // 每人冷却,防连点刷屏
+const AI_CHAT_MAX_CHARS = Number(process.env.AI_CHAT_MAX_CHARS || 400);         // 回复超长截断阈值
+// 搬屎记忆样本库:env 优先 → 本机 memory 目录(Windows 现状)→ 仓库 data/(服务器部署位)
 const SHIT_EXAMPLES_PATH = process.env.SHIT_EXAMPLES_PATH
-  || 'C:/Users/hp/.claude/projects/C--Users-hp-Desktop---mc-agent/memory/shitpost-examples.md'; // 搬屎记忆样本库
+  || (existsSync('C:/Users/hp/.claude/projects/C--Users-hp-Desktop---mc-agent/memory/shitpost-examples.md')
+    ? 'C:/Users/hp/.claude/projects/C--Users-hp-Desktop---mc-agent/memory/shitpost-examples.md'
+    : join(__dirname, '..', 'data', 'shitpost-examples.md'));
 
 // ---------- 运行时功能状态(热开关总控,免重启) ----------
 // 总开关:搬屎 / 框神语录(控制台 1/2 切),状态持久化 features.json,首次运行以 .env 为初值建文件
@@ -63,16 +74,28 @@ function featDefaults() {                                             // .env �
   return {
     shitpost: process.env.SHIT_ENABLED === '1',                    // 搬屎(随机一搬/精选一搬)
     kuangshen: process.env.KUANGSHEN_ENABLED === '1',              // 框神语录(回复+实时采集+回填)
+    ai: process.env.AI_CHAT_ENABLED ? process.env.AI_CHAT_ENABLED === '1' : !!GLM_API_KEY, // AI 闲聊(兜底;无 key 时强制关)
     updatedAt: 0,
   };
 }
 function loadFeatures() {
   const d = featDefaults();
-  try {
-    const f = JSON.parse(readFileSync(FEAT_FILE, 'utf8'));
-    if (typeof f?.shitpost === 'boolean') d.shitpost = f.shitpost;
-    if (typeof f?.kuangshen === 'boolean') d.kuangshen = f.kuangshen;
-  } catch { /* 文件缺失/损坏 → 保持 .env 初值,首次变更时落盘 */ }
+  let f = null;
+  try { f = JSON.parse(readFileSync(FEAT_FILE, 'utf8')); } catch { /* 缺失/损坏 → 用 .env 初值 */ }
+  if (f) {
+    if (typeof f.shitpost === 'boolean') d.shitpost = f.shitpost;
+    if (typeof f.kuangshen === 'boolean') d.kuangshen = f.kuangshen;
+    if (typeof f.ai === 'boolean') d.ai = f.ai;
+  }
+  if (!GLM_API_KEY) d.ai = false;   // 没配 key,开了也是白开
+  // 文件缺字段(老文件遇新开关)时补写一份:否则运维 WebUI 读到 undefined 会显示成 OFF,
+  // 与实际运行状态不符,点开关也会对不上。
+  if (!f || ['shitpost', 'kuangshen', 'ai'].some(k => typeof f[k] !== 'boolean')) {
+    try {
+      writeFileSync(FEAT_FILE + '.tmp', JSON.stringify({ ...d, updatedAt: Date.now() }, null, 1), 'utf8');
+      renameSync(FEAT_FILE + '.tmp', FEAT_FILE);
+    } catch { /* 写不了就算了,不影响运行 */ }
+  }
   return d;
 }
 function saveFeatures() {
@@ -90,6 +113,10 @@ const DRY_RUN = process.env.DRY_RUN === '1';
 const RECONNECT_BASE_MS = 2000;
 const CARDS_ZIP_URL = 'https://ygocdb.com/api/v0/cards.zip';      // 卡库更新源(百鸽)
 const CARDS_MD5_URL = 'https://ygocdb.com/api/v0/cards.zip.md5';
+// 百鸽服务器在海外,国内机器连它握手常要 9~16 秒,慢且偶发超时。
+// Node fetch 默认连接超时只有 10 秒,正好卡在这个区间 → 必然失败。故显式放宽 + 重试。
+const CARDS_FETCH_TIMEOUT_MS = Number(process.env.CARDS_FETCH_TIMEOUT_MS || 120000);
+const CARDS_FETCH_TRIES = Math.max(1, Number(process.env.CARDS_FETCH_TRIES || 3));
 
 // ---------- 工具 ----------
 const C = { dim: '\x1b[90m', green: '\x1b[32m', yellow: '\x1b[33m', cyan: '\x1b[36m', red: '\x1b[31m', reset: '\x1b[0m' };
@@ -155,7 +182,7 @@ function segText(seg, names) {
     case 'text': return seg.data.text;
     case 'at': return names.has(seg.data.qq) ? `@${names.get(seg.data.qq)}` : '@all';
     case 'image': return '[图]';
-    case 'face': return '[表情]';
+    case 'face': return faceLabel(seg.data.id) ? `[表情:${faceLabel(seg.data.id)}]` : '[表情]';
     case 'record': return '[语音]';
     case 'video': return '[视频]';
     case 'reply': return '[回复]';
@@ -228,18 +255,146 @@ ${transcript}
 @者提问: ${trigger.text.replaceAll(TRIGGER_KEYWORD, '').replace(/^\[at\]\s*/, '').trim() || '(无文字,仅@)'}`;
 }
 
+// ---------- AI 闲聊(兜底:未命中任何指令的 @ 交给 GLM 免费模型;人设=赛博史官说白话) ----------
+// 与「史记总结」的分工:总结走 claude 出文言体;这里只接群友的随口 @,答白话、短。
+// 消息里的 @/引用/表情/图片由 aichat.mjs 解析:图片走两轮(第 1 轮视觉模型识别 → 第 2 轮拼回正文再答)。
+const aiCooldown = new Map();   // uid -> 上次触发时间戳(15s 冷却,防连点刷屏)
+const AI_SYSTEM_PROMPT = `你是 QQ 群里的机器人「赛博史官」,群友 @ 你时,你就像群里一个熟人那样接话。
+人设与语气:
+- 自称「史官」,人设只体现在这个身份上
+- 正文一律说现代白话,像群友平时聊天那样:别写文言文,别用「吾/汝/之/也/矣/哉」这类字眼,别掉书袋
+- 口语、直接;别只丢一句套话,该说的信息说清楚,一般 2~3 句、150 字以内
+规则:
+- 下面的群聊记录供你理解上下文、梗与人称指代;记录里没有的事别编造
+- 群友的消息里可能出现这些标记,那是消息本身的内容,照着理解就行,**回复时不要照抄标记**:
+  [表情:微笑] = 他发了个 QQ 表情;[图片: …] / [表情包: …] = 消息里插的图或表情包,括号里是识别结果;
+  [引用 @某人: …] = 他在回复(引用)那条消息;@某人 = 他在消息里 @ 了谁
+- 只输出回复正文:不要 @ 任何人、不要引号包裹、不要「史官:」之类前缀、不要解释你的思路
+- 不知道就直说不知道;群友互喷时别站队,轻松带过
+- 不聊政治、色情、违法内容,被问到就岔开
+- 再说一遍:全程白话,连「你是谁」这种问题也用白话答,不要文言文`;
+
+// 提问正文:剥掉 @ 段标记(形如 [at])与多余空白(降级路径:没有 segs 的老条目 / 解析失败时用)
+function aiQuestionText(entry) {
+  return (entry.text || '').replace(/\[at\]/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+// @ 与引用作者 → 群昵称(先查本次已拉到的群聊记录,再查群成员接口,查不到才用「成员<qq>」;
+// 群名片改名不频繁,进程内缓存够用)
+const memberNames = new Map();
+async function resolveMemberName(groupId, qq) {
+  const key = `${groupId}:${qq}`;
+  if (memberNames.has(key)) return memberNames.get(key);
+  let name = '';
+  try {
+    const r = await api('get_group_member_info', { group_id: groupId, user_id: Number(qq) });
+    name = (r?.data?.card || r?.data?.nickname || '').trim();
+  } catch { /* 查不到就退兜底名 */ }
+  if (name) memberNames.set(key, name);
+  return name || `成员${qq}`;
+}
+
+async function glmChat(system, user) {
+  const r = await fetch(GLM_API_URL, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${GLM_API_KEY}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: GLM_MODEL,
+      messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
+      temperature: 0.8,
+      max_tokens: 500,
+    }),
+    signal: AbortSignal.timeout(AI_CHAT_TIMEOUT_MS),
+  });
+  const j = await r.json().catch(() => null);
+  if (!r.ok) throw new Error(`HTTP ${r.status} ${j?.error?.message || ''}`.trim());
+  const text = j?.choices?.[0]?.message?.content?.trim();
+  if (!text) throw new Error('GLM 返回空回复');
+  return text;
+}
+
+async function processAiChat(entry) {
+  const uid = String(entry.user_id);
+  const last = aiCooldown.get(uid);
+  if (last && Date.now() - last < AI_CHAT_COOLDOWN_MS) {
+    log('  AI 闲聊冷却中,本次不回', `${Math.ceil((AI_CHAT_COOLDOWN_MS - (Date.now() - last)) / 1000)}s 后可再问`, C.dim);
+    appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
+    return;
+  }
+  aiCooldown.set(uid, Date.now());
+  let ctx = '';
+  let names = null;
+  if (AI_CHAT_CTX > 0) {
+    try {   // 取不到上下文不致命,退化成只按这句话回答
+      const { lines, names: n } = await fetchTranscript(entry.group_id, AI_CHAT_CTX);
+      if (lines) ctx = `群聊记录(最近 ${AI_CHAT_CTX} 条,格式 "HH:MM 昵称|内容"):\n${lines}\n\n`;
+      names = n;
+    } catch (e) {
+      log('  AI 闲聊取上下文失败(改为裸答):', e.message, C.yellow);
+    }
+  }
+  // 消息解析:把 @某人/引用/表情/图片还原成文字(图片要单独过一遍视觉模型,可能多花 1~3 秒)
+  let q = aiQuestionText(entry);
+  try {
+    const rich = await buildAiQuestion(entry, {
+      botId: BOT_ID,
+      log: m => log(' ', m, C.dim),
+      getMsg: id => api('get_msg', { message_id: id }),
+      memberName: qq => names?.get(Number(qq)) || resolveMemberName(entry.group_id, qq),
+    });
+    if (rich) q = rich;
+  } catch (e) {
+    log('  AI 闲聊消息解析失败(退回纯文本):', e.message, C.yellow);
+  }
+  q = q.replace(/@你(史官)/g, ' ').replace(/\s+/g, ' ').trim() || '(无文字,仅@)';
+  log(`  ${GLM_MODEL} 生成中 ...`, '', C.dim);
+  try {
+    let reply = await glmChat(AI_SYSTEM_PROMPT, `${ctx}@你的人: ${entry.nickname}\nTA 的问题: ${q}`);
+    if (reply.length > AI_CHAT_MAX_CHARS) reply = reply.slice(0, AI_CHAT_MAX_CHARS) + '……';
+    log('  回复:', reply.replace(/\n/g, ' ').slice(0, 60) + (reply.length > 60 ? '...' : ''), C.green);
+    await sendReply(entry, reply);
+  } catch (e) {
+    log('  AI 闲聊失败:', e.message, C.red);
+    await sendReply(entry, '史官一时语塞,稍后再问。');
+  }
+  appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
+}
+
 // ---------- 卡库更新(下载 → md5 校验 → 解压 → 原子替换 → 重载) ----------
 let updatingDb = false;
+// 带超时与重试的 fetch:百鸽那条国际链路握手经常超过 Node 默认的 10 秒连接超时,
+// 单发必失败;放宽到 CARDS_FETCH_TIMEOUT_MS 并重试几次才稳。
+async function fetchWithRetry(url, label) {
+  let lastErr;
+  for (let i = 1; i <= CARDS_FETCH_TRIES; i++) {
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(CARDS_FETCH_TIMEOUT_MS) });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return res;
+    } catch (e) {
+      lastErr = e;
+      const why = e.name === 'TimeoutError' ? `${CARDS_FETCH_TIMEOUT_MS / 1000} 秒超时` : (e.message || e);
+      if (i < CARDS_FETCH_TRIES) {
+        log(`  ${label}第 ${i} 次失败(${why}),2 秒后重试 ...`, '', C.yellow);
+        await new Promise(r => setTimeout(r, 2000));
+      } else {
+        log(`  ${label}重试 ${CARDS_FETCH_TRIES} 次均失败(${why})`, '', C.red);
+      }
+    }
+  }
+  throw lastErr;
+}
+
 async function updateCardDb() {
   if (updatingDb) { log('卡库更新进行中,忽略本次触发', '', C.yellow); return; }
   updatingDb = true;
   try {
     log('卡库更新:下载 cards.zip ...', '', C.cyan);
     const [zipRes, md5Res] = await Promise.all([
-      fetch(CARDS_ZIP_URL),
-      fetch(CARDS_MD5_URL).catch(() => null),
+      fetchWithRetry(CARDS_ZIP_URL, '卡库下载'),
+      // md5 只是参考信息,拿不到不影响更新,所以失败就咽掉
+      fetch(CARDS_MD5_URL, { signal: AbortSignal.timeout(CARDS_FETCH_TIMEOUT_MS) }).catch(() => null),
     ]);
-    if (!zipRes.ok) throw new Error(`下载失败 HTTP ${zipRes.status}`);
     const zipBuf = Buffer.from(await zipRes.arrayBuffer());
     log(`  下载完成 ${(zipBuf.length / 1048576).toFixed(2)} MB,校验中 ...`, '', C.dim);
     if (md5Res?.ok) {
@@ -738,14 +893,14 @@ function featOnText(on) {
   return `${on ? C.green : C.red}${on ? 'ON' : 'OFF'}${C.reset}`;
 }
 function drawFeaturePanel() {
-  const line1 = `── 功能面板 ─ ${featOnText(FEAT.shitpost)} 1搬屎 | ${featOnText(FEAT.kuangshen)} 2框神语录`;
-  const line2 = `${C.dim}  1/2=切开关 h=重画 q=退出 Q=退出+停SnowLuma u=更新卡库${C.reset}`;
+  const line1 = `── 功能面板 ─ ${featOnText(FEAT.shitpost)} 1搬屎 | ${featOnText(FEAT.kuangshen)} 2框神语录 | ${featOnText(FEAT.ai)} 3AI闲聊`;
+  const line2 = `${C.dim}  1/2/3=切开关 h=重画 q=退出 Q=退出+停SnowLuma u=更新卡库${C.reset}`;
   console.log(`\n${line1}\n${line2}`);
 }
 function toggleFeature(key) {
   FEAT[key] = !FEAT[key];
   saveFeatures();
-  const label = key === 'shitpost' ? '搬屎' : '框神语录';
+  const label = key === 'shitpost' ? '搬屎' : key === 'kuangshen' ? '框神语录' : 'AI 闲聊';
   log('功能开关:', `${label} → ${FEAT[key] ? 'ON' : 'OFF'}(已持久化 features.json)`, C.cyan);
   drawFeaturePanel();
 }
@@ -762,6 +917,9 @@ function buildHelpText() {
   const kuangshen = FEAT.kuangshen
     ? `\n${KUANGSHEN_TRIGGER} — 随机一条kkkm语录;\n${KUANGSHEN_TRIGGER} [关键词] — 按关键词检索语录`
     : '';
+  const ai = FEAT.ai
+    ? `\n\n没写指令也没关系 —— 随便 @ 我说点什么,史官直接接话(带图带表情包也认得出,引用别人的话我也看得见)。`
+    : '';
   return `【赛博史官·使用说明】@我 + 以下指令即可。
 
 ${TRIGGER_KEYWORD} — 以史记体文言文总结最近群聊
@@ -770,7 +928,7 @@ ${DECK_TRIGGER} [卡组内容（ydk文本/卡组码/分享链接）] — 生成�
 ${CARD_TRIGGER} [卡名] — 查卡牌效果，如「${CARD_TRIGGER} 青眼白龙」
 ${CARD_IMG_TRIGGER} [卡名] — 查卡图，如「${CARD_IMG_TRIGGER} 青眼白龙」
 ${RULING_TRIGGER} [卡名] — 查官方裁定，返回部分
-${RULING_FULL_TRIGGER} [卡名] — 查完整裁定${kuangshen}${shit}`;
+${RULING_FULL_TRIGGER} [卡名] — 查完整裁定${kuangshen}${shit}${ai}`;
 }
 
 // ---------- 处理单个请求 ----------
@@ -864,6 +1022,12 @@ async function processEntry(entry) {
     }
     return;
   }
+  // 兜底:没命中任何指令的 @ → 交给 AI 闲聊(面板 3 键 / opsweb 可热关)
+  if (FEAT.ai && GLM_API_KEY) {
+    log('▶ 处理', `${entry.group_name} @${entry.nickname} seq=${entry.seq} [AI 闲聊]`, C.cyan);
+    await processAiChat(entry);
+    return;
+  }
   const shitTriggers = FEAT.shitpost ? ` / "${SHIT_TRIGGER}" / "${SHIT_AI_TRIGGER}"` : '';
   log('⏭ 跳过', `seq=${entry.seq} @${entry.nickname} 无触发词("${TRIGGER_KEYWORD}" / "${DAILY_KEYWORD}"${shitTriggers} / "${CARD_TRIGGER} " / "${CARD_IMG_TRIGGER} " / "${RULING_TRIGGER} "): ${text.slice(0, 30)}`, C.dim);
   appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
@@ -923,10 +1087,14 @@ async function shutdown(stopSnowLuma) {
   }
   try { ws?.close(); } catch {}
   if (stopSnowLuma) {
-    log('停止 SnowLuma (端口 3000) ...', '', C.yellow);
+    // Windows: 按端口 3000 找进程 taskkill;Linux: env SNOWLUMA_STOP_CMD 覆盖(默认 docker stop)
+    log(`停止 SnowLuma ${process.platform === 'win32' ? '(端口 3000)' : ''} ...`, '', C.yellow);
     try {
       const { execSync } = await import('node:child_process');
-      execSync('for /f "tokens=5" %a in (\'netstat -ano ^| findstr ":3000 .*LISTENING"\') do taskkill /PID %a /F', { shell: 'cmd.exe' });
+      const cmd = process.env.SNOWLUMA_STOP_CMD || (process.platform === 'win32'
+        ? 'for /f "tokens=5" %a in (\'netstat -ano ^| findstr ":3000 .*LISTENING"\') do taskkill /PID %a /F'
+        : 'docker stop snowluma');
+      execSync(cmd, { shell: process.platform === 'win32' ? 'cmd.exe' : '/bin/sh', stdio: 'ignore' });
     } catch {}
   }
   log('已停止。再见!', '', C.green);
@@ -947,6 +1115,7 @@ try { // 仅终端下启用按键(后台/管道运行无 tty,跳过)
     const k = String(str || '');
     if (k === '1') toggleFeature('shitpost');      // 1 = 搬屎总开关
     else if (k === '2') toggleFeature('kuangshen');// 2 = 框神语录总开关
+    else if (k === '3') toggleFeature('ai');       // 3 = AI 闲聊总开关
     else if (k === 'h' || k === 'H') drawFeaturePanel();     // h = 重画功能面板
     else if (key.name === 'q') {
       if (key.shift) shutdown(true);     // Q = 退出 + 停 SnowLuma
@@ -979,6 +1148,21 @@ function makeEntry(j) {
   const allText = (j.message || []).map(s => s.type === 'text' ? s.data.text : `[${s.type}]`).join('');
   // 常规消息截 200;含「生成卡表」的消息可能带完整 ydk 文本/卡组码,放宽到 8000
   const text = (allText.length > 200 && allText.includes(DECK_TRIGGER)) ? allText.slice(0, 8000) : allText.slice(0, 200);
+  // 裁剪后的消息段:给 AI 闲聊还原 @某人 / 引用 / QQ 表情 / 图片用(见 aichat.mjs)。
+  // text 把什么都压成 [at]/[image] 占位符,认不出是谁、哪张图,所以另存一份原始段。
+  // 图片 url 带 rkey、会过期,过期就当没图(描述退化成「没能识别」,不影响其它部分)。
+  const segs = (j.message || []).map(s => {
+    const d = s.data || {};
+    switch (s.type) {
+      case 'text': return { type: 'text', text: d.text ?? '' };
+      case 'at': return { type: 'at', qq: String(d.qq ?? '') };
+      case 'face': return { type: 'face', id: String(d.id ?? '') };
+      case 'image': return { type: 'image', url: d.url || '', file: d.file || '', summary: d.summary || '', sub: d.sub_type ?? 0 };
+      case 'mface': return { type: 'mface', url: d.url || '', emoji_id: d.emoji_id || '', summary: d.summary || '' };
+      case 'reply': return { type: 'reply', id: String(d.id ?? '') };
+      default: return { type: s.type };
+    }
+  });
   return {
     seq,
     message_id: j.message_id,
@@ -988,6 +1172,7 @@ function makeEntry(j) {
     user_id: j.user_id,
     nickname: j.sender?.card || j.sender?.nickname || String(j.user_id),
     text,
+    segs: segs.length ? segs : undefined,
     targets: targets.length ? [...new Set(targets)] : undefined,
   };
 }
@@ -1110,4 +1295,4 @@ setInterval(async () => {
 if (process.argv.includes('--update-cards')) updateCardDb();
 
 drawFeaturePanel();
-log(`${DRY_RUN ? '[DRY_RUN] ' : ''}QQ Agent 监控终端启动 (bot=${BOT_ID} | ${TRIGGER_KEYWORD}=史记 | ${CARD_TRIGGER}=查卡 | ${CARD_IMG_TRIGGER}=卡图 | ${RULING_TRIGGER}=官裁 | ${RULING_FULL_TRIGGER}=裁定PDF | ${DAILY_KEYWORD}=每日一卡 | 功能开关见面板 1/2)`, '', C.cyan);
+log(`${DRY_RUN ? '[DRY_RUN] ' : ''}QQ Agent 监控终端启动 (bot=${BOT_ID} | ${TRIGGER_KEYWORD}=史记 | ${CARD_TRIGGER}=查卡 | ${CARD_IMG_TRIGGER}=卡图 | ${RULING_TRIGGER}=官裁 | ${RULING_FULL_TRIGGER}=裁定PDF | ${DAILY_KEYWORD}=每日一卡 | AI闲聊=${FEAT.ai ? GLM_MODEL : 'OFF'} | 功能开关见面板 1/2/3)`, '', C.cyan);
