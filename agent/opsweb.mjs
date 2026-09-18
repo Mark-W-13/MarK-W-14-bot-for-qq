@@ -43,6 +43,17 @@ const TOKEN = process.env.OPSWEB_TOKEN || '';
 const FEATURES = join(AGENT, 'features.json');
 const CARDS = join(AGENT, 'ygocard', 'cards.json');
 const IMG_DIR = join(AGENT, 'ygocard', 'cards_img');
+const AICHAT_STATS = join(AGENT, 'aichat_stats.json');   // AI 闲聊按用户记账(monitor 写,本页只读)
+
+// AI 闲聊后端(与 monitor.mjs 同一套推断:有 DEEPSEEK_API_KEY 就走 deepseek,否则智谱 GLM)。
+// 界面文案要跟着实际配置走 —— 2026-09-17 用户指出这里还写死成 GLM,与实际不符。
+// 注意:.env 是 opsweb 启动时读的,换后端后要重启 opsweb(monitor 同理)文案才更新。
+const AI_IS_DS = (process.env.AI_CHAT_PROVIDER || (process.env.DEEPSEEK_API_KEY ? 'deepseek' : 'glm')).toLowerCase() === 'deepseek';
+const AI_BACKEND_NAME = AI_IS_DS ? 'DeepSeek' : '智谱 GLM';
+const AI_MODEL_NAME = process.env.AI_CHAT_MODEL
+  || (AI_IS_DS ? 'deepseek-flash' : (process.env.GLM_MODEL || 'glm-4-flash'));
+const AI_IMG_DIRECT = String(process.env.AI_CHAT_IMAGE_MODE || 'direct').toLowerCase() === 'direct';
+const AI_CHAT_DESC = `未命中指令的 @ 交给 ${AI_BACKEND_NAME}(${AI_MODEL_NAME}) 接话${AI_IMG_DIRECT ? ',图片直传一轮' : ',图片两轮识别'}(@/引用/表情/图片都认)`;
 
 // 受管的 systemd 用户级单元(顺序即界面顺序)
 const UNITS = [
@@ -254,6 +265,13 @@ async function buildStatus() {
   try { cardsMtime = statSync(CARDS).mtime.toISOString(); } catch {}
   const cards = readJson(CARDS);
   const host = hostStats();
+  // AI 闲聊各用户次数:按「回复发给了谁」统计(monitor 落盘),这里只做排序与格式化。
+  // 降序;名字取最近一次的群名片,标签是「名字(QQ号)」。
+  const aiStat = readJson(AICHAT_STATS) || {};
+  const aiRows = Object.entries(aiStat.users || {})
+    .map(([qq, u]) => ({ qq, name: (u && u.name) || `成员${qq}`, count: (u && u.count) || 0, failed: (u && u.failed) || 0, last: (u && u.last) || 0 }))
+    .filter(r => r.count > 0 || r.failed > 0)
+    .sort((a, b) => b.count - a.count || b.last - a.last);
   return {
     services,
     onebot: {
@@ -266,6 +284,12 @@ async function buildStatus() {
     account: info?.data ? { uin: String(info.data.user_id), nickname: info.data.nickname } : null,
     cards: { mtime: cardsMtime, count: cards ? Object.keys(cards).length : 0, images: countImages() },
     host: { ...host, disk, uptimeText: fmtDuration(host.uptimeS) },
+    aiChat: {
+      rows: aiRows,
+      total: aiStat.total || 0,
+      updatedAt: aiStat.updatedAt || 0,
+      approximateSince: aiStat.approximateSince || '',
+    },
     lastRequest: lastMatch(lines, /★ @请求/),
     lastSend: lastMatch(lines, /已发送 message_id=/),
   };
@@ -380,11 +404,31 @@ input[type=password]{font:inherit;width:100%;padding:10px;border:1px solid var(-
 #upbox.ok #uphead{color:var(--ok)}#upbox.bad #uphead{color:var(--bad)}#upbox.run #uphead{color:var(--warn)}
 #upmsg{font-size:12px;color:#61666d;margin-top:3px;word-break:break-all}
 #uprog{margin-top:7px;font:11px/1.55 ui-monospace,Consolas,monospace;color:var(--mut);max-height:150px;overflow:auto;white-space:pre-wrap;word-break:break-all}
+/* AI 闲聊各用户次数:横向条形图(降序),单行紧凑式,宽屏三列;前 20 名常显,其余折叠 */
+/* 溢出坑(2026-09-17 实测:720/768/1080px 都会被顶出卡片,1080 时页面被撑出 237px):CSS Grid 的
+   **网格项默认 min-width:auto**,不许折行的长群名片会把列撑得比 1fr 还宽 → 整个网格溢出。
+   三处都要写:① 列用 minmax(0,1fr);② 网格项 min-width:0;③ 行自身 min-width:0 + overflow:hidden。 */
+.aicols{display:grid;gap:0 20px;grid-template-columns:1fr;min-width:0}
+@media(min-width:720px){.aicols{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(min-width:1080px){.aicols{grid-template-columns:repeat(3,minmax(0,1fr))}}
+.aicols>*{min-width:0}
+.airow{display:flex;align-items:center;gap:7px;font-size:12px;line-height:1.75;min-width:0;overflow:hidden}
+/* 排名:普通名次是灰数字,前三名是金银铜圆徽 */
+.airank{flex:0 0 auto;width:16px;text-align:center;font-size:11px;color:var(--mut);font-variant-numeric:tabular-nums}
+.airank.top{width:18px;height:18px;line-height:18px;border-radius:50%;color:#fff;font-weight:700;box-shadow:0 1px 2px rgba(0,0,0,.18)}
+.airank.r1{background:linear-gradient(135deg,#ffd85e,#d9a11a)}
+.airank.r2{background:linear-gradient(135deg,#d6dbe2,#9aa3ad)}
+.airank.r3{background:linear-gradient(135deg,#eaa877,#b87333)}
+.ainame{flex:0 1 auto;max-width:46%;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#61666d}
+.aibar{flex:1;min-width:16px;height:7px;background:var(--line);border-radius:4px;overflow:hidden}
+.aibar>i{display:block;height:100%;border-radius:4px;background:linear-gradient(90deg,#fb7299,#ffa8c3);min-width:3px}
+.aicnt{flex:0 0 auto;color:var(--mut);font-size:11px;font-variant-numeric:tabular-nums}
+button.mini{min-height:28px;padding:4px 10px;font-size:12px;border-radius:7px}
 </style></head><body>
 
 <div id="login"><div class="box">
   <h1 style="font-size:16px;margin:0 0 4px">赛博史官 · 运维台</h1>
-  <div class="mut">请输入访问令牌(服务器 agent/.env 里的 OPSWEB_TOKEN)</div>
+  <div class="mut">请输入访问令牌</div>
   <input id="tk" type="password" placeholder="令牌" autocomplete="current-password">
   <button class="pri" style="width:100%" onclick="doLogin()">登录</button>
   <div id="lerr" class="mut" style="color:var(--bad);margin-top:8px"></div>
@@ -409,6 +453,12 @@ input[type=password]{font:inherit;width:100%;padding:10px;border:1px solid var(-
     <div id="upbox"><div id="uphead"></div><div id="upmsg"></div><pre id="uprog"></pre></div></div>
 
   <div class="card"><h2>主机</h2><div id="host"></div></div>
+
+  <div class="card wide"><h2>AI 闲聊 · 各用户次数 <span class="mut" style="font-weight:400" id="ainote"></span></h2>
+    <div class="aicols" id="aichat"></div>
+    <div class="aicols" id="aichat2" style="display:none"></div>
+    <div id="aichatmore" style="margin-top:7px"></div>
+    <div class="mut" style="margin-top:6px;font-size:11px">口径:按回复实际发给谁计;冷却跳过不计,失败另标。悬停看完整名字。</div></div>
 
   <div class="card wide"><h2>QQ 消息日志 <span class="mut" style="font-weight:400" id="snowfile"></span>
     <label class="mut" style="margin-left:auto;font-weight:400"><input type="checkbox" id="snowall"> 全部(含调试)</label></h2>
@@ -466,7 +516,7 @@ function tick(){
     document.getElementById('feats').innerHTML=
       frow('搬屎','随机一搬 / 精选一搬',s.features.shitpost,'shitpost')+
       frow('框神语录','回复 + 实时采集 + 回填',s.features.kuangshen,'kuangshen')+
-      frow('AI 闲聊','未命中指令的 @ 由 GLM 接话(@/引用/表情/图片都认)',s.features.ai,'ai');
+      frow('AI 闲聊','${AI_CHAT_DESC}',s.features.ai,'ai');
 
     document.getElementById('svcs').innerHTML=s.services.map(function(v){
       return '<div class="row"><span class="dot '+(v.active?'ok':'bad')+'"></span><span class="k">'+h(v.label)+
@@ -492,12 +542,52 @@ function tick(){
       '<div class="row" style="border-top:1px solid var(--line)"><span class="k">负载<div class="sub">1/5/15 分钟</div></span><b>'+h(H.load)+'</b></div>'+
       '<div class="row"><span class="k">已运行<div class="sub">服务器开机时长</div></span><b>'+h(H.uptimeText)+'</b></div>'+
       '<div class="row"><span class="k mut">最近请求<div class="sub">'+h(s.lastRequest||'暂无')+'</div></span></div>';
+    aichatChart(s.aiChat);
     return s;
   }).catch(function(){});
 }
 function frow(name,desc,on,key){
   return '<div class="row"><span class="k">'+name+'<div class="sub">'+desc+'</div></span>'+
     '<div class="sw'+(on?' on':'')+'" onclick="toggle(\\''+key+'\\','+(!!on)+')"><i></i></div></div>';
+}
+function fmtTime(ts){
+  var d=new Date(ts),p=function(n){return (n<10?'0':'')+n};
+  return (d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes());
+}
+// AI 闲聊各用户次数:横向条形图,次数降序。单行紧凑式;前 20 名常显、其余折叠;前三名金银铜徽章。
+// 折叠状态存在 aiExpanded 里 —— tick() 每 5 秒重渲染,不存就会被自动展开。
+var aiExpanded=false, aiLast=null;
+var AI_TOP_N=20;
+function aichatToggle(){aiExpanded=!aiExpanded;aichatChart();}
+function aiRowHtml(r,i,max){
+  var w=Math.max(3,Math.round(r.count/max*100));
+  var label=r.name+'（'+r.qq+'）';
+  var cls='airank'+(i<3?(' top r'+(i+1)):'');       // 第 1/2/3 名:金/银/铜圆徽
+  return '<div class="airow"><span class="'+cls+'">'+(i+1)+'</span>'+
+    '<span class="ainame" title="'+h(label)+'">'+h(label)+'</span>'+
+    '<span class="aibar"><i style="width:'+w+'%"></i></span>'+
+    '<span class="aicnt">'+r.count+(r.failed?(' +'+r.failed+'✗'):'')+'</span></div>';
+}
+function aichatChart(a){
+  if(a)aiLast=a;
+  var box=document.getElementById('aichat');
+  if(!box)return;
+  var box2=document.getElementById('aichat2'),more=document.getElementById('aichatmore'),note=document.getElementById('ainote');
+  var rows=(aiLast&&aiLast.rows)||[];
+  if(!rows.length){
+    note.textContent='';box.innerHTML='<div class="mut">还没有记录 —— 群里 @ 机器人随便聊一句就会记在这里(AI 闲聊开关要开着)</div>';
+    box2.innerHTML='';box2.style.display='none';more.innerHTML='';
+    return;
+  }
+  note.textContent='共 '+(aiLast.total||0)+' 次'+(aiLast.updatedAt?(' · 更新于 '+fmtTime(aiLast.updatedAt)):'')+(aiLast.approximateSince?(' · 含 '+aiLast.approximateSince+' 起的估算'):'');
+  var max=1;
+  for(var i=0;i<rows.length;i++){if(rows[i].count>max)max=rows[i].count}
+  var top=rows.slice(0,AI_TOP_N),rest=rows.slice(AI_TOP_N);
+  box.innerHTML=top.map(function(r,i){return aiRowHtml(r,i,max)}).join('');
+  box2.innerHTML=(rest.length&&aiExpanded)?rest.map(function(r,i){return aiRowHtml(r,i+AI_TOP_N,max)}).join(''):'';
+  box2.style.display=(rest.length&&aiExpanded)?'':'none';
+  more.innerHTML=rest.length?('<button class="mini" onclick="aichatToggle()">'+
+    (aiExpanded?('收起,只看前 '+AI_TOP_N+' 名'):('展开其余 '+rest.length+' 人'))+'</button>'):'';
 }
 function logs(){
   if(!document.getElementById('auto').checked)return;

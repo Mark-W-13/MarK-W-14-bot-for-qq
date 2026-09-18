@@ -21,7 +21,7 @@ import { downloadImages } from './ygocard/download_images.mjs';
 import { generateDeckListPdf, classifyDeckInput } from './ygocard/decklist.mjs';
 import { pickShit, buildCardHtml, buildVideoCardHtml, pickVideoShit, renderCard, pngToSegment, appendShitVideo, addToBlacklist, removeFromShitVideos } from './shitpost/shitpost.mjs';
 import { collectQuoteFromEvent, pickFeaturedQuote, backfillQuotes, searchQuotes, addToBlacklist as quoteBlacklist, removeQuoteBySeq } from './kuangshen/kuangshen.mjs';
-import { buildQuestion as buildAiQuestion, faceLabel } from './aichat/aichat.mjs';
+import { buildQuestion as buildAiQuestion, buildQuestionRich as buildAiQuestionRich, faceLabel } from './aichat/aichat.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -47,10 +47,25 @@ const DECK_TRIGGER = process.env.DECK_TRIGGER || '生成卡表';        // 卡�
 const SHIT_TRIGGER = process.env.SHIT_TRIGGER || '随机一搬';        // 搬屎触发词:纯规则筛选,发截图
 const SHIT_AI_TRIGGER = process.env.SHIT_AI_TRIGGER || '精选一搬';  // 搬屎触发词:规则粗筛 + AI 精挑
 const KUANGSHEN_TRIGGER = process.env.KUANGSHEN_TRIGGER || '框神语录'; // 框神语录触发词:从精筛语录库随机抽一条
-const GLM_API_KEY = process.env.ZHIPU_API_KEY || process.env.GLM_API_KEY || ''; // 智谱 key(缺失则 AI 闲聊自动关闭)
+// ---------- AI 闲聊后端(2026-09-17 改:图片随消息直传、一次请求出结果) ----------
+// 两套后端,AI_CHAT_PROVIDER 选;没显式指定时「有 DEEPSEEK_API_KEY 就走 deepseek,否则智谱 GLM」。
+//   deepseek(默认推荐):模型自己会看图 → 图片按 data URL 直接附在消息里,**一轮出结果**
+//   glm               :glm-4-flash 没有视觉,图片只能先让视觉模型认成文字再问(两轮,见 aichat.mjs)
+const GLM_API_KEY = process.env.ZHIPU_API_KEY || process.env.GLM_API_KEY || ''; // 智谱 key
 const GLM_MODEL = process.env.GLM_MODEL || 'glm-4-flash';                       // 免费模型(实测 1~2 秒回)
 const GLM_API_URL = process.env.GLM_API_URL || 'https://open.bigmodel.cn/api/paas/v4/chat/completions';
-const AI_CHAT_CTX = Math.max(0, Number(process.env.AI_CHAT_CTX ?? 30));         // 附带最近 N 条群聊当上下文(0=不带)
+const AI_IS_DS = (process.env.AI_CHAT_PROVIDER || (process.env.DEEPSEEK_API_KEY ? 'deepseek' : 'glm')).toLowerCase() === 'deepseek';
+const AI_API_KEY = AI_IS_DS ? (process.env.DEEPSEEK_API_KEY || '') : GLM_API_KEY;
+const AI_API_URL = process.env.AI_CHAT_API_URL || (AI_IS_DS ? 'https://api.deepseek.com/chat/completions' : GLM_API_URL);
+const AI_MODEL = process.env.AI_CHAT_MODEL || (AI_IS_DS ? 'deepseek-flash' : GLM_MODEL);
+const AI_CHAT_CTX = Math.max(0, Number(process.env.AI_CHAT_CTX ?? 10));         // 附带最近 N 条群聊当上下文(0=不带;用户 2026-09-14 从 30 调小到 10)
+const AI_CHAT_WEB_SEARCH = process.env.AI_CHAT_WEB_SEARCH !== '0';              // 联网搜索(默认开;=0 关)
+// 智谱服务端的联网搜索工具**只对智谱有效**:deepseek 挂上它会直接 4xx,所以换后端时自动不挂。
+const AI_WEB_SEARCH = AI_CHAT_WEB_SEARCH && !AI_IS_DS;
+// deepseek 系默认会「思考」:实测 reasoning_effort='low' 会把 max_tokens 全烧在思考上、**正文返回空**
+// ('none' 才是真关,1.1s)。闲聊要快、要短 → 默认关;想开思考设 AI_CHAT_REASONING=1。
+const AI_THINK_OFF = AI_IS_DS && process.env.AI_CHAT_REASONING !== '1';
+const AI_CHAT_MAX_TOKENS = Number(process.env.AI_CHAT_MAX_TOKENS || 800);       // 上限:留足思考/正文,别像 500 那样被思考吃空
 const AI_CHAT_TIMEOUT_MS = Number(process.env.AI_CHAT_TIMEOUT_MS || 30000);     // 单次请求超时
 const AI_CHAT_COOLDOWN_MS = Number(process.env.AI_CHAT_COOLDOWN_MS || 15000);   // 每人冷却,防连点刷屏
 const AI_CHAT_MAX_CHARS = Number(process.env.AI_CHAT_MAX_CHARS || 400);         // 回复超长截断阈值
@@ -68,7 +83,7 @@ function featDefaults() {                                             // .env �
   return {
     shitpost: process.env.SHIT_ENABLED === '1',                    // 搬屎(随机一搬/精选一搬)
     kuangshen: process.env.KUANGSHEN_ENABLED === '1',              // 框神语录(回复+实时采集+回填)
-    ai: process.env.AI_CHAT_ENABLED ? process.env.AI_CHAT_ENABLED === '1' : !!GLM_API_KEY, // AI 闲聊(兜底;无 key 时强制关)
+    ai: process.env.AI_CHAT_ENABLED ? process.env.AI_CHAT_ENABLED === '1' : !!AI_API_KEY, // AI 闲聊(兜底;无 key 时强制关)
     updatedAt: 0,
   };
 }
@@ -81,7 +96,7 @@ function loadFeatures() {
     if (typeof f.kuangshen === 'boolean') d.kuangshen = f.kuangshen;
     if (typeof f.ai === 'boolean') d.ai = f.ai;
   }
-  if (!GLM_API_KEY) d.ai = false;   // 没配 key,开了也是白开
+  if (!AI_API_KEY) d.ai = false;   // 没配 key,开了也是白开
   // 文件缺字段(老文件遇新开关)时补写一份:否则运维 WebUI 读到 undefined 会显示成 OFF,
   // 与实际运行状态不符,点开关也会对不上。
   if (!f || ['shitpost', 'kuangshen', 'ai'].some(k => typeof f[k] !== 'boolean')) {
@@ -192,14 +207,19 @@ async function fetchTranscript(groupId, count = 100) {
   const names = new Map();
   for (const m of msgs) if (m.user_id && !names.has(m.user_id)) names.set(m.user_id, nameOf(m.sender));
   const lines = [];
+  // 跨天的消息**必须带日期**:群里静半天/一天时「最近 N 条」可能整段是昨天的,只给 HH:MM 模型会当成
+  // 刚刚发生(2026-09-14 实测:上下文最后几行是 09-13 的 17:19,问「现在几点了」它答「下午 5 点 19 分」
+  // ——就是从那行抄的,尽管系统提示词里已写着「现在是 …11:27」)。前缀只加给非今天的消息。
+  const dayStart = d => new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+  const t0 = dayStart(new Date());
   for (const m of msgs.reverse()) {
-    if (String(m.user_id) === BOT_ID) continue;
-    const t = new Date(m.time * 1000);
+    if (String(m.user_id) === BOT_ID) continue;    const t = new Date(m.time * 1000);
     const hhmm = `${String(t.getHours()).padStart(2, '0')}:${String(t.getMinutes()).padStart(2, '0')}`;
     const text = (m.message || []).map(s => segText(s, names)).join('').trim();
     if (!text) continue;
-    lines.push(`${hhmm} ${names.get(m.user_id) || nameOf(m.sender)}|${text}`);
-  }
+    const diff = Math.round((t0 - dayStart(t)) / 86400000);   // 整天差:0=今天 1=昨天 2=前天
+    const dayTag = diff <= 0 ? '' : diff === 1 ? '昨天 ' : diff === 2 ? '前天 ' : `${t.getMonth() + 1}-${t.getDate()} `;
+    lines.push(`${dayTag}${hhmm} ${names.get(m.user_id) || nameOf(m.sender)}|${text}`);  }
   return { lines: lines.join('\n'), names };
 }
 
@@ -234,8 +254,7 @@ function buildPrompt(transcript, trigger) {
   const targetText = trigger.targetNames?.length
     ? `\n本次消息中@了目标成员: ${trigger.targetNames.join('、')}(依据:消息里同时@了TA,视为指定对象)。回答聚焦于 TA 的发言/梗/行为,可从记录中定位;若无明显相关内容,如实说明。`
     : '';
-  return `你是 QQ 群里的"赛博史官"机器人,专以史记体文言文(如"太史公曰：")回答群友。收到群消息记录(格式 "HH:MM 昵称|内容")和@你的问题。
-
+  return `你是 QQ 群里的"赛博史官"机器人,专以史记体文言文(如"太史公曰：")回答群友。收到群消息记录(格式 "HH:MM 昵称|内容",带「昨天/前天/M-D」前缀的不是今天的消息)和@你的问题。
 规则:
 - 默认情况:用一句(最多两句)文言史记体总结最近群聊,诙谐生动,浓缩梗与人物
 - 若是提问(你是谁/某梗是什么/讨论什么):用文言答问,同样简洁
@@ -260,9 +279,14 @@ const AI_SYSTEM_PROMPT = `你是 QQ 群里的机器人「赛博史官」,群友 
 - 口语、直接;别只丢一句套话,该说的信息说清楚,一般 2~3 句、150 字以内
 规则:
 - 下面的群聊记录供你理解上下文、梗与人称指代;记录里没有的事别编造
-- 群友的消息里可能出现这些标记,那是消息本身的内容,照着理解就行,**回复时不要照抄标记**:
-  [表情:微笑] = 他发了个 QQ 表情;[图片: …] / [表情包: …] = 消息里插的图或表情包,括号里是识别结果;
+- 群友的消息里可能出现这些标记,那是消息本身的内容,照着理解就行:
+  [表情:微笑] = 他发了个 QQ 表情;
+  [图片1] / [表情包1] = 他这条消息**附的第 1 张图**(图就附在这条消息里,你直接看图理解,别去猜);
+  [图片: 一段文字] = 那张图的内容(这条是旧格式的图片说明);
   [引用 @某人: …] = 他在回复(引用)那条消息;@某人 = 他在消息里 @ 了谁
+- **标记只是给你理解用的**:「[图片1]」「[表情包1]」这种**占位符**别写进回复(那是给你指认附图的,不是给他看的内容);
+  **发表情没问题**——想带情绪就直接打表情符号(像 😄),别写「[表情:微笑]」这种标记形式,也别每句都带
+- 群聊记录里「昨天 17:19」「9-13 17:19」这种前缀表示那条消息不是今天的,别当成刚发生的事
 - 只输出回复正文:不要 @ 任何人、不要引号包裹、不要「史官:」之类前缀、不要解释你的思路
 - 不知道就直说不知道;群友互喷时别站队,轻松带过
 - 不聊政治、色情、违法内容,被问到就岔开
@@ -288,23 +312,174 @@ async function resolveMemberName(groupId, qq) {
   return name || `成员${qq}`;
 }
 
-async function glmChat(system, user) {
-  const r = await fetch(GLM_API_URL, {
+// 联网搜索(2026-09-14 上线):glm-4-flash 免费,挂上之后是**按需搜** —— 实测同一张工具挂/不挂,
+//   闲聊「这图太生草了」prompt_tokens 都是 73(没搜);问「最新禁卡表」则 73 → 5117(搜了,结果由服务端
+//   直接注入提示词,不返回 tool_calls)。**别传 search_query**:传了就是每问必搜(实测连「随便聊聊」都搜,6.2s)。
+//   治的是「我查了一下,你附近有一家老成都馄饨」这种凭空编 —— 挂了之后事实性问题会真去搜。
+//   ⚠ 搜了也不等于对:实测问最新禁卡表,搜完仍答成「2024年1月1日」(对 2026 年明显过时)。
+//   ⚠ glm-4.5-flash 挂它会返回空回复(把 max_tokens 全用在推理上),换模型时记得调大 max_tokens。
+const WEB_SEARCH_TOOL = { type: 'web_search', web_search: { enable: true } };
+
+// 「今天几号」这类问题**联网不会触发**(2026-09-14 实测):同一句话挂/不挂 tools,prompt_tokens 都是 369
+//   (压根没搜),模型就直接编 —— 连问两次,一次「今天20号」一次「今天12号」。而问「最新禁卡表」确实会搜
+//   (427 → 2811)。所以**不是联网坏了,是日期得自己喂**:glm-4-flash 的训练数据本就停在过去,
+//   而它自认为知道今天几号,根本不会去搜。喂进去立刻就对(实测「今天9月14号,周一呢」)。
+//   **每次请求现算**,别提到模块顶层算一次 —— monitor 是常驻进程,顶层那个值会停在启动那一刻,
+//   过了午夜就开始骗人(本地时间,与每日一卡的 dayKey 同一套基准;服务器 TZ 已是 Asia/Shanghai)。
+function nowText(ts = Date.now()) {
+  const d = new Date(ts);
+  const p = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()} 年 ${d.getMonth() + 1} 月 ${d.getDate()} 日(星期${'日一二三四五六'[d.getDay()]})${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+// 带图时的额外规则(2026-09-17 实测补的):**不加这条,模型会漏掉/答错图上的关键信息** ——
+// 起因:群友引用一张 394x138 的卡图说「翻译」,模型答成「能通常召唤」(卡上写的是不能通常召唤)。
+// 复现与对照(同一张图、线上同款提示词):原样跑 3 次只有 1 次提到召唤限制;只把温度降到 0.3 → 0/3(没用);
+// 把图放大 4 倍 → 能读对但更贵(in=1239);**只加下面这条规则 → 3/3 全对**,且不用放大(in=877)。
+// 结论:关键在「让它照实读、读不清就说读不清」,不在分辨率也不在温度 —— 别再回头折腾放大。
+const IMG_READ_RULE = `
+- 他这条消息带了图。图上的字**照实读**:卡名、数值、召唤条件这类关键信息一律以图上写的为准;
+  图上写没写「不能通常召唤」这类限制,写了就必须译出来,没写就别自己加
+- 读不清就说读不清,别猜、别拿常识补;拿不准就说拿不准(群友追问时也一样,别为了顺着他改口,也别为了顶回去硬撑)`;
+
+// 系统提示词 = 固定人设 + 当前时间。末尾「他没问就别主动报时间」是给小模型的护栏:不写这句,
+// 它容易在闲聊里顺嘴报一句时间,写了之后闲聊不再带时间(实测;联网那套照旧,事实问题该搜还搜)。
+const aiSystemPrompt = (hasImages = false) => `${AI_SYSTEM_PROMPT}${hasImages ? IMG_READ_RULE : ''}
+- 现在是 ${nowText()}。这是你说话时的真实时间,群友问日期/时间/星期以它为准;他没问就别主动报时间`;
+
+async function aiChat(system, userText, images = []) {
+  // 退让阶梯:先按默认档跑;碰到 4xx(参数/格式不认)依次去掉「联网工具」「关思考」,最后连图一起去掉。
+  // 换后端/换模型最容易踩的就是参数不认 —— 实测 deepseek 挂智谱的 web_search 工具必 4xx,
+  // 有的后端不认 reasoning_effort。一个参数不能把整条闲聊弄挂。
+  // 超时/网络错**不重试**:再来一轮只会把群友的等待翻倍。
+  const ladder = [
+    { webSearch: AI_WEB_SEARCH, thinkOff: AI_THINK_OFF, images, tag: '' },
+    ...(AI_WEB_SEARCH ? [{ webSearch: false, thinkOff: AI_THINK_OFF, images, tag: '去掉联网工具' }] : []),
+    ...(AI_THINK_OFF ? [{ webSearch: false, thinkOff: false, images, tag: '带上思考' }] : []),
+    ...(images.length ? [{ webSearch: false, thinkOff: AI_THINK_OFF, images: [], tag: '去掉图片' }] : []),
+  ];
+  let lastErr;
+  for (const step of ladder) {
+    try {
+      if (step.tag) log(`  AI 闲聊重试(${step.tag})...`, '', C.dim);
+      return await aiChatOnce(system, userText, step.images, step);
+    } catch (e) {
+      lastErr = e;
+      if (!/^HTTP 4/.test(String(e.message || ''))) throw e;
+    }
+  }
+  throw lastErr;
+}
+
+// 图片按 OpenAI 多模态格式附在正文后面;**必须是 data URL**(data:image/jpeg;base64,...)——
+// 实测传裸 base64 会被拒「Unsupported image_url format」(2026-09-17)。
+function buildUserContent(text, images) {
+  if (!images?.length) return text;
+  return [
+    { type: 'text', text },
+    ...images.map(im => ({ type: 'image_url', image_url: { url: `data:${im.mime};base64,${im.b64}` } })),
+  ];
+}
+
+async function aiChatOnce(system, userText, images = [], opts = {}) {
+  const { webSearch = AI_WEB_SEARCH, thinkOff = AI_THINK_OFF } = opts;
+  const r = await fetch(AI_API_URL, {
     method: 'POST',
-    headers: { Authorization: `Bearer ${GLM_API_KEY}`, 'Content-Type': 'application/json' },
+    headers: { Authorization: `Bearer ${AI_API_KEY}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      model: GLM_MODEL,
-      messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
+      model: AI_MODEL,
+      messages: [{ role: 'system', content: system }, { role: 'user', content: buildUserContent(userText, images) }],
       temperature: 0.8,
-      max_tokens: 500,
+      max_tokens: AI_CHAT_MAX_TOKENS,
+      ...(thinkOff ? { reasoning_effort: 'none' } : {}),
+      ...(webSearch ? { tools: [WEB_SEARCH_TOOL] } : {}),
     }),
     signal: AbortSignal.timeout(AI_CHAT_TIMEOUT_MS),
   });
   const j = await r.json().catch(() => null);
-  if (!r.ok) throw new Error(`HTTP ${r.status} ${j?.error?.message || ''}`.trim());
+  if (!r.ok) throw new Error(`HTTP ${r.status} ${j?.error?.message || j?.message || ''}`.trim());
   const text = j?.choices?.[0]?.message?.content?.trim();
-  if (!text) throw new Error('GLM 返回空回复');
+  if (!text) throw new Error(`${AI_MODEL} 返回空回复`);
   return text;
+}
+
+// ---------- AI 闲聊记账(2026-09-17:运维 WebUI 要按用户统计调用次数) ----------
+// 口径(用户定的):**以回复发给了哪个 @用户为准** —— 所以只在「回复真的发出去」时 +1;
+// 冷却跳过(压根没调模型)与失败(回了「史官一时语塞」)分开记 failed,不计入次数。
+// 存 agent/aichat_stats.json(不入库),运维台读它画横向条形图。
+const AICHAT_STATS_FILE = join(__dirname, 'aichat_stats.json');
+function loadAiChatStats() {
+  try {
+    const s = JSON.parse(readFileSync(AICHAT_STATS_FILE, 'utf8'));
+    if (s && typeof s === 'object' && s.users) return s;
+  } catch { /* 文件缺失/损坏 → 从零开始 */ }
+  return { users: {}, total: 0, updatedAt: 0 };
+}
+function saveAiChatStats(s) {
+  s.updatedAt = Date.now();
+  try {
+    writeFileSync(AICHAT_STATS_FILE + '.tmp', JSON.stringify(s, null, 1), 'utf8');
+    renameSync(AICHAT_STATS_FILE + '.tmp', AICHAT_STATS_FILE);
+  } catch (e) { log('  AI 闲聊记账失败:', e.message, C.red); }
+}
+function bumpAiChatStat(entry, ok = true) {
+  const s = loadAiChatStats();
+  const qq = String(entry.user_id);
+  const u = s.users[qq] || (s.users[qq] = { name: '', count: 0, failed: 0, last: 0 });
+  if (entry.nickname) u.name = entry.nickname;          // 群名片会改,记最新的
+  if (ok) { u.count = (u.count || 0) + 1; u.last = Date.now(); s.total = (s.total || 0) + 1; }
+  else u.failed = (u.failed || 0) + 1;
+  saveAiChatStats(s);
+}
+
+// 历史回填(启动参数 --backfill-aichat-stats [YYYY-MM-DD]):processed.jsonl 里没记「哪条是 AI 闲聊」,
+// 只能按 processEntry 的分流顺序把其它触发词逐条排掉 —— 所以是**近似值**:
+//   ① 开关状态未必与当时一致(比如框神语录那阵子还开着);② 触发词可能被 env 改过。
+// 只为让统计页一开始就有数,别当账本。
+function looksLikeAiChat(entry) {
+  const text = (entry.text || '').replace(/\[at\]/g, ' ');
+  if (!text.trim()) return false;
+  if (isHelpRequest(text)) return false;
+  if (text.includes(TRIGGER_KEYWORD)) return false;
+  if (text.includes(DAILY_KEYWORD)) return false;
+  if (extractCardQuery(entry, DECK_TRIGGER).triggered) return false;
+  if (text.includes(KUANGSHEN_TRIGGER)) return false;
+  if (text.includes(SHIT_AI_TRIGGER) || text.includes(SHIT_TRIGGER)) return false;
+  if (extractCardQuery(entry, CARD_TRIGGER).triggered) return false;
+  if (extractCardQuery(entry, CARD_IMG_TRIGGER).triggered) return false;
+  if (text.includes(RULING_FULL_TRIGGER)) return false;
+  if (extractCardQuery(entry, RULING_TRIGGER).triggered) return false;
+  return true;
+}
+function backfillAiChatStats(since = '2026-09-13') {
+  const cutoff = Math.floor(new Date(`${since}T00:00:00+08:00`).getTime() / 1000);
+  const s = loadAiChatStats();
+  const seen = new Set();
+  let scanned = 0, added = 0;
+  const lines = existsSync(PROCESSED) ? readFileSync(PROCESSED, 'utf8').split('\n') : [];
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    let e; try { e = JSON.parse(line); } catch { continue; }
+    if (seen.has(e.seq)) continue;                       // processed.jsonl 里同一条可能有多行
+    seen.add(e.seq);
+    scanned++;
+    if ((e.time || 0) < cutoff) continue;
+    if (!looksLikeAiChat(e)) continue;
+    const qq = String(e.user_id);
+    const u = s.users[qq] || (s.users[qq] = { name: '', count: 0, failed: 0, last: 0 });
+    if (e.nickname) u.name = e.nickname;
+    u.count = (u.count || 0) + 1;
+    u.last = Math.max(u.last || 0, (e.time || 0) * 1000);
+    s.total = (s.total || 0) + 1;
+    added++;
+  }
+  s.approximateSince = since;                            // 运维台据此标「(含估算)」
+  saveAiChatStats(s);
+  log('AI 闲聊统计回填:', `扫 ${scanned} 条 processed / 计入 ${added} 条(自 ${since} 起,近似)`, C.green);
+  for (const [qq, u] of Object.entries(s.users).sort((a, b) => b[1].count - a[1].count).slice(0, 10)) {
+    log('  ', `${u.name || '?'}(${qq}) ${u.count} 次`, C.dim);
+  }
+  process.exit(0);
 }
 
 async function processAiChat(entry) {
@@ -321,35 +496,39 @@ async function processAiChat(entry) {
   if (AI_CHAT_CTX > 0) {
     try {   // 取不到上下文不致命,退化成只按这句话回答
       const { lines, names: n } = await fetchTranscript(entry.group_id, AI_CHAT_CTX);
-      if (lines) ctx = `群聊记录(最近 ${AI_CHAT_CTX} 条,格式 "HH:MM 昵称|内容"):\n${lines}\n\n`;
-      names = n;
+      if (lines) ctx = `群聊记录(最近 ${AI_CHAT_CTX} 条,格式 "HH:MM 昵称|内容";带「昨天/前天/M-D」前缀的是更早的消息,不是刚发生):\n${lines}\n\n`;      names = n;
     } catch (e) {
       log('  AI 闲聊取上下文失败(改为裸答):', e.message, C.yellow);
     }
   }
-  // 消息解析:把 @某人/引用/表情/图片还原成文字(图片要单独过一遍视觉模型,可能多花 1~3 秒)
+  // 消息解析:@某人/引用/表情/图片 → 正文;direct 模式下图片**直接随消息发出去**,一轮出结果
   let q = aiQuestionText(entry);
+  let images = [];
   try {
-    const rich = await buildAiQuestion(entry, {
+    const rich = await buildAiQuestionRich(entry, {
       botId: BOT_ID,
       log: m => log(' ', m, C.dim),
       getMsg: id => api('get_msg', { message_id: id }),
       memberName: qq => names?.get(Number(qq)) || resolveMemberName(entry.group_id, qq),
     });
-    if (rich) q = rich;
+    if (rich?.text) q = rich.text;
+    images = rich?.images || [];
+    if (rich && rich.mode !== 'direct') log(`  图片走 ${rich.mode} 模式`, '', C.dim);
   } catch (e) {
     log('  AI 闲聊消息解析失败(退回纯文本):', e.message, C.yellow);
   }
   q = q.replace(/@你(史官)/g, ' ').replace(/\s+/g, ' ').trim() || '(无文字,仅@)';
-  log(`  ${GLM_MODEL} 生成中 ...`, '', C.dim);
+  log(`  ${AI_MODEL} 生成中 ...${images.length ? `(含 ${images.length} 张图,一轮出结果)` : ''}`, '', C.dim);
   try {
-    let reply = await glmChat(AI_SYSTEM_PROMPT, `${ctx}@你的人: ${entry.nickname}\nTA 的问题: ${q}`);
+    let reply = await aiChat(aiSystemPrompt(images.length > 0), `${ctx}@你的人: ${entry.nickname}\nTA 的问题: ${q}`, images);
     if (reply.length > AI_CHAT_MAX_CHARS) reply = reply.slice(0, AI_CHAT_MAX_CHARS) + '……';
     log('  回复:', reply.replace(/\n/g, ' ').slice(0, 60) + (reply.length > 60 ? '...' : ''), C.green);
     await sendReply(entry, reply);
+    if (!DRY_RUN) bumpAiChatStat(entry, true);            // 记账:这条回复给了谁
   } catch (e) {
     log('  AI 闲聊失败:', e.message, C.red);
     await sendReply(entry, '史官一时语塞,稍后再问。');
+    if (!DRY_RUN) bumpAiChatStat(entry, false);
   }
   appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
 }
@@ -1017,7 +1196,7 @@ async function processEntry(entry) {
     return;
   }
   // 兜底:没命中任何指令的 @ → 交给 AI 闲聊(面板 3 键 / opsweb 可热关)
-  if (FEAT.ai && GLM_API_KEY) {
+  if (FEAT.ai && AI_API_KEY) {
     log('▶ 处理', `${entry.group_name} @${entry.nickname} seq=${entry.seq} [AI 闲聊]`, C.cyan);
     await processAiChat(entry);
     return;
@@ -1257,6 +1436,11 @@ function connect() {
   };
   ws.onerror = (e) => log('WS 错误:', e.message || e, C.red);
 }
+// 启动参数 --backfill-aichat-stats [YYYY-MM-DD]:回填 AI 闲聊统计后直接退出(不连 WS)
+if (process.argv.includes('--backfill-aichat-stats')) {
+  backfillAiChatStats(process.argv.find(a => /^\d{4}-\d{2}-\d{2}$/.test(a)));
+}
+
 connect();
 
 // 纯文本 @ 识别用昵称:启动时拉取当前 QQ 昵称加入集合
@@ -1289,4 +1473,4 @@ setInterval(async () => {
 if (process.argv.includes('--update-cards')) updateCardDb();
 
 drawFeaturePanel();
-log(`${DRY_RUN ? '[DRY_RUN] ' : ''}QQ Agent 监控终端启动 (bot=${BOT_ID} | ${TRIGGER_KEYWORD}=史记 | ${CARD_TRIGGER}=查卡 | ${CARD_IMG_TRIGGER}=卡图 | ${RULING_TRIGGER}=官裁 | ${RULING_FULL_TRIGGER}=裁定PDF | ${DAILY_KEYWORD}=每日一卡 | AI闲聊=${FEAT.ai ? GLM_MODEL : 'OFF'} | 功能开关见面板 1/2/3)`, '', C.cyan);
+log(`${DRY_RUN ? '[DRY_RUN] ' : ''}QQ Agent 监控终端启动 (bot=${BOT_ID} | ${TRIGGER_KEYWORD}=史记 | ${CARD_TRIGGER}=查卡 | ${CARD_IMG_TRIGGER}=卡图 | ${RULING_TRIGGER}=官裁 | ${RULING_FULL_TRIGGER}=裁定PDF | ${DAILY_KEYWORD}=每日一卡 | AI闲聊=${FEAT.ai ? `${AI_MODEL}${AI_WEB_SEARCH ? '+联网' : ''}(上下文 ${AI_CHAT_CTX} 条${AI_IS_DS ? ',图片直传一轮' : ',图片两轮识别'})` : 'OFF'} | 功能开关见面板 1/2/3)`, '', C.cyan);

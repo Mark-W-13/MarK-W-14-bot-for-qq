@@ -7,14 +7,13 @@
 服务器凭据(勿外传).txt
 远程服务器信息.txt
 
-# 运行时数据(群消息记录 / 日志 / 抽卡状态 / 功能开关 / 框神语录库)
+# 运行时数据(群消息记录 / 日志 / 抽卡状态 / 功能开关 / 框神语录库 / AI 闲聊记账)
 agent/inbox.jsonl
 agent/processed.jsonl
 agent/daily_card.json
 agent/features.json
-agent/listener.log
+agent/aichat_stats.json
 agent/*.log
-agent/tmp_*.json
 agent/kuangshen/quotes.json
 agent/kuangshen/blacklist.json
 agent/kuangshen/pending.json
@@ -40,9 +39,6 @@ agent/ygocard/cards_img/
 agent/shitpost/tmp/
 agent/shitpost/pending.json
 agent/shitpost/seed_memory.json
-
-# 运行时 pid
-agent/listener.pid
 
 # 服务器部署位的屎库/样本(随数据迁移,不入库)
 data/

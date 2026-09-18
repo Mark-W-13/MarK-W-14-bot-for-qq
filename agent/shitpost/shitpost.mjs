@@ -8,10 +8,10 @@
 //   node shitpost.mjs --image      # 自测:含截图,输出 png 路径
 //   node shitpost.mjs --dump       # 打印候选池评分明细(调词表用)
 import '../env.mjs';   // ⚠ 第一个:下面的模块 / 本文件顶层要从 .env 取值(CLI 自测也靠自己加载)
-import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync, unlinkSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { chromePath } from '../env.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -517,32 +517,89 @@ body{margin:0;background:#f1f2f3;font-family:"Microsoft YaHei",sans-serif;width:
   };
 }
 
-// Edge headless 截图 → 返回 PNG 绝对路径
-export function renderCard(card) {
+// ---------- 截图 ----------
+// 2026-09-17 重写(服务器反馈:随机一搬的截图右侧有滚动条、底部一大条空白,影响观感)。
+// 根因**不在 CSS,在 chrome 的一个坑**:`--headless=new` 的 `--window-size` 量的是**窗口**而不是视口 ——
+// 实测请求 620x522 时视口只有 620x435,**恒定差 87px**(窗口边框;窗口 300/522/800 都是差 87)。连锁反应:
+//   视口矮了 87px → 内容(455px)溢出 → 出纵向滚动条 → 视口宽度被挤掉 15px → 又冒横向滚动条;
+//   而截图按窗口尺寸出图 → 底部那 87px 就是一条空白。
+// 修法三步:① `--hide-scrollbars` 不给滚动条;② 先探针量出真实内容高,窗口高 = 内容高 + 边框;
+//           ③ 用 ffmpeg 把边框那一条裁掉(没有 ffmpeg 就跳过第③步——至少不再是滚动条,只剩一条背景色边)。
+const WIN_FRAME_FALLBACK = 87;   // headless=new 的窗口边框实测值(只在探针失败时兜底)
+
+let ffmpegOk = null;
+function hasFfmpeg() {
+  if (ffmpegOk === null) {
+    try { ffmpegOk = spawnSync(process.env.FFMPEG_BIN || 'ffmpeg', ['-version'], { stdio: 'ignore', timeout: 5000 }).status === 0; }
+    catch { ffmpegOk = false; }
+  }
+  return ffmpegOk;
+}
+
+// 探针:把页面真实尺寸写进 <title>,再用 --dump-dom 读回来(注入脚本只落在临时的 .probe.html,不动原文件)
+export function measureContent(htmlPath, width) {
+  const probePath = htmlPath.replace(/\.html$/, '.probe.html');
+  try {
+    const script = `<script>document.title='MC'+JSON.stringify({ih:innerHeight,bh:document.body.scrollHeight,bw:document.body.scrollWidth});</script>`;
+    const html = readFileSync(htmlPath, 'utf8');
+    writeFileSync(probePath, html.includes('</body>') ? html.replace('</body>', script + '</body>') : html + script, 'utf8');
+    const r = spawnSync(chromePath(), ['--headless=new', '--disable-gpu', '--no-first-run', '--hide-scrollbars',
+      `--window-size=${width},1200`, '--virtual-time-budget=8000', '--dump-dom', pathToFileURL(probePath).href],
+      { encoding: 'utf8', timeout: 30000, windowsHide: true });
+    const m = String(r.stdout || '').match(/MC(\{[^<]*\})/);
+    if (!m) return null;
+    const d = JSON.parse(m[1]);
+    const frame = 1200 - Number(d.ih);
+    const h = Number(d.bh) || 0;
+    const w = Math.max(width, Number(d.bw) || 0);
+    return (h > 0 && frame > 0 && frame < 200) ? { frame, w, h } : null;
+  } catch { return null; }
+  finally { try { unlinkSync(probePath); } catch {} }
+}
+
+// 浏览器 headless 截图 → 返回 PNG 绝对路径(图高 = 内容真实高度,不再靠估算)
+export async function renderCard(card) {
   const { html, width, height } = card;
   mkdirSync(TMP, { recursive: true });
   const htmlPath = join(TMP, 'card.html');
   const pngPath = join(TMP, 'card.png');
   writeFileSync(htmlPath, html, 'utf8');
-  return new Promise((resolve, reject) => {
-    const url = `file:///${htmlPath.replace(/\\/g, '/')}`;
+
+  const m = measureContent(htmlPath, width);            // 探针失败 → 退回估算高度(旧行为,不影响出图)
+  const frame = m?.frame ?? WIN_FRAME_FALLBACK;
+  const shotW = m?.w ?? width;
+  const shotH = Math.max(40, (m?.h ?? height) + 2);     // 内容高 + 2px 余量,防最后一像素被切
+  const winH = shotH + frame;
+
+  await new Promise((resolve, reject) => {
     const args = [
-      '--headless=new', '--disable-gpu', '--no-first-run',
+      '--headless=new', '--disable-gpu', '--no-first-run', '--hide-scrollbars',
       '--run-all-compositor-stages-before-draw', '--virtual-time-budget=8000',
-      `--window-size=${width},${height}`,
+      `--window-size=${shotW},${winH}`,
       `--screenshot=${pngPath}`,
       `--user-data-dir=${join(TMP, 'edge_prof')}`,
-      url,
+      pathToFileURL(htmlPath).href,
     ];
     const child = spawn(chromePath(), args, { windowsHide: true, stdio: 'ignore' });
     const timer = setTimeout(() => { try { child.kill(); } catch {} }, 30000);
-    child.on('error', e => { clearTimeout(timer); reject(new Error(`Edge 启动失败: ${e.message}`)); });
+    child.on('error', e => { clearTimeout(timer); reject(new Error(`浏览器启动失败: ${e.message}`)); });
     child.on('exit', code => {
       clearTimeout(timer);
       if (!existsSync(pngPath)) return reject(new Error(`截图失败(exit ${code})`));
-      resolve(pngPath);
+      resolve();
     });
   });
+
+  // 裁掉窗口边框那一条(裁切失败不致命,只是底部多一条背景色)
+  if (hasFfmpeg()) {
+    const cropped = join(TMP, 'card.crop.png');
+    try {
+      const r = spawnSync(process.env.FFMPEG_BIN || 'ffmpeg',
+        ['-y', '-loglevel', 'error', '-i', pngPath, '-vf', `crop=${shotW}:${shotH}:0:0`, cropped], { timeout: 30000 });
+      if (r.status === 0 && existsSync(cropped)) renameSync(cropped, pngPath);
+    } catch { /* 保持未裁切的图 */ }
+  }
+  return pngPath;
 }
 
 export function pngToSegment(pngPath) {
