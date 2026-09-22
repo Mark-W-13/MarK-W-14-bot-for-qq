@@ -33,6 +33,7 @@ downloads/
 
 # 临时文件
 *.tmp
+tmp_*
 agent/ygocard/tmp/
 
 # 卡图数据库(体积大,可重下重建)
