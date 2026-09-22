@@ -22,18 +22,26 @@ import { readFileSync, existsSync, statSync, readdirSync,
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
+import { allModes, setMode as setGroupMode, modeOf, MODE_CN, MODES } from './modes.mjs';
+import { getTone, setTone, TONES, TONE_CN, TONE_DESC, tonePath } from './aichat/tone.mjs';
+// ⚠ 这一行只是把 env.mjs **加载**进来 —— 它**被 import 的那一刻**就自己把 agent/.env 读进
+//   process.env 了(env.mjs 文件末尾有 loadEnvFile())。所以本文件**不要再自己调一次** loadEnvFile():
+//   那时 .env 的键已经在 process.env 里,再调会因为「已存在」而全部跳过、返回空数组,
+//   2026-09-21 就在启动日志里打出过误导人的「agent/.env: 读入 0 个键」。要展示读了哪些键用 envLoadedKeys()。
+import { envLoadedKeys } from './env.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const AGENT = __dirname;
 
-// ---------- 加载 .env(与 monitor.mjs 同一套做法:已存在的环境变量优先) ----------
-try {
-  const envText = readFileSync(join(AGENT, '.env'), 'utf8');
-  for (const line of envText.split('\n')) {
-    const m = line.match(/^\s*([A-Z_][A-Z0-9_]*)\s*=\s*(.*)$/);
-    if (m && !(m[1] in process.env)) process.env[m[1]] = m[2].replace(/^["']|["']$/g, '');
-  }
-} catch { /* 没有 .env 也能跑,令牌可用环境变量给 */ }
+// ---------- .env ----------
+// 为什么这里曾经出过事(2026-09-21 定位并修,别再抄回去):
+//   本文件原先**自己手抄了一份** .env 解析,正则写作 `/^\s*([A-Z_][A-Z0-9_]*)\s*=\s*(.*)$/`,
+//   而本仓库的 .env 是 **CRLF** 的 —— 在 Node 24 上这条正则**一行都匹配不上**
+//   (实测:`"A=1\r".match(...)` → null,`\s*$` 撞上结尾的 `\r` 会回退失败)。
+//   后果:opsweb 读不到 OPSWEB_TOKEN(登录直接废)、也读不到 ZHIPU_API_KEY
+//   (联网源被误判成「零 key」的 bing),而同一台机器上的 monitor(走 env.mjs)一切正常 ——
+//   两个进程行为不一致,极难查。现在两边统一由 env.mjs 负责解析,别再各写一份。
+const loadedEnvKeys = envLoadedKeys();
 
 const PORT = Number(process.env.OPSWEB_PORT || 8090);
 const HOST = '127.0.0.1';                       // 硬编码,理由见文件头
@@ -44,16 +52,20 @@ const FEATURES = join(AGENT, 'features.json');
 const CARDS = join(AGENT, 'ygocard', 'cards.json');
 const IMG_DIR = join(AGENT, 'ygocard', 'cards_img');
 const AICHAT_STATS = join(AGENT, 'aichat_stats.json');   // AI 闲聊按用户记账(monitor 写,本页只读)
+const SEARCH_STATS = join(AGENT, 'search_stats.json');   // 联网搜索次数记账(monitor 写,本页只读)
 
-// AI 闲聊后端(与 monitor.mjs 同一套推断:有 DEEPSEEK_API_KEY 就走 deepseek,否则智谱 GLM)。
+// AI 闲聊后端(2026-09-21 起与 monitor.mjs 同一套:**只有一条 OpenAI 兼容后端**,智谱聊天后端已删)。
 // 界面文案要跟着实际配置走 —— 2026-09-17 用户指出这里还写死成 GLM,与实际不符。
 // 注意:.env 是 opsweb 启动时读的,换后端后要重启 opsweb(monitor 同理)文案才更新。
-const AI_IS_DS = (process.env.AI_CHAT_PROVIDER || (process.env.DEEPSEEK_API_KEY ? 'deepseek' : 'glm')).toLowerCase() === 'deepseek';
-const AI_BACKEND_NAME = AI_IS_DS ? 'DeepSeek' : '智谱 GLM';
-const AI_MODEL_NAME = process.env.AI_CHAT_MODEL
-  || (AI_IS_DS ? 'deepseek-flash' : (process.env.GLM_MODEL || 'glm-4-flash'));
-const AI_IMG_DIRECT = String(process.env.AI_CHAT_IMAGE_MODE || 'direct').toLowerCase() === 'direct';
-const AI_CHAT_DESC = `未命中指令的 @ 交给 ${AI_BACKEND_NAME}(${AI_MODEL_NAME}) 接话${AI_IMG_DIRECT ? ',图片直传一轮' : ',图片两轮识别'}(@/引用/表情/图片都认)`;
+const AI_MODEL_NAME = process.env.AI_CHAT_MODEL || 'deepseek-flash';
+const AI_BACKEND_NAME = /deepseek/i.test(AI_MODEL_NAME) ? 'DeepSeek' : '对话模型';
+// 联网:2026-09-21 从「智谱服务端注入」改成「本地 function calling 工具」,**任何后端都能搜**,
+// 所以这里不再需要区分后端。文案直接说清用的哪个搜索源(文案与 monitor 的 searchProviderText 口径一致)。
+const AI_SEARCH_ON = process.env.AI_CHAT_WEB_SEARCH !== '0';
+const AI_SEARCH_PROVIDER = process.env.SEARCH_PROVIDER
+  || (process.env.ZHIPU_API_KEY ? 'zhipu' : process.env.TAVILY_API_KEY ? 'tavily' : process.env.BOCHA_API_KEY ? 'bocha' : 'bing');
+const AI_CHAT_DESC = `未命中指令的 @ 交给 ${AI_BACKEND_NAME}(${AI_MODEL_NAME}) 接话,图片直传一轮(@/引用/表情/图片都认);`
+  + `联网${AI_SEARCH_ON ? `开(源:${AI_SEARCH_PROVIDER},自己判断该不该搜)` : '关'}`;
 
 // 受管的 systemd 用户级单元(顺序即界面顺序)
 const UNITS = [
@@ -67,15 +79,23 @@ const UNITS = [
 // ---------- 小工具 ----------
 
 // 带超时的子进程调用。超时是刚需:tmux/systemctl 卡住不能把 HTTP 响应一起拖死。
+// ⚠ 必须吞掉「同步抛出的 spawn 错误」:execFile 在**起不来**时会**同步 throw**
+//   (实测被沙箱限制的环境里是 `spawn EPERM`,机器上没有 tmux/systemctl 时是 ENOENT)。
+//   不吞的话异常会穿出 buildStatus,把整个 /api/status 打成 500 —— 页面全白,
+//   而真实原因只是「这台机器上没 systemctl」。2026-09-21 在本地复现到,顺手修掉:
+//   服务控制类接口本来就有 code 判断,返回 code:1 反而能给出「已停止」这种看得懂的状态。
 function sh(cmd, args = [], timeout = 8000) {
   return new Promise(resolve => {
-    execFile(cmd, args, { timeout, encoding: 'utf8' }, (err, stdout, stderr) => {
-      resolve({
-        code: err ? (typeof err.code === 'number' ? err.code : 1) : 0,
-        out: stdout || '',
-        err: stderr || '',
-      });
+    const done = (err, stdout, stderr) => resolve({
+      code: err ? (typeof err.code === 'number' ? err.code : 1) : 0,
+      out: stdout || '',
+      err: stderr || '',
     });
+    try {
+      execFile(cmd, args, { timeout, encoding: 'utf8' }, done);
+    } catch (e) {
+      resolve({ code: 1, out: '', err: e.message || String(e) });
+    }
   });
 }
 
@@ -189,6 +209,22 @@ async function onebot(action) {
   } catch { return null; }
 }
 
+// ---------- 分群游戏模式(游戏王 / 炉石传说,2026-09-20) ----------
+// 与 monitor 共用 agent/modes.json(键=群号,值=ygo|hs);monitor 每次现读,所以这里改完立即生效。
+// 顺带把群名带出来(群里 @ 过 bot 的群在 OneBot 的 get_group_list 里都有)。
+async function groupsWithMode() {
+  const modes = allModes();
+  const nameOf = new Map();
+  const j = await onebot('get_group_list');
+  for (const g of (j?.data || [])) {
+    if (g?.group_id) nameOf.set(String(g.group_id), g.group_name || '');
+  }
+  for (const gid of Object.keys(modes)) if (!nameOf.has(gid)) nameOf.set(gid, '');
+  return [...nameOf.entries()]
+    .map(([groupId, name]) => ({ groupId, name, mode: modeOf(groupId), cn: MODE_CN[modeOf(groupId)] }))
+    .sort((a, b) => String(a.name || a.groupId).localeCompare(String(b.name || b.groupId), 'zh'));
+}
+
 function hostStats() {
   const num = (s, re) => { const m = String(s).match(re); return m ? Number(m[1]) : 0; };
   let load = '', memTotal = 0, memAvail = 0, uptimeS = 0;
@@ -261,6 +297,8 @@ async function buildStatus() {
     diskStats(),
     accountInfo(),
   ]);
+  let modes = [];
+  try { modes = await groupsWithMode(); } catch { modes = []; }
   let cardsMtime = null;
   try { cardsMtime = statSync(CARDS).mtime.toISOString(); } catch {}
   const cards = readJson(CARDS);
@@ -281,6 +319,27 @@ async function buildStatus() {
     ws: wsStateFrom(lines),
     tmux: !!lines,
     features: { shitpost: !!feat.shitpost, kuangshen: !!feat.kuangshen, ai: !!feat.ai, updatedAt: feat.updatedAt || 0 },
+    // 提示词档位(2026-09-21):与 features 那套不同,**不需要敲 tmux 按键** —— monitor 每次请求现读
+    // tone.json,所以这里直接写文件就即时生效(见 /api/tone)。toneAt 顺便给界面显示文件时间。
+    tone: {
+      current: getTone(),
+      options: TONES.map(t => ({ id: t, cn: TONE_CN[t], short: TONE_DESC[t].short, long: TONE_DESC[t].long })),
+      file: tonePath(),
+      updatedAt: (readJson(tonePath()) || {}).updatedAt || 0,
+    },
+    search: {
+      enabled: AI_SEARCH_ON,
+      provider: AI_SEARCH_PROVIDER,
+      total: (readJson(SEARCH_STATS) || {}).total || 0,
+      ok: (readJson(SEARCH_STATS) || {}).ok || 0,
+      failed: (readJson(SEARCH_STATS) || {}).failed || 0,
+      // byDay 的键是 monitor 的 dayKey() 格式(**本地时区、不补零**:2026-9-21),不是 ISO 日期,
+      // 所以这里也按本地时区拼,别用 toISOString()(那是 UTC,东八区凌晨会错到昨天去)。
+      today: ((readJson(SEARCH_STATS) || {}).byDay || {})[(() => {
+        const d = new Date(); return `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`;
+      })()] || null,
+    },
+    modes,
     account: info?.data ? { uin: String(info.data.user_id), nickname: info.data.nickname } : null,
     cards: { mtime: cardsMtime, count: cards ? Object.keys(cards).length : 0, images: countImages() },
     host: { ...host, disk, uptimeText: fmtDuration(host.uptimeS) },
@@ -443,6 +502,10 @@ button.mini{min-height:28px;padding:4px 10px;font-size:12px;border-radius:7px}
   <div class="card"><h2>功能开关</h2><div id="feats"></div>
     <div class="mut" style="margin-top:8px">切换即时生效,不重启 bot(走 tmux 面板按键)</div></div>
 
+  <div class="card wide"><h2>游戏模式 <span class="mut" style="font-weight:400">(按群)</span></h2>
+    <div id="modes"></div>
+    <div class="mut" style="margin-top:8px;font-size:11px">决定该群「效果 / 卡图 / 每日一卡 / 卡组」按哪个游戏走(默认游戏王);群友发「mode 炉石」「mode 游戏王」也能改,与此处同步。</div></div>
+
   <div class="card"><h2>服务</h2><div id="svcs"></div></div>
 
   <div class="card"><h2>账号</h2><div id="acct"></div></div>
@@ -453,6 +516,14 @@ button.mini{min-height:28px;padding:4px 10px;font-size:12px;border-radius:7px}
     <div id="upbox"><div id="uphead"></div><div id="upmsg"></div><pre id="uprog"></pre></div></div>
 
   <div class="card"><h2>主机</h2><div id="host"></div></div>
+
+  <div class="card wide"><h2>AI 闲聊 · 提示词档位 <span class="mut" style="font-weight:400" id="tonenote"></span></h2>
+    <div id="tones"></div>
+    <div class="mut" style="margin-top:8px;font-size:11px">决定机器人「能聊什么」:板正档守着原来的政治/色情红线,熟人群聊档(默认)把它们放开,放开档连引战也接。<strong>点了即时生效,不用重启</strong>(monitor 每次回复前现读档位文件)。</div></div>
+
+  <div class="card"><h2>AI 闲聊 · 联网 <span class="mut" style="font-weight:400" id="netsnote"></span></h2>
+    <div id="nets"></div>
+    <div class="mut" style="margin-top:8px;font-size:11px">联网是本地工具调用:模型自己判断该不该搜,搜到的标题/摘要/链接连日期一起喂回去(事实性问题才搜,纯闲聊不搜)。<br>换源/开关:agent/.env 的 AI_CHAT_WEB_SEARCH、SEARCH_PROVIDER、SEARCH_COUNT(改完重启 monitor 生效)。</div></div>
 
   <div class="card wide"><h2>AI 闲聊 · 各用户次数 <span class="mut" style="font-weight:400" id="ainote"></span></h2>
     <div class="aicols" id="aichat"></div>
@@ -492,6 +563,18 @@ function act(path,body,confirmMsg){
    .finally(function(){for(var i=0;i<bs.length;i++)bs[i].disabled=false})
 }
 function toggle(key,cur){act('feature',{key:key,value:!cur})}
+// 分群游戏模式:每群两个小按钮(游戏王/炉石),当前那个高亮;点了就走 /api/mode 直接写 modes.json。
+// 不用开关样式的原因:这是「二选一」而不是开关,而且要一眼看出这群现在按哪个游戏走。
+function setMode(groupId,mode){act('mode',{groupId:groupId,mode:mode})}
+function modesHtml(list){
+  if(!list||!list.length)return '<div class="mut">读不到群列表(OneBot 可能没起来)</div>';
+  return list.map(function(g){
+    var cur=g.mode||'ygo';
+    var b=function(v,label){return '<button class="'+(cur===v?'pri':'')+'" style="min-height:26px;padding:2px 10px;font-size:12px" onclick="setMode(\\''+g.groupId+'\\',\\''+v+'\\')">'+label+'</button>'};
+    return '<div class="row"><span class="k" title="'+h(g.groupId)+'">'+h(g.name||('群 '+g.groupId))+
+      '<div class="sub">'+h(g.groupId)+'</div></span><span style="display:flex;gap:6px">'+b('ygo','游戏王')+b('hs','炉石')+'</span></div>';
+  }).join('')
+}
 // SnowLuma 侧日志:谁在哪个群说了什么、bot 发了什么。默认只筛消息相关行,勾「全部」看原始 DEBUG。
 function snowlog(){
   var all=document.getElementById('snowall').checked?'all':'event';
@@ -517,6 +600,11 @@ function tick(){
       frow('搬屎','随机一搬 / 精选一搬',s.features.shitpost,'shitpost')+
       frow('框神语录','回复 + 实时采集 + 回填',s.features.kuangshen,'kuangshen')+
       frow('AI 闲聊','${AI_CHAT_DESC}',s.features.ai,'ai');
+
+    document.getElementById('modes').innerHTML=modesHtml(s.modes);
+
+    renderTones(s.tone);
+    renderNets(s.search);
 
     document.getElementById('svcs').innerHTML=s.services.map(function(v){
       return '<div class="row"><span class="dot '+(v.active?'ok':'bad')+'"></span><span class="k">'+h(v.label)+
@@ -549,6 +637,33 @@ function tick(){
 function frow(name,desc,on,key){
   return '<div class="row"><span class="k">'+name+'<div class="sub">'+desc+'</div></span>'+
     '<div class="sw'+(on?' on':'')+'" onclick="toggle(\\''+key+'\\','+(!!on)+')"><i></i></div></div>';
+}
+// 提示词档位(2026-09-21):三个档画成一排按钮,当前档高亮。与游戏模式那排同一个交互思路。
+// 走 /api/tone 直接写 monitor 的 tone.json —— 不需要敲 tmux 按键(monitor 每次回复前现读文件)。
+function setTone(id){act('tone',{tone:id})}
+function renderTones(t){
+  var box=document.getElementById('tones'),note=document.getElementById('tonenote');
+  if(!box||!t)return;
+  var opts=t.options||[],cur=t.current;
+  var cur0=null;
+  for(var i=0;i<opts.length;i++){if(opts[i].id===cur)cur0=opts[i]}
+  note.textContent='当前:'+(cur0?cur0.cn:cur)+(t.updatedAt?(' · 改于 '+fmtTime(t.updatedAt)):'');
+  box.innerHTML=opts.map(function(o){
+    return '<div class="row"><span class="k">'+h(o.cn)+
+      '<div class="sub">'+h(o.long||o.short||'')+'</div></span>'+
+      '<button class="'+(o.id===cur?'pri':'')+'" style="flex:0 0 auto;min-height:28px;padding:4px 14px;font-size:12px" '+
+      'onclick="setTone(\\''+o.id+'\\')">'+(o.id===cur?'使用中':'切到这档')+'</button></div>';
+  }).join('');
+}
+// 联网状态:开着就报搜索源 + 当天/累计次数,关了就直说关着(免得群友问「你不是能联网吗」时没人知道)
+function renderNets(s){
+  var box=document.getElementById('nets'),note=document.getElementById('netsnote');
+  if(!box||!s)return;
+  if(!s.enabled){note.textContent='已关闭';box.innerHTML='<div class="mut">AI_CHAT_WEB_SEARCH=0 —— 机器人不会联网,事实性问题只能凭记忆答(容易过时)。</div>';return}
+  var today=s.today?('今天 '+(s.today.ok||0)+' 次'+(s.today.failed?('/ 失败 '+s.today.failed):'')):'今天还没搜过';
+  note.textContent='已开启';
+  box.innerHTML='<div class="row"><span class="k">搜索源<div class="sub">'+h(s.provider||'?')+'</div></span><b>'+h(s.provider||'?')+'</b></div>'+
+    '<div class="row"><span class="k">搜索次数<div class="sub">'+h(today)+' · 累计成功 '+(s.ok||0)+' / 失败 '+(s.failed||0)+'</div></span><b>'+(s.total||0)+'</b></div>';
 }
 function fmtTime(ts){
   var d=new Date(ts),p=function(n){return (n<10?'0':'')+n};
@@ -742,6 +857,29 @@ const server = createServer(async (req, res) => {
       });
     }
 
+    if (path === '/api/tone' && req.method === 'POST') {
+      // 提示词档位:直接写 tone.json(不经 tmux)—— monitor 每次回复前重读该文件,所以即时生效。
+      const { tone } = await readBody(req);
+      const r = setTone(String(tone || ''));
+      return json(res, r.ok ? 200 : 400, {
+        ok: r.ok, tone: r.tone,
+        message: r.ok ? `AI 闲聊档位已切到「${TONE_CN[r.tone] || r.tone}」,下一条回复就按新档说`
+          : (r.message || '档位不合法'),
+        tones: { current: getTone(), options: TONES.map(t => ({ id: t, cn: TONE_CN[t], short: TONE_DESC[t].short, long: TONE_DESC[t].long })) },
+      });
+    }
+
+    if (path === '/api/mode' && req.method === 'POST') {
+      const { groupId, mode } = await readBody(req);
+      if (!groupId || !MODES.includes(mode)) return json(res, 400, { message: '群号或模式不合法(mode 只能是 ygo / hs)' });
+      const r = setGroupMode(String(groupId), mode);
+      return json(res, r.ok ? 200 : 400, {
+        ok: r.ok, changed: r.changed, mode: r.mode,
+        message: r.ok ? (r.changed ? `群 ${groupId} 已切到${MODE_CN[mode]}` : `群 ${groupId} 本来就是${MODE_CN[mode]}`) : '设置失败',
+        modes: await groupsWithMode().catch(() => []),
+      });
+    }
+
     if (path === '/api/update-cards' && req.method === 'POST') {
       const r = await updateCards();
       return json(res, r.ok ? 200 : 502, r);
@@ -760,5 +898,8 @@ const server = createServer(async (req, res) => {
 server.listen(PORT, HOST, () => {
   console.log(`opsweb 运维台已启动: http://${HOST}:${PORT}`);
   console.log(`访问方式(本机开隧道): ssh -N -L ${PORT}:127.0.0.1:${PORT} <用户>@<服务器>`);
+  // 把「.env 读到了几个键」打出来**只打名字不打值**(2026-09-21 起):那次 CRLF 解析事故就是
+  // 「一个键都没读到」,但在界面上只表现为「登录失败 / 搜索源不对」,谁也没往 .env 上想。
+  console.log(`agent/.env: 读入 ${loadedEnvKeys.length} 个键${loadedEnvKeys.length ? `(${loadedEnvKeys.join(', ')})` : '(文件不存在,或这些键已由环境变量提供)'}`);
   if (!TOKEN) console.log('⚠ 未配置 OPSWEB_TOKEN,登录会失败 —— 请在 agent/.env 里加一行');
 });

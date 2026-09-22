@@ -11,7 +11,7 @@
 import './env.mjs';   // ⚠ 必须第一个:下面的模块在顶层读 process.env,而 ESM 按 import 顺序求值
 import { appendFileSync, existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join, dirname, basename } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import readline from 'node:readline';
@@ -22,6 +22,20 @@ import { generateDeckListPdf, classifyDeckInput } from './ygocard/decklist.mjs';
 import { pickShit, buildCardHtml, buildVideoCardHtml, pickVideoShit, renderCard, pngToSegment, appendShitVideo, addToBlacklist, removeFromShitVideos } from './shitpost/shitpost.mjs';
 import { collectQuoteFromEvent, pickFeaturedQuote, backfillQuotes, searchQuotes, addToBlacklist as quoteBlacklist, removeQuoteBySeq } from './kuangshen/kuangshen.mjs';
 import { buildQuestion as buildAiQuestion, buildQuestionRich as buildAiQuestionRich, faceLabel } from './aichat/aichat.mjs';
+import { getTone, setTone, systemPrompt as aiSystemPrompt, TONES, TONE_CN, TONE_DESC, tonePath } from './aichat/tone.mjs';
+import { runSearch, WEB_SEARCH_TOOL, providerText as searchProviderText, searchReady, pickProvider, SEARCH_COUNT } from './aichat/websearch.mjs';
+import { modeOf, setMode, parseModeCommand, MODE_CN, modesPath, allModes } from './modes.mjs';
+import {
+  searchCards as hsSearchCards, formatCard as hsFormatCard, queryAndFormat as hsQueryAndFormat,
+  fetchCardImage, imageSegmentOf, decodeDeckstring as hsDecodeDeck, formatDeckList as hsFormatDeckList,
+  extractDeckstring as hsExtractDeckstring, randomCard as hsRandomCard, cardCount as hsCardCount,
+  totalCount as hsTotalCount, reloadCards as hsReloadCards, getCardsPath as hsCardsPath,
+  updateHsCards, loadCards as hsLoadCards, cardById as hsCardById, cardByDbf as hsCardByDbf, cleanText as hsCleanText,
+} from './hs/hs.mjs';
+import {
+  recommend as hsRecommend, formatRecommendation as hsFormatRecommendation, pureDeckCode as hsPureDeckCode,
+  metaStats as hsMetaStats, loadMeta as hsLoadMeta, saveMeta as hsSaveMeta,
+} from './hs/hs_meta.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -37,6 +51,9 @@ if (!WS_TOKEN || !API_TOKEN) {
   process.exit(1);
 }
 const BOT_ID = (process.env.BOT_ID || '3757588606').toString();
+// OneBot 的 @全体成员 段长这样:{type:'at', data:{qq:'all'}} —— 它不是某个人的 qq,
+// 落到「查不到名字」的兜底分支里会被当成真人,或被误渲染成 @all(2026-09-20 修,见 atText)。
+const AT_ALL = 'all';
 const TRIGGER_KEYWORD = process.env.TRIGGER_KEYWORD || '史记总结'; // 史记体触发词
 const CARD_TRIGGER = process.env.CARD_TRIGGER || '效果';            // 查卡触发词:「效果 」后跟卡名
 const CARD_IMG_TRIGGER = process.env.CARD_IMG_TRIGGER || '卡图';     // 查卡图触发词:「卡图 」后跟卡名(只发图)
@@ -47,24 +64,37 @@ const DECK_TRIGGER = process.env.DECK_TRIGGER || '生成卡表';        // 卡�
 const SHIT_TRIGGER = process.env.SHIT_TRIGGER || '随机一搬';        // 搬屎触发词:纯规则筛选,发截图
 const SHIT_AI_TRIGGER = process.env.SHIT_AI_TRIGGER || '精选一搬';  // 搬屎触发词:规则粗筛 + AI 精挑
 const KUANGSHEN_TRIGGER = process.env.KUANGSHEN_TRIGGER || '框神语录'; // 框神语录触发词:从精筛语录库随机抽一条
-// ---------- AI 闲聊后端(2026-09-17 改:图片随消息直传、一次请求出结果) ----------
-// 两套后端,AI_CHAT_PROVIDER 选;没显式指定时「有 DEEPSEEK_API_KEY 就走 deepseek,否则智谱 GLM」。
-//   deepseek(默认推荐):模型自己会看图 → 图片按 data URL 直接附在消息里,**一轮出结果**
-//   glm               :glm-4-flash 没有视觉,图片只能先让视觉模型认成文字再问(两轮,见 aichat.mjs)
-const GLM_API_KEY = process.env.ZHIPU_API_KEY || process.env.GLM_API_KEY || ''; // 智谱 key
-const GLM_MODEL = process.env.GLM_MODEL || 'glm-4-flash';                       // 免费模型(实测 1~2 秒回)
-const GLM_API_URL = process.env.GLM_API_URL || 'https://open.bigmodel.cn/api/paas/v4/chat/completions';
-const AI_IS_DS = (process.env.AI_CHAT_PROVIDER || (process.env.DEEPSEEK_API_KEY ? 'deepseek' : 'glm')).toLowerCase() === 'deepseek';
-const AI_API_KEY = AI_IS_DS ? (process.env.DEEPSEEK_API_KEY || '') : GLM_API_KEY;
-const AI_API_URL = process.env.AI_CHAT_API_URL || (AI_IS_DS ? 'https://api.deepseek.com/chat/completions' : GLM_API_URL);
-const AI_MODEL = process.env.AI_CHAT_MODEL || (AI_IS_DS ? 'deepseek-flash' : GLM_MODEL);
+// ---------- 炉石传说功能(2026-09-20 新增)----------
+// 触发词与游戏王的**故意重叠**(「效果」「卡图」「每日一卡」):同一句话按本群 mode 走哪个游戏,
+// 由「mode 游戏王/炉石」决定(见 modes.mjs)。另外两个炉石专属触发词:
+const HS_DECK_TRIGGER = process.env.HS_DECK_TRIGGER || '卡组解析';   // 「卡组解析 」+卡组代码 → 卡表
+const HS_RECO_TRIGGER = process.env.HS_RECO_TRIGGER || '推荐';       // 「推荐 狂野 猎人」→ 环境热门构筑
+const HS_CARD_TRIGGER = CARD_TRIGGER;                                // 复用「效果 」
+const HS_CARD_IMG_TRIGGER = CARD_IMG_TRIGGER;                        // 复用「卡图 」
+const HELP_CMD = '/help';
+// ---------- AI 闲聊后端(2026-09-21 改:**只剩一套 OpenAI 兼容后端**,智谱聊天后端整块删掉) ----------
+// 老版本有两套后端(deepseek / 智谱 GLM),靠 AI_CHAT_PROVIDER 切,还带一堆降级逻辑(智谱没视觉要两轮识图、
+// 智谱服务端注入式联网 …)。用户 2026-09-21 明确要求「把智谱后端相关删了」——它那套唯一的好处是免费,
+// 而代价是把图片识别、联网都绑死在智谱身上。现在统一走 OpenAI 兼容的 /chat/completions:
+//   AI_CHAT_API_URL 默认 https://api.deepseek.com/chat/completions
+//   AI_CHAT_MODEL   默认 deepseek-flash(会看图,所以图片一轮直传)
+//   换任何兼容服务(自建 vLLM / OneAPI / 别的厂商)只需改这两个,代码不用动。
+// ⚠ 智谱的东西并没有全删:**只删了「拿它当聊天模型」这条路**。AI_CHAT_TONE 之外,联网搜索仍然可以用
+//   ZHIPU_API_KEY —— 那是它家的 Web Search API(纯搜索服务,与聊天模型无关),见 aichat/websearch.mjs。
+const AI_API_KEY = process.env.DEEPSEEK_API_KEY || process.env.AI_CHAT_API_KEY || '';
+const AI_API_URL = process.env.AI_CHAT_API_URL || 'https://api.deepseek.com/chat/completions';
+const AI_MODEL = process.env.AI_CHAT_MODEL || 'deepseek-flash';
 const AI_CHAT_CTX = Math.max(0, Number(process.env.AI_CHAT_CTX ?? 10));         // 附带最近 N 条群聊当上下文(0=不带;用户 2026-09-14 从 30 调小到 10)
-const AI_CHAT_WEB_SEARCH = process.env.AI_CHAT_WEB_SEARCH !== '0';              // 联网搜索(默认开;=0 关)
-// 智谱服务端的联网搜索工具**只对智谱有效**:deepseek 挂上它会直接 4xx,所以换后端时自动不挂。
-const AI_WEB_SEARCH = AI_CHAT_WEB_SEARCH && !AI_IS_DS;
+// 联网搜索(2026-09-21 重写):从「智谱服务端注入」改成**本地实现的 function calling 工具** ——
+// 模型自己决定要不要搜,我们自己调搜索 API,把结果当 tool 消息喂回去。任何后端都能用。
+// AI_CHAT_WEB_SEARCH=0 关掉;没配任何搜索源时自动不挂(见 websearch.mjs 的 pickProvider)。
+const AI_CHAT_WEB_SEARCH = process.env.AI_CHAT_WEB_SEARCH !== '0';
+const AI_WEB_SEARCH = AI_CHAT_WEB_SEARCH && searchReady();
+const AI_CHAT_MAX_SEARCHES = Math.max(1, Number(process.env.AI_CHAT_MAX_SEARCHES || 2));  // 单次回复最多搜几次,防它连着搜十轮把群友等烦
 // deepseek 系默认会「思考」:实测 reasoning_effort='low' 会把 max_tokens 全烧在思考上、**正文返回空**
 // ('none' 才是真关,1.1s)。闲聊要快、要短 → 默认关;想开思考设 AI_CHAT_REASONING=1。
-const AI_THINK_OFF = AI_IS_DS && process.env.AI_CHAT_REASONING !== '1';
+// 注意:关思考是**按模型名**判断的(只对 deepseek 系有效),别的后端不会被塞这个参数。
+const AI_THINK_OFF = /deepseek/i.test(AI_MODEL) && process.env.AI_CHAT_REASONING !== '1';
 const AI_CHAT_MAX_TOKENS = Number(process.env.AI_CHAT_MAX_TOKENS || 800);       // 上限:留足思考/正文,别像 500 那样被思考吃空
 const AI_CHAT_TIMEOUT_MS = Number(process.env.AI_CHAT_TIMEOUT_MS || 30000);     // 单次请求超时
 const AI_CHAT_COOLDOWN_MS = Number(process.env.AI_CHAT_COOLDOWN_MS || 15000);   // 每人冷却,防连点刷屏
@@ -189,7 +219,7 @@ function nameOf(sender) {
 function segText(seg, names) {
   switch (seg.type) {
     case 'text': return seg.data.text;
-    case 'at': return names.has(seg.data.qq) ? `@${names.get(seg.data.qq)}` : '@all';
+    case 'at': return atText(seg.data?.qq, names);
     case 'image': return '[图]';
     case 'face': return faceLabel(seg.data.id) ? `[表情:${faceLabel(seg.data.id)}]` : '[表情]';
     case 'record': return '[语音]';
@@ -200,12 +230,66 @@ function segText(seg, names) {
   }
 }
 
+// ---------- @ 提及 → 说的是谁 ----------
+// 2026-09-20 修的大坑:以前这里是 `names.has(seg.data.qq) ? '@'+名字 : '@all'`,
+// 而 names 的键是 get_group_msg_history 给的 **number** user_id,at 段里的 qq 却是 **string**
+// (线上实测:发言者 user_id 是 number 2186220790,段里是 "2186220790")→ 键永远对不上,
+// **每一个 @ 都渲染成 @all**,连 @机器人自己 也是,模型于是以为那些人在喊「全体」。
+// 现在:① 按键统一成字符串查;② @全体成员 认成「全体成员」而不是人;③ @的是机器人自己 → 「你(史官)」;
+//        ④ 查不到名字用「成员<qq>」,**绝不写 @all**。
+// (aichat.mjs 的 renderToken 是同一套口径:<qq> 段单独走那条路,本文件的群聊记录走这里。)
+export function atText(qq, names) {
+  const q = String(qq ?? '').trim();
+  if (!q) return '@某人';                                   // 段里没带 qq(老条目降级路径)
+  if (q.toLowerCase() === AT_ALL) return '@全体成员';         // 真的 @全体成员
+  if (q === BOT_ID) return '@你(史官)';                      // @ 机器人自己
+  const hit = names?.get?.(q);
+  return hit ? `@${hit}` : `@成员${q}`;
+}
+
+// @ 与引用作者 → 群昵称(先查本次已拉到的群聊记录,再查群成员接口,查不到才用「成员<qq>」;
+// 群名片改名不频繁,进程内缓存够用 —— 键**一律 String**,别把 number/string 混着塞)
+const memberNames = new Map();
+async function resolveMemberName(groupId, qq) {
+  const key = `${groupId}:${String(qq)}`;
+  if (memberNames.has(key)) return memberNames.get(key);
+  let name = '';
+  try {
+    const r = await api('get_group_member_info', { group_id: groupId, user_id: Number(qq) });
+    name = (r?.data?.card || r?.data?.nickname || '').trim();
+  } catch { /* 查不到就退兜底名 */ }
+  if (name) memberNames.set(key, name);
+  return name || `成员${qq}`;
+}
+
+// 被 @ 的人常常**没在本批记录里发过言**(names 里没有他)→ segText 只能退化成「成员<qq>」。
+// 这里补一次:把本批里所有查不到的 qq 批量问群成员接口,真昵称回填进 names。
+// 尽力而为 —— 失败/查不到就算了,不影响正文(但绝不因此写 @all)。
+async function fillAtNames(groupId, msgs, names) {
+  const miss = [];
+  for (const m of (msgs || [])) {
+    for (const s of (m.message || [])) {
+      if (s.type !== 'at') continue;
+      const q = String(s.data?.qq ?? '').trim();
+      if (!q || q.toLowerCase() === AT_ALL || q === BOT_ID) continue;   // 这三个 atText 自己认
+      if (names.has(q) || miss.includes(q)) continue;
+      miss.push(q);
+    }
+  }
+  await Promise.all(miss.slice(0, 12).map(async q => {   // 一条消息顶多几个 @,12 是防异常的顶格
+    const n = await resolveMemberName(groupId, q);
+    if (n && !n.startsWith('成员')) names.set(q, n);
+  }));
+}
+
 async function fetchTranscript(groupId, count = 100) {
   const { data } = await api('get_group_msg_history', { group_id: groupId, count });
   const msgs = data?.messages || [];
   if (!msgs.length) return null;
+  // 键**统一 String**:历史接口给的是 number、at 段给的是 string,混着存就永远查不到(见 atText)
   const names = new Map();
-  for (const m of msgs) if (m.user_id && !names.has(m.user_id)) names.set(m.user_id, nameOf(m.sender));
+  for (const m of msgs) if (m.user_id && !names.has(String(m.user_id))) names.set(String(m.user_id), nameOf(m.sender));
+  await fillAtNames(groupId, msgs, names);
   const lines = [];
   // 跨天的消息**必须带日期**:群里静半天/一天时「最近 N 条」可能整段是昨天的,只给 HH:MM 模型会当成
   // 刚刚发生(2026-09-14 实测:上下文最后几行是 09-13 的 17:19,问「现在几点了」它答「下午 5 点 19 分」
@@ -219,7 +303,7 @@ async function fetchTranscript(groupId, count = 100) {
     if (!text) continue;
     const diff = Math.round((t0 - dayStart(t)) / 86400000);   // 整天差:0=今天 1=昨天 2=前天
     const dayTag = diff <= 0 ? '' : diff === 1 ? '昨天 ' : diff === 2 ? '前天 ' : `${t.getMonth() + 1}-${t.getDate()} `;
-    lines.push(`${dayTag}${hhmm} ${names.get(m.user_id) || nameOf(m.sender)}|${text}`);  }
+    lines.push(`${dayTag}${hhmm} ${names.get(String(m.user_id)) || nameOf(m.sender)}|${text}`);  }
   return { lines: lines.join('\n'), names };
 }
 
@@ -268,57 +352,18 @@ ${transcript}
 @者提问: ${trigger.text.replaceAll(TRIGGER_KEYWORD, '').replace(/^\[at\]\s*/, '').trim() || '(无文字,仅@)'}`;
 }
 
-// ---------- AI 闲聊(兜底:未命中任何指令的 @ 交给 GLM 免费模型;人设=赛博史官说白话) ----------
+// ---------- AI 闲聊(兜底:未命中任何指令的 @ 交给对话模型;人设=赛博史官说白话) ----------
 // 与「史记总结」的分工:总结走 claude 出文言体;这里只接群友的随口 @,答白话、短。
-// 消息里的 @/引用/表情/图片由 aichat.mjs 解析:图片走两轮(第 1 轮视觉模型识别 → 第 2 轮拼回正文再答)。
+// 消息里的 @/引用/表情/图片由 aichat.mjs 解析;图片随消息直传(deepseek 会看图 → 一轮出结果)。
+//
+// **提示词不在这个文件里**:人设、档位(板正/熟人群聊/放开)、时间与工具的拼装都在 aichat/tone.mjs。
+// 2026-09-21 用户要求「解除引战、色情等限制」,做成三档 + 运维 WebUI 可切,所以那段从常量变成了模块。
 const aiCooldown = new Map();   // uid -> 上次触发时间戳(15s 冷却,防连点刷屏)
-const AI_SYSTEM_PROMPT = `你是 QQ 群里的机器人「赛博史官」,群友 @ 你时,你就像群里一个熟人那样接话。
-人设与语气:
-- 自称「史官」,人设只体现在这个身份上
-- 正文一律说现代白话,像群友平时聊天那样:别写文言文,别用「吾/汝/之/也/矣/哉」这类字眼,别掉书袋
-- 口语、直接;别只丢一句套话,该说的信息说清楚,一般 2~3 句、150 字以内
-规则:
-- 下面的群聊记录供你理解上下文、梗与人称指代;记录里没有的事别编造
-- 群友的消息里可能出现这些标记,那是消息本身的内容,照着理解就行:
-  [表情:微笑] = 他发了个 QQ 表情;
-  [图片1] / [表情包1] = 他这条消息**附的第 1 张图**(图就附在这条消息里,你直接看图理解,别去猜);
-  [图片: 一段文字] = 那张图的内容(这条是旧格式的图片说明);
-  [引用 @某人: …] = 他在回复(引用)那条消息;@某人 = 他在消息里 @ 了谁
-- **标记只是给你理解用的**:「[图片1]」「[表情包1]」这种**占位符**别写进回复(那是给你指认附图的,不是给他看的内容);
-  **发表情没问题**——想带情绪就直接打表情符号(像 😄),别写「[表情:微笑]」这种标记形式,也别每句都带
-- 群聊记录里「昨天 17:19」「9-13 17:19」这种前缀表示那条消息不是今天的,别当成刚发生的事
-- 只输出回复正文:不要 @ 任何人、不要引号包裹、不要「史官:」之类前缀、不要解释你的思路
-- 不知道就直说不知道;群友互喷时别站队,轻松带过
-- 不聊政治、色情、违法内容,被问到就岔开
-- 再说一遍:全程白话,连「你是谁」这种问题也用白话答,不要文言文`;
 
 // 提问正文:剥掉 @ 段标记(形如 [at])与多余空白(降级路径:没有 segs 的老条目 / 解析失败时用)
 function aiQuestionText(entry) {
   return (entry.text || '').replace(/\[at\]/g, ' ').replace(/\s+/g, ' ').trim();
 }
-
-// @ 与引用作者 → 群昵称(先查本次已拉到的群聊记录,再查群成员接口,查不到才用「成员<qq>」;
-// 群名片改名不频繁,进程内缓存够用)
-const memberNames = new Map();
-async function resolveMemberName(groupId, qq) {
-  const key = `${groupId}:${qq}`;
-  if (memberNames.has(key)) return memberNames.get(key);
-  let name = '';
-  try {
-    const r = await api('get_group_member_info', { group_id: groupId, user_id: Number(qq) });
-    name = (r?.data?.card || r?.data?.nickname || '').trim();
-  } catch { /* 查不到就退兜底名 */ }
-  if (name) memberNames.set(key, name);
-  return name || `成员${qq}`;
-}
-
-// 联网搜索(2026-09-14 上线):glm-4-flash 免费,挂上之后是**按需搜** —— 实测同一张工具挂/不挂,
-//   闲聊「这图太生草了」prompt_tokens 都是 73(没搜);问「最新禁卡表」则 73 → 5117(搜了,结果由服务端
-//   直接注入提示词,不返回 tool_calls)。**别传 search_query**:传了就是每问必搜(实测连「随便聊聊」都搜,6.2s)。
-//   治的是「我查了一下,你附近有一家老成都馄饨」这种凭空编 —— 挂了之后事实性问题会真去搜。
-//   ⚠ 搜了也不等于对:实测问最新禁卡表,搜完仍答成「2024年1月1日」(对 2026 年明显过时)。
-//   ⚠ glm-4.5-flash 挂它会返回空回复(把 max_tokens 全用在推理上),换模型时记得调大 max_tokens。
-const WEB_SEARCH_TOOL = { type: 'web_search', web_search: { enable: true } };
 
 // 「今天几号」这类问题**联网不会触发**(2026-09-14 实测):同一句话挂/不挂 tools,prompt_tokens 都是 369
 //   (压根没搜),模型就直接编 —— 连问两次,一次「今天20号」一次「今天12号」。而问「最新禁卡表」确实会搜
@@ -332,29 +377,28 @@ function nowText(ts = Date.now()) {
   return `${d.getFullYear()} 年 ${d.getMonth() + 1} 月 ${d.getDate()} 日(星期${'日一二三四五六'[d.getDay()]})${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
-// 带图时的额外规则(2026-09-17 实测补的):**不加这条,模型会漏掉/答错图上的关键信息** ——
-// 起因:群友引用一张 394x138 的卡图说「翻译」,模型答成「能通常召唤」(卡上写的是不能通常召唤)。
-// 复现与对照(同一张图、线上同款提示词):原样跑 3 次只有 1 次提到召唤限制;只把温度降到 0.3 → 0/3(没用);
-// 把图放大 4 倍 → 能读对但更贵(in=1239);**只加下面这条规则 → 3/3 全对**,且不用放大(in=877)。
-// 结论:关键在「让它照实读、读不清就说读不清」,不在分辨率也不在温度 —— 别再回头折腾放大。
-const IMG_READ_RULE = `
-- 他这条消息带了图。图上的字**照实读**:卡名、数值、召唤条件这类关键信息一律以图上写的为准;
-  图上写没写「不能通常召唤」这类限制,写了就必须译出来,没写就别自己加
-- 读不清就说读不清,别猜、别拿常识补;拿不准就说拿不准(群友追问时也一样,别为了顺着他改口,也别为了顶回去硬撑)`;
+// 系统提示词 = tone.mjs 里按档位拼好的人设 + 当前时间 + (可选)读图规则与联网规则。
+// 末尾「他没问就别主动报时间」是给小模型的护栏:不写这句,它容易在闲聊里顺嘴报一句时间。
+const aiSystem = (hasImages = false, tone = getTone()) => aiSystemPrompt({
+  tone,
+  hasImages,
+  hasSearch: AI_WEB_SEARCH,
+  now: nowText(),
+});
 
-// 系统提示词 = 固定人设 + 当前时间。末尾「他没问就别主动报时间」是给小模型的护栏:不写这句,
-// 它容易在闲聊里顺嘴报一句时间,写了之后闲聊不再带时间(实测;联网那套照旧,事实问题该搜还搜)。
-const aiSystemPrompt = (hasImages = false) => `${AI_SYSTEM_PROMPT}${hasImages ? IMG_READ_RULE : ''}
-- 现在是 ${nowText()}。这是你说话时的真实时间,群友问日期/时间/星期以它为准;他没问就别主动报时间`;
+// 网络/超时错误与「后端 4xx」分开:4xx 才值得退让重试(参数不认),超时重来一轮只是把群友的等待翻倍。
+class AiHttpError extends Error {}
 
 async function aiChat(system, userText, images = []) {
-  // 退让阶梯:先按默认档跑;碰到 4xx(参数/格式不认)依次去掉「联网工具」「关思考」,最后连图一起去掉。
-  // 换后端/换模型最容易踩的就是参数不认 —— 实测 deepseek 挂智谱的 web_search 工具必 4xx,
-  // 有的后端不认 reasoning_effort。一个参数不能把整条闲聊弄挂。
-  // 超时/网络错**不重试**:再来一轮只会把群友的等待翻倍。
+  // 退让阶梯:先按默认档跑;碰到 4xx(参数/格式不认)依次退,最后连图一起去掉。
+  // 换后端/换模型最容易踩的就是参数不认 —— 一个参数不能把整条闲聊弄挂。
+  // 顺序讲究:① 去掉联网工具最可能救场(有的后端/模型不支持 function calling);
+  //          ② 网页版 deepseek 支持思考模式下的工具调用,所以「不去工具、改开思考」也留一条;
+  //          ③ 图片被后端拒(选了没视觉的模型)时最后去掉图,至少还能答字。
   const ladder = [
     { webSearch: AI_WEB_SEARCH, thinkOff: AI_THINK_OFF, images, tag: '' },
     ...(AI_WEB_SEARCH ? [{ webSearch: false, thinkOff: AI_THINK_OFF, images, tag: '去掉联网工具' }] : []),
+    ...(AI_WEB_SEARCH && AI_THINK_OFF ? [{ webSearch: true, thinkOff: false, images, tag: '联网+带思考' }] : []),
     ...(AI_THINK_OFF ? [{ webSearch: false, thinkOff: false, images, tag: '带上思考' }] : []),
     ...(images.length ? [{ webSearch: false, thinkOff: AI_THINK_OFF, images: [], tag: '去掉图片' }] : []),
   ];
@@ -365,7 +409,7 @@ async function aiChat(system, userText, images = []) {
       return await aiChatOnce(system, userText, step.images, step);
     } catch (e) {
       lastErr = e;
-      if (!/^HTTP 4/.test(String(e.message || ''))) throw e;
+      if (!(e instanceof AiHttpError) || !/^HTTP 4/.test(e.message)) throw e;
     }
   }
   throw lastErr;
@@ -381,26 +425,114 @@ function buildUserContent(text, images) {
   ];
 }
 
+// 单次 POST(带超时);4xx/5xx 抛 AiHttpError,其余(超时/网络)按原样抛。
+async function postChat(body, tag = '') {
+  let r;
+  try {
+    r = await fetch(AI_API_URL, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${AI_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(AI_CHAT_TIMEOUT_MS),
+    });
+  } catch (e) {
+    const why = e.name === 'TimeoutError' || e.name === 'AbortError' ? `超时 ${AI_CHAT_TIMEOUT_MS}ms` : e.message;
+    throw new Error(`${AI_MODEL}${tag} 请求失败:${why}`);
+  }
+  const j = await r.json().catch(() => null);
+  if (!r.ok) throw new AiHttpError(`HTTP ${r.status} ${j?.error?.message || j?.message || ''}`.trim());
+  return j;
+}
+
+/**
+ * 一次闲聊:function calling 循环 —— 模型要搜就搜(我们自己执行搜索),搜完把结果喂回去让它接着答。
+ * 为什么这样写(2026-09-21 改):老路子是智谱服务端注入式联网,**只对智谱有效**,deepseek 挂上必 4xx。
+ * 现在工具是我们本地实现的,任何 OpenAI 兼容后端都能用,而且搜了什么在面板上看得见(下面那行 log)。
+ * 省钱护栏:AI_CHAT_MAX_SEARCHES(默认 2)轮之后就**不再挂工具**,逼它用已有材料作答,别无限搜下去。
+ */
 async function aiChatOnce(system, userText, images = [], opts = {}) {
   const { webSearch = AI_WEB_SEARCH, thinkOff = AI_THINK_OFF } = opts;
-  const r = await fetch(AI_API_URL, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${AI_API_KEY}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({
+  const messages = [{ role: 'system', content: system }, { role: 'user', content: buildUserContent(userText, images) }];
+  const maxSearches = webSearch ? AI_CHAT_MAX_SEARCHES : 0;
+  let used = 0;
+  for (let round = 0; ; round++) {
+    // 预算用完就**停止挂工具**(不再给它搜的机会,逼它用已有材料作答)。
+    // ⚠ 判据用「还能搜几次」而不是「跑了几轮」:一轮里模型可能一口气要搜 2 个词,次数照样会超;
+    //   同一把尺子也用在下面执行搜索前,免得超预算的调用白花一次搜索钱。
+    const withTools = used < maxSearches;
+    const j = await postChat({
       model: AI_MODEL,
-      messages: [{ role: 'system', content: system }, { role: 'user', content: buildUserContent(userText, images) }],
+      messages,
       temperature: 0.8,
       max_tokens: AI_CHAT_MAX_TOKENS,
       ...(thinkOff ? { reasoning_effort: 'none' } : {}),
-      ...(webSearch ? { tools: [WEB_SEARCH_TOOL] } : {}),
-    }),
-    signal: AbortSignal.timeout(AI_CHAT_TIMEOUT_MS),
-  });
-  const j = await r.json().catch(() => null);
-  if (!r.ok) throw new Error(`HTTP ${r.status} ${j?.error?.message || j?.message || ''}`.trim());
-  const text = j?.choices?.[0]?.message?.content?.trim();
-  if (!text) throw new Error(`${AI_MODEL} 返回空回复`);
-  return text;
+      ...(withTools ? { tools: [WEB_SEARCH_TOOL] } : {}),
+    });
+    const msg = j?.choices?.[0]?.message;
+    if (!msg) throw new Error(`${AI_MODEL} 返回结构不对:${JSON.stringify(j).slice(0, 200)}`);
+    const calls = (msg.tool_calls || []).filter(c => c?.function?.name === 'web_search');
+    if (!calls.length) {
+      const text = String(msg.content || '').trim();
+      if (!text) throw new Error(`${AI_MODEL} 返回空回复${round ? '(搜完之后没接上话)' : ''}`);
+      return text;
+    }
+    // 记下助手的工具调用请求(OpenAI 要求这一条也在 messages 里,否则下一轮报「tool 消息找不到对应请求」)
+    messages.push({ role: 'assistant', content: msg.content || '', tool_calls: msg.tool_calls });
+    for (const c of calls) {
+      const args = (() => { try { return JSON.parse(c.function.arguments || '{}'); } catch { return {}; } })();
+      const q = String(args.query || '').trim();
+      if (q && used < maxSearches) {
+        used++;
+        const r = await runSearch(q, { count: Math.min(SEARCH_COUNT, 5) });   // 闲聊要快:每条结果都塞进提示词,别贪多
+        log('  🔎 联网搜索:', `${q} → ${r.ok ? `${r.count} 条(${r.provider})` : r.error}`, r.ok ? C.dim : C.yellow);
+        bumpSearchStat(r.ok, r.provider);
+        messages.push({
+          role: 'tool', tool_call_id: c.id,
+          content: r.ok ? r.text : `搜索失败(${r.error})。没有搜到东西,按你已有的知识回答;不确定就直说不确定,别编造具体数字与日期。`,
+        });
+      } else if (q) {
+        if (used === maxSearches) {   // 只在「刚好把预算用光」这一刻说一次,别每轮都刷
+          log(`  本次已达最多 ${maxSearches} 次联网,用已有材料作答`, '', C.dim);
+          used++;   // 抬过阈值,免得下一轮又提示一遍(仅用于去重提示,不代表真搜了)
+        }
+        messages.push({
+          role: 'tool', tool_call_id: c.id,
+          content: `本次回复的联网搜索次数已用完(${maxSearches} 次),不再执行搜索。请用已经拿到的材料回答;不够就说查不到。`,
+        });
+      } else {
+        messages.push({ role: 'tool', tool_call_id: c.id, content: '搜索词为空,没有执行搜索。' });
+      }
+    }
+  }
+}
+
+// ---------- 联网搜索记账(2026-09-21) ----------
+// 为什么要记:老路子(智谱服务端注入)搜没搜全靠猜,现在虽然是本地执行、有日志,但运维台要有累计数
+// 才好判断「开了这么久到底搜过几次、失败几次」。存 agent/search_stats.json(不入库),按天+总数。
+const SEARCH_STATS_FILE = join(__dirname, 'search_stats.json');
+function loadSearchStats() {
+  try {
+    const s = JSON.parse(readFileSync(SEARCH_STATS_FILE, 'utf8'));
+    if (s && typeof s === 'object') return { total: 0, ok: 0, failed: 0, byDay: {}, byProvider: {}, ...s };
+  } catch { /* 缺失/损坏 → 从零开始 */ }
+  return { total: 0, ok: 0, failed: 0, byDay: {}, byProvider: {}, updatedAt: 0 };
+}
+function bumpSearchStat(ok, provider = '') {
+  const s = loadSearchStats();
+  const day = dayKey();
+  s.total++;
+  if (ok) s.ok = (s.ok || 0) + 1; else s.failed = (s.failed || 0) + 1;
+  s.byDay[day] = s.byDay[day] || { ok: 0, failed: 0 };
+  if (ok) s.byDay[day].ok++; else s.byDay[day].failed++;
+  if (provider) s.byProvider[provider] = (s.byProvider[provider] || 0) + 1;
+  s.updatedAt = Date.now();
+  // 只留最近 60 天,免得文件无限长大
+  const days = Object.keys(s.byDay).sort();
+  for (const d of days.slice(0, Math.max(0, days.length - 60))) delete s.byDay[d];
+  try {
+    writeFileSync(SEARCH_STATS_FILE + '.tmp', JSON.stringify(s, null, 1), 'utf8');
+    renameSync(SEARCH_STATS_FILE + '.tmp', SEARCH_STATS_FILE);
+  } catch (e) { log('  联网搜索记账失败:', e.message, C.red); }
 }
 
 // ---------- AI 闲聊记账(2026-09-17:运维 WebUI 要按用户统计调用次数) ----------
@@ -509,7 +641,7 @@ async function processAiChat(entry) {
       botId: BOT_ID,
       log: m => log(' ', m, C.dim),
       getMsg: id => api('get_msg', { message_id: id }),
-      memberName: qq => names?.get(Number(qq)) || resolveMemberName(entry.group_id, qq),
+      memberName: qq => names?.get(String(qq)) || resolveMemberName(entry.group_id, qq),
     });
     if (rich?.text) q = rich.text;
     images = rich?.images || [];
@@ -518,9 +650,11 @@ async function processAiChat(entry) {
     log('  AI 闲聊消息解析失败(退回纯文本):', e.message, C.yellow);
   }
   q = q.replace(/@你(史官)/g, ' ').replace(/\s+/g, ' ').trim() || '(无文字,仅@)';
-  log(`  ${AI_MODEL} 生成中 ...${images.length ? `(含 ${images.length} 张图,一轮出结果)` : ''}`, '', C.dim);
+  // 档位**每次请求现读**(tone.json 是热切的,运维台一点就生效;读几 KB 的 JSON 相比一次模型调用可忽略)
+  const tone = getTone();
+  log(`  ${AI_MODEL} 生成中 ...(档位 ${TONE_CN[tone]}${AI_WEB_SEARCH ? ',可联网' : ''}${images.length ? `,含 ${images.length} 张图` : ''})`, '', C.dim);
   try {
-    let reply = await aiChat(aiSystemPrompt(images.length > 0), `${ctx}@你的人: ${entry.nickname}\nTA 的问题: ${q}`, images);
+    let reply = await aiChat(aiSystem(images.length > 0, tone), `${ctx}@你的人: ${entry.nickname}\nTA 的问题: ${q}`, images);
     if (reply.length > AI_CHAT_MAX_CHARS) reply = reply.slice(0, AI_CHAT_MAX_CHARS) + '……';
     log('  回复:', reply.replace(/\n/g, ' ').slice(0, 60) + (reply.length > 60 ? '...' : ''), C.green);
     await sendReply(entry, reply);
@@ -1078,12 +1212,146 @@ function toggleFeature(key) {
   drawFeaturePanel();
 }
 
+// ---------- 炉石传说功能(2026-09-20 新增)----------
+// 四个功能与游戏王那套对称:卡牌检索(回卡图)/ 卡组代码解析 / 每日一卡 / 环境热门构筑推荐。
+// 数据源与踩坑见 hs/hs.mjs 与 hs/hs_meta.mjs 的文件头(卡库 HearthstoneJSON,meta 只有 metastats 可达)。
+const HS_DAILY_STATE_FILE = join(__dirname, 'hs_daily_card.json');   // 炉石每日一卡(与游戏王那份分开存,免得 id 撞车)
+const hsRecoCooldown = new Map();                                    // uid → 上次查环境卡组的时间(8s 短冷却,抓站有成本)
+
+/** 「效果 X」/「卡图 X」:查炉石卡,回文本 + 卡图;imageOnly 只回图 */
+export async function processHsCardQuery(entry, raw, opts = {}) {
+  log(`  查炉石卡「${raw}」...`, '', C.dim);
+  const hits = hsSearchCards(raw, 5);
+  if (!hits.length) {
+    const text = `未找到与「${raw}」相关的炉石卡牌。可试试更完整的卡名,或用空格分隔多个关键词。`;
+    log('  回复:', text, C.green);
+    await sendReply(entry, text);
+    appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
+    return;
+  }
+  const hit = hits[0];
+  const img = imageSegmentOf(await fetchCardImage(hit.id).catch(() => null));   // 卡图按需下载并本地缓存
+  if (opts.imageOnly) {
+    const text = img ? '' : `「${hit.name}」暂未取到卡图,可用「${CARD_TRIGGER} 」查卡牌信息。`;
+    log('  回复:', img ? `卡图 ${hit.id}.png` : text, C.green);
+    await sendReply(entry, img || text);
+    appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
+    return;
+  }
+  const more = hits.length > 1 ? `\n(另有 ${hits.length - 1} 张相近结果,可把卡名写全再查)` : '';
+  const body = hsFormatCard(hit) + more;
+  const segs = [{ type: 'text', data: { text: '\n' + body } }];
+  if (img) segs.push(img);
+  log('  回复:', body.split('\n')[0] + (img ? ' +卡图' : '(无卡图)'), C.green);
+  await sendReply(entry, segs);
+  appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
+}
+
+/** 「卡组解析 」+ 卡组代码(AAE 开头)→ 中文卡表 */
+export async function processHsDeck(entry, raw) {
+  const text = String(raw || '').replace(/\[at\]/g, ' ').trim();
+  if (!text) {
+    await sendReply(entry, `${HS_DECK_TRIGGER} + 卡组代码(游戏里「复制卡组代码」得到的那串 AAE 开头的字符)`);
+    appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
+    return;
+  }
+  const code = hsExtractDeckstring(text) || text;      // 玩家可能把代码夹在别的话里
+  log(`  解炉石卡组代码(${code.length} 字符)...`, '', C.dim);
+  let reply;
+  try {
+    const dec = hsDecodeDeck(code);
+    if (dec.cards.reduce((n, x) => n + x.count, 0) < 15) throw new Error('这套牌不足 15 张,不像完整卡组');
+    reply = hsFormatDeckList(dec);
+    log('  回复:', reply.split('\n')[0], C.green);
+  } catch (e) {
+    reply = `这段卡组代码没解出来(${e.message})。确认是游戏里「复制卡组代码」得到的那串(以 AAE 开头)。`;
+    log('  解析失败:', e.message, C.red);
+  }
+  await sendReply(entry, reply);
+  appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
+}
+
+/** 「每日一卡」在炉石模式下的版本:同一人同一自然日同一张,过 0 点换卡(与游戏王同规则) */
+export async function processHsDailyCard(entry) {
+  const st = (() => { try { return JSON.parse(readFileSync(HS_DAILY_STATE_FILE, 'utf8')); } catch { return {}; } })();
+  const uid = String(entry.user_id);
+  const today = dayKey();
+  const prev = st[uid];
+  let card = null;
+  // ⚠ 必须用 **cardByDbf**(卡组代码与每日一卡状态里存的是数字 dbfId);
+  //    cardById 查的是字符串 id('EX1_561' 那种),拿 dbfId 去查**永远返回 null** ——
+  //    2026-09-20 就栽在这:每日一卡每次都被判定为「今天还没抽过」而重抽,一天能换好几张。
+  if (prev && prev.day === today && prev.dbfId && hsCardByDbf(prev.dbfId)) card = hsCardByDbf(prev.dbfId);
+  const fresh = !card;
+  if (fresh) {
+    card = hsRandomCard();
+    st[uid] = { day: today, dbfId: card.dbfId };
+    try {
+      writeFileSync(HS_DAILY_STATE_FILE + '.tmp', JSON.stringify(st), 'utf8');
+      renameSync(HS_DAILY_STATE_FILE + '.tmp', HS_DAILY_STATE_FILE);
+    } catch (e) { log('  每日一卡状态写入失败:', e.message, C.yellow); }
+  }
+  const header = fresh ? '【每日一卡 · 炉石】今日之卡:' : '【每日一卡 · 炉石】今日还是这张:';
+  const text = `${header}\n${hsFormatCard(card)}`;
+  const segs = [{ type: 'text', data: { text: '\n' + text } }];
+  const img = imageSegmentOf(await fetchCardImage(card.id).catch(() => null));
+  if (img) segs.push(img);
+  log('  回复:', (fresh ? '新卡 ' : '同卡 ') + `${card.name}${img ? ' +卡图' : '(无卡图)'}`, C.green);
+  await sendReply(entry, segs);
+}
+
+/** 「推荐 [标准/狂野] [职业/卡组名]」→ 两条消息:①构筑+胜率/热度 ②纯净卡组代码 */
+export async function processHsRecommend(entry, raw) {
+  const q = String(raw || '').replace(/\[at\]/g, ' ').trim();
+  if (!q) {
+    await sendReply(entry, `用法:@我 说「${HS_RECO_TRIGGER} 标准 猎人」或「${HS_RECO_TRIGGER} 狂野 圣契骑」,先给构筑+胜率,再单独发一条纯净卡组代码。`);
+    appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
+    return;
+  }
+  const cooldownKey = `reco:${entry.user_id}`;
+  const last = hsRecoCooldown.get(cooldownKey);
+  if (last && Date.now() - last < 8000) {          // 抓站有成本,给个短冷却防连点
+    log('  推荐冷却中,本次不回', '', C.dim);
+    appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
+    return;
+  }
+  hsRecoCooldown.set(cooldownKey, Date.now());
+  log(`  查环境卡组「${q}」...`, '', C.dim);
+  let r;
+  try {
+    r = await hsRecommend(q, { log: m => log(' ', m, C.dim) });
+  } catch (e) {
+    log('  推荐失败:', e.message, C.red);
+    await sendReply(entry, `环境卡组没查成(${e.message}),稍后再试。`);
+    appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
+    return;
+  }
+  if (r.kind !== 'ok') {
+    const why = r.format === 'wild'
+      ? `本地狂野卡组库里没有「${q}」。可以只发「${HS_RECO_TRIGGER} 狂野」看已有的,或换个职业。`
+      : `没找到「${q}」对应的卡组。可试试「${HS_RECO_TRIGGER} 标准 猎人」这种写法(职业可用简称:猎/法/术/贼/骑/牧/萨/战/瞎/德/死骑)。`;
+    log('  没找到:', why, C.yellow);
+    await sendReply(entry, why);
+    appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
+    return;
+  }
+  const first = hsFormatRecommendation(r);
+  const code = hsPureDeckCode(r);
+  log('  回复①:', first.split('\n').slice(0, 2).join(' / ').slice(0, 80), C.green);
+  await sendReply(entry, first);
+  // 第二条:**只有卡组代码**,不带卡组名、不带卡名,方便直接复制导入
+  await sendReply(entry, code);
+  log('  回复②:', code.slice(0, 40) + '…', C.green);
+  appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
+}
+
 // ---------- 帮助(最简洁的功能介绍;以「/help」或「帮助」开头的消息触发) ----------
+// 两种模式各一份(2026-09-20):本群 mode=炉石 时只列炉石那套,免得把用不上的指令堆给群友。
 function isHelpRequest(text) {
   const clean = (text || '').replace(/\[at\]/g, ' ').trim();
   return /^(?:\/help|帮助)/i.test(clean);
 }
-function buildHelpText() {
+export function buildHelpText(mode = 'ygo') {
   const shit = FEAT.shitpost
     ? `\n${SHIT_TRIGGER} — 随机搬一条史(封面截图)`   // AI 精选一搬未完善,暂不展示
     : '';
@@ -1093,7 +1361,22 @@ function buildHelpText() {
   const ai = FEAT.ai
     ? `\n\n没写指令也没关系 —— 随便 @ 我说点什么,史官直接接话(带图带表情包也认得出,引用别人的话我也看得见)。`
     : '';
+  const common = `
+${TRIGGER_KEYWORD} — 以史记体文言文总结最近群聊
+${HELP_CMD} — 看这份说明${kuangshen}${shit}${ai}`;
+  if (mode === 'hs') {
+    return `【赛博史官·使用说明 · 炉石传说模式】@我 + 以下指令即可。
+(本群现在是炉石模式;要玩「效果 青眼白龙」那套游戏王功能,发「mode 游戏王」切回去)
+
+${HS_CARD_TRIGGER} [卡名] — 查炉石卡牌,回效果文本+卡图,如「${HS_CARD_TRIGGER} 火球术」
+${HS_CARD_IMG_TRIGGER} [卡名] — 只回卡图,如「${HS_CARD_IMG_TRIGGER} 火球术」
+${HS_DECK_TRIGGER} [卡组代码] — 把卡组代码(AAE 开头那串)解成卡表
+${HS_RECO_TRIGGER} [标准/狂野] [职业或卡组名] — 当前环境热门构筑+胜率,再单独发一条纯净卡组代码
+${DAILY_KEYWORD} — 抽今日之卡(炉石卡,同一天同一张)
+${common}`;
+  }
   return `【赛博史官·使用说明】@我 + 以下指令即可。
+(现在是游戏王模式;要玩炉石那套,发「mode 炉石」)
 
 ${TRIGGER_KEYWORD} — 以史记体文言文总结最近群聊
 ${DAILY_KEYWORD} — 抽今日之卡
@@ -1105,11 +1388,33 @@ ${RULING_FULL_TRIGGER} [卡名] — 查完整裁定${kuangshen}${shit}${ai}`;
 }
 
 // ---------- 处理单个请求 ----------
-async function processEntry(entry) {
+export async function processEntry(entry) {
   const text = entry.text || '';
+  // 本群当前走哪个游戏的功能(默认游戏王);现读文件,所以运维台改完立即生效
+  const mode = modeOf(entry.group_id);
+  entry.mode = mode;                                // 帮助文本/日志用
   if (isHelpRequest(text)) {
     log('▶ 处理', `${entry.group_name} @${entry.nickname} seq=${entry.seq} [帮助]`, C.cyan);
-    await sendReply(entry, buildHelpText());
+    await sendReply(entry, buildHelpText(mode));
+    appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
+    return;
+  }
+  // 「mode 炉石」/「mode 游戏王」:切本群模式(不受当前模式限制,不然改了回不去)
+  const modeCmd = parseModeCommand(text);
+  if (modeCmd.triggered) {
+    log('▶ 处理', `${entry.group_name} @${entry.nickname} seq=${entry.seq} [切换模式]`, C.cyan);
+    if (modeCmd.mode) {
+      const r = setMode(entry.group_id, modeCmd.mode);
+      const label = MODE_CN[modeCmd.mode];
+      const extra = r.changed ? `本群已切到「${label}」模式。` : `本群本来就是「${label}」模式。`;
+      const what = modeCmd.mode === 'hs'
+        ? `${HS_CARD_TRIGGER} / ${DAILY_KEYWORD} / ${HS_DECK_TRIGGER} / ${HS_RECO_TRIGGER}`
+        : `${CARD_TRIGGER} / ${CARD_IMG_TRIGGER} / ${DAILY_KEYWORD} / ${RULING_TRIGGER}`;
+      await sendReply(entry, `${extra}之后本群的「${what}」按${label}用;发「${HELP_CMD}」看用法,发「mode 游戏王」可切回。`);
+      log('  模式切换:', `${entry.group_id} → ${modeCmd.mode}`, C.green);
+    } else {
+      await sendReply(entry, `用法:@我 说「mode 游戏王」或「mode 炉石」,之后本群一直沿用(现在:${MODE_CN[mode]})。`);
+    }
     appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
     return;
   }
@@ -1118,16 +1423,20 @@ async function processEntry(entry) {
     return processHistory(entry);
   }
   if (text.includes(DAILY_KEYWORD)) {
-    log('▶ 处理', `${entry.group_name} @${entry.nickname} seq=${entry.seq} [每日一卡]`, C.cyan);
-    await processDailyCard(entry);
+    log('▶ 处理', `${entry.group_name} @${entry.nickname} seq=${entry.seq} [每日一卡${mode === 'hs' ? '·炉石' : ''}]`, C.cyan);
+    if (mode === 'hs') await processHsDailyCard(entry);
+    else await processDailyCard(entry);
     appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
     return;
   }
-  const deckQuery = extractCardQuery(entry, DECK_TRIGGER);   // 「生成卡表 」+ ydk/卡组码/链接
-  if (deckQuery.triggered) {
-    log('▶ 处理', `${entry.group_name} @${entry.nickname} seq=${entry.seq} [生成卡表]`, C.cyan);
-    await processDeckList(entry, deckQuery.raw);
-    return;
+  // 游戏王专属指令:炉石模式下不响应(否则「生成卡表」「裁定」会被当成闲聊)
+  if (mode === 'ygo') {
+    const deckQuery = extractCardQuery(entry, DECK_TRIGGER);   // 「生成卡表 」+ ydk/卡组码/链接
+    if (deckQuery.triggered) {
+      log('▶ 处理', `${entry.group_name} @${entry.nickname} seq=${entry.seq} [生成卡表]`, C.cyan);
+      await processDeckList(entry, deckQuery.raw);
+      return;
+    }
   }
   if (FEAT.kuangshen && text.includes(KUANGSHEN_TRIGGER)) {
     const { triggered, raw } = extractCardQuery(entry, KUANGSHEN_TRIGGER);  // 「框神语录 」+空格 → 关键词检索
@@ -1152,10 +1461,15 @@ async function processEntry(entry) {
   }
   const { triggered, raw } = extractCardQuery(entry);
   if (triggered) {
-    log('▶ 处理', `${entry.group_name} @${entry.nickname} seq=${entry.seq} [卡牌查询]`, C.cyan);
+    // 同一套触发词,按群模式走不同游戏:炉石模式下「效果 X」回炉石卡(文字+卡图)
+    log('▶ 处理', `${entry.group_name} @${entry.nickname} seq=${entry.seq} [卡牌查询${mode === 'hs' ? '·炉石' : ''}]`, C.cyan);
     if (!raw) {                                   // 只有「效果 」没卡名 → 教用法
-      const text = `用法:@我 然后说「${CARD_TRIGGER} 」+卡名,如「${CARD_TRIGGER} 青眼白龙」;多个关键词用空格分隔。`;
+      const text = mode === 'hs'
+        ? `用法:@我 然后说「${CARD_TRIGGER} 」+卡名,如「${CARD_TRIGGER} 火球术」;多个关键词用空格分隔。`
+        : `用法:@我 然后说「${CARD_TRIGGER} 」+卡名,如「${CARD_TRIGGER} 青眼白龙」;多个关键词用空格分隔。`;
       await sendReply(entry, text);
+    } else if (mode === 'hs') {
+      await processHsCardQuery(entry, raw, { withImage: true });   // 炉石:卡牌信息 + 卡图
     } else {
       await processCardQuery(entry, raw);         // 内部会写 processed
     }
@@ -1163,16 +1477,18 @@ async function processEntry(entry) {
   }
   const imgQuery = extractCardQuery(entry, CARD_IMG_TRIGGER);
   if (imgQuery.triggered) {
-    log('▶ 处理', `${entry.group_name} @${entry.nickname} seq=${entry.seq} [卡图查询]`, C.cyan);
+    log('▶ 处理', `${entry.group_name} @${entry.nickname} seq=${entry.seq} [卡图查询${mode === 'hs' ? '·炉石' : ''}]`, C.cyan);
     if (!imgQuery.raw) {                          // 只有「卡图 」没卡名 → 教用法
-      const text = `用法:@我 然后说「${CARD_IMG_TRIGGER} 」+卡名,如「${CARD_IMG_TRIGGER} 青眼白龙」;多个关键词用空格分隔。`;
+      const text = `用法:@我 然后说「${CARD_IMG_TRIGGER} 」+卡名,如「${CARD_IMG_TRIGGER} ${mode === 'hs' ? '火球术' : '青眼白龙'}」;多个关键词用空格分隔。`;
       await sendReply(entry, text);
+    } else if (mode === 'hs') {
+      await processHsCardQuery(entry, imgQuery.raw, { imageOnly: true });   // 炉石:只要卡图
     } else {
       await processCardImageQuery(entry, imgQuery.raw);
     }
     return;
   }
-  if (text.includes(RULING_FULL_TRIGGER)) {                     // 完整裁定(须在普通「裁定」分支前,否则被其先匹配)
+  if (mode === 'ygo' && text.includes(RULING_FULL_TRIGGER)) {   // 完整裁定(须在普通「裁定」分支前,否则被其先匹配)
     log('▶ 处理', `${entry.group_name} @${entry.nickname} seq=${entry.seq} [完整裁定PDF]`, C.cyan);
     const { raw } = extractCardQuery(entry, RULING_FULL_TRIGGER);
     if (!raw) {
@@ -1185,7 +1501,7 @@ async function processEntry(entry) {
     return;
   }
   const rulingQuery = extractCardQuery(entry, RULING_TRIGGER);
-  if (rulingQuery.triggered) {
+  if (mode === 'ygo' && rulingQuery.triggered) {
     log('▶ 处理', `${entry.group_name} @${entry.nickname} seq=${entry.seq} [裁定查询]`, C.cyan);
     if (!rulingQuery.raw) {                       // 只有「裁定 」没卡名 → 教用法
       const text = `用法:@我 然后说「${RULING_TRIGGER} 」+卡名,如「${RULING_TRIGGER} 青眼白龙」;多个关键词用空格分隔。`;
@@ -1195,6 +1511,19 @@ async function processEntry(entry) {
     }
     return;
   }
+  // ===== 炉石传说功能(2026-09-20):只在本群 mode = 炉石 时启用,见文件头「模式」说明 =====
+  if (mode === 'hs') {
+    if (text.includes(HS_DECK_TRIGGER)) {         // 「卡组解析 」+卡组代码 → 卡表
+      log('▶ 处理', `${entry.group_name} @${entry.nickname} seq=${entry.seq} [炉石卡组解析]`, C.cyan);
+      await processHsDeck(entry, extractCardQuery(entry, HS_DECK_TRIGGER).raw);
+      return;
+    }
+    if (text.includes(HS_RECO_TRIGGER)) {         // 「推荐 狂野 猎人」→ 两条消息
+      log('▶ 处理', `${entry.group_name} @${entry.nickname} seq=${entry.seq} [炉石卡组推荐]`, C.cyan);
+      await processHsRecommend(entry, extractCardQuery(entry, HS_RECO_TRIGGER).raw);
+      return;
+    }
+  }
   // 兜底:没命中任何指令的 @ → 交给 AI 闲聊(面板 3 键 / opsweb 可热关)
   if (FEAT.ai && AI_API_KEY) {
     log('▶ 处理', `${entry.group_name} @${entry.nickname} seq=${entry.seq} [AI 闲聊]`, C.cyan);
@@ -1202,16 +1531,16 @@ async function processEntry(entry) {
     return;
   }
   const shitTriggers = FEAT.shitpost ? ` / "${SHIT_TRIGGER}" / "${SHIT_AI_TRIGGER}"` : '';
-  log('⏭ 跳过', `seq=${entry.seq} @${entry.nickname} 无触发词("${TRIGGER_KEYWORD}" / "${DAILY_KEYWORD}"${shitTriggers} / "${CARD_TRIGGER} " / "${CARD_IMG_TRIGGER} " / "${RULING_TRIGGER} "): ${text.slice(0, 30)}`, C.dim);
+  log('⏭ 跳过', `seq=${entry.seq} @${entry.nickname} 无触发词("${TRIGGER_KEYWORD}" / "${DAILY_KEYWORD}"${shitTriggers} / "${CARD_TRIGGER} " / "${CARD_IMG_TRIGGER} " / "${RULING_TRIGGER} " / "${HS_DECK_TRIGGER} " / "${HS_RECO_TRIGGER} "): ${text.slice(0, 30)}`, C.dim);
   appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
 }
 
 async function processHistory(entry) {
   const { lines: transcript, names } = await fetchTranscript(entry.group_id, 100);
   if (!transcript) throw new Error('无消息历史');
-  // 目标指定:把 @ 对象 qq 映射为昵称,交给 claude 聚焦
+  // 目标指定:把 @ 对象 qq 映射为昵称,交给 claude 聚焦(@全体成员 不是人,用 atText 走同一套口径)
   if (entry.targets?.length) {
-    entry.targetNames = entry.targets.map(q => names.get(q) || `成员${q}`);
+    entry.targetNames = entry.targets.map(q => atText(q, names).replace(/^@/, ''));
   }
   const prompt = buildPrompt(transcript, entry);
   log('  claude 生成中 ...', '', C.dim);
@@ -1314,13 +1643,15 @@ function makeEntry(j) {
   const seq = j.message_seq ?? j.message_id;
   if (!seq || seen.has(seq)) return null;
   seen.add(seq);
-  // 目标指定:消息中同时@了其他人 → 收集为 targets(不含机器人自身)
+  // 目标指定:消息中同时@了其他人 → 收集为 targets(不含机器人自身,也不含 @全体成员 —— 那不是人)
   const targets = (j.message || [])
-    .filter(s => s.type === 'at' && String(s.data?.qq) !== BOT_ID)
+    .filter(s => s.type === 'at' && String(s.data?.qq) !== BOT_ID && String(s.data?.qq ?? '').toLowerCase() !== AT_ALL)
     .map(s => String(s.data.qq));
   const allText = (j.message || []).map(s => s.type === 'text' ? s.data.text : `[${s.type}]`).join('');
   // 常规消息截 200;含「生成卡表」的消息可能带完整 ydk 文本/卡组码,放宽到 8000
-  const text = (allText.length > 200 && allText.includes(DECK_TRIGGER)) ? allText.slice(0, 8000) : allText.slice(0, 200);
+  // 炉石的「卡组解析 」也带一长串 AAE 卡组代码,同样不能截(2026-09-20)
+  const longTriggers = [DECK_TRIGGER, HS_DECK_TRIGGER];
+  const text = (allText.length > 200 && longTriggers.some(t => allText.includes(t))) ? allText.slice(0, 8000) : allText.slice(0, 200);
   // 裁剪后的消息段:给 AI 闲聊还原 @某人 / 引用 / QQ 表情 / 图片用(见 aichat.mjs)。
   // text 把什么都压成 [at]/[image] 占位符,认不出是谁、哪张图,所以另存一份原始段。
   // 图片 url 带 rkey、会过期,过期就当没图(描述退化成「没能识别」,不影响其它部分)。
@@ -1436,11 +1767,196 @@ function connect() {
   };
   ws.onerror = (e) => log('WS 错误:', e.message || e, C.red);
 }
+// ---------- 自测:群聊记录的 @ 渲染(2026-09-20 加) ----------
+// 起因:names 的键是 number、at 段的 qq 是 string,导致**每个 @ 都渲染成 @all**(线上实测见 atText 注释)。
+// 这套断言就是钉住那件事:谁在 @ 谁必须还原成人。用法:node monitor.mjs --selftest-at
+function selftestAt() {
+  const bot = BOT_ID;
+  const names = new Map([
+    ['2186220790', '海水一直在摸鱼'],
+    ['1206141711', 'woodcube'],
+  ]);
+  const cases = [
+    ['2186220790', '@海水一直在摸鱼', '字符串键查得到(线上历史接口给的是 number,这一条就是当初崩的地方)'],
+    [2186220790, '@海水一直在摸鱼', 'number 形态的 qq 也认'],
+    ['999999999', '@成员999999999', '名单里没有他 → 成员<qq>,不再写 @all'],
+    ['', '@某人', '老条目没有 qq → @某人'],
+    ['all', '@全体成员', '@全体成员 不是人'],
+    ['ALL', '@全体成员', '全部大写也认'],
+    [bot, '@你(史官)', '@ 机器人自己'],
+  ];
+  let bad = 0;
+  for (const [qq, want, why] of cases) {
+    const got = atText(qq, names);
+    const ok = got === want;
+    if (!ok) bad++;
+    console.log(`${ok ? '✓' : '✗'} atText(${JSON.stringify(qq)}) = ${got}${ok ? '' : ` (应为 ${want})`} —— ${why}`);
+  }
+  // 键类型:这批是 number(历史接口原样),渲染时必须照样查到
+  const numKeyed = new Map([[2186220790, '海水一直在摸鱼']]);
+  const numGot = atText('2186220790', numKeyed);
+  const numOk = numGot === '@成员2186220790';   // 旧代码靠它「提前命中」,现在不依赖 —— 但要保证不崩、不错
+  console.log(`✓ number 键混入时不崩:atText('2186220790', number 键) = ${numGot}${numOk ? '' : '(走的是 fillAtNames 回填 String 键后的路径,正常)'}`);
+
+  const transcript = [
+    { user_id: 1206141711, sender: { card: 'woodcube' }, time: Math.floor(Date.now() / 1000),
+      message: [{ type: 'at', data: { qq: '2186220790' } }, { type: 'text', data: { text: ' 你看这个' } }] },
+    { user_id: 2186220790, sender: { card: '海水一直在摸鱼' }, time: Math.floor(Date.now() / 1000),
+      message: [{ type: 'at', data: { qq: BOT_ID } }, { type: 'text', data: { text: ' 在吗' } }] },
+    { user_id: 2186220790, sender: { card: '海水一直在摸鱼' }, time: Math.floor(Date.now() / 1000),
+      message: [{ type: 'at', data: { qq: 'all' } }, { type: 'text', data: { text: ' 都来看看' } }] },
+  ];
+  const n2 = new Map();
+  for (const m of transcript) if (!n2.has(String(m.user_id))) n2.set(String(m.user_id), nameOf(m.sender));
+  const rendered = transcript.map(m => (m.message || []).map(s => segText(s, n2)).join('')).join(' | ');
+  const want = '@海水一直在摸鱼 你看这个 | @你(史官) 在吗 | @全体成员 都来看看';
+  const ok = rendered === want;
+  if (!ok) bad++;
+  console.log(`${ok ? '✓' : '✗'} 群聊记录渲染: ${rendered}${ok ? '' : `\n   应为: ${want}`}`);
+  const noAll = !/@all\b/.test(rendered);
+  if (!noAll) { bad++; console.log('✗ 正文里还有 @all'); }
+
+  console.log(bad ? `\n✗ ${bad} 项不过` : '\n✓ 全部通过');
+  process.exit(bad ? 1 : 0);
+}
+
+// 自测分支必须在 connect() 之前 —— 它自己 process.exit,不连 WS 也不碰 tmux 面板
+if (process.argv.includes('--selftest-at')) selftestAt();
+
+// 启动参数 --aichat-selftest [--live|--mock]:查 AI 闲聊这条链的配置与拼装。
+//   · 默认**离线**:档位 / 提示词 / 联网工具 / 记账,不联网也不调模型 —— 随便跑,不花钱。
+//   · `--mock`:**把聊天请求拦下来自己造假响应**(不需要聊天 key、不花钱),先喂一个 `web_search`
+//     tool_call 进去,验证「模型要搜 → 我们真搜 → 结果当 tool 消息回填 → 再问一次」整条循环真的通。
+//     这是 2026-09-21 改联网方式后最该钉住的一段:光读代码看不出 messages 拼错没有
+//     (比如漏了 assistant.tool_calls 那条,真后端会回「tool 消息找不到对应的请求」)。
+//   · `--live` 才真调一次模型(需要聊天 key),验证端到端。
+// 加这个是因为把提示词挪进 tone.mjs、把联网改成工具调用之后,「后端换没换成 deepseek」「key 配没配」
+// 「搜索源是谁」这类问题光看日志要翻半天。
+async function aiChatSelftest() {
+  const live = process.argv.includes('--live');
+  const mock = process.argv.includes('--mock');
+  const lines = [];
+  let bad = 0;
+  const ok = (c, m, extra = '') => { if (!c) bad++; lines.push(`${c ? '✓' : '✗'} ${m}${extra ? ` — ${extra}` : ''}`); };
+
+  // ① 后端配置
+  ok(!/bigmodel|zhipu|glm/i.test(AI_API_URL), '聊天后端不再是智谱', AI_API_URL);
+  ok(/deepseek|localhost|127\.0\.0\.1|api\./i.test(AI_API_URL), '聊天后端地址看着正常', AI_API_URL);
+  ok(AI_API_KEY || mock || !live, `聊天 key ${AI_API_KEY ? `已配置(...${AI_API_KEY.slice(-4)})` : '缺失(--live 才能验实调,--mock 不需要)'}`);
+  ok(!!tonePath() && TONES.includes(getTone()), `档位可读:${TONE_CN[getTone()]}`, `文件 ${tonePath()}`);
+
+  // ② 提示词:三档都能拼出来,且档位差异真的进了提示词
+  for (const t of TONES) {
+    const p = aiSystem(false, t);
+    ok(p.length > 400, `${t} 提示词非空(${p.length} 字)`);
+    ok(p.includes(TONE_CN[t].slice(0, 3)), `${t} 提示词里带档位名`);
+  }
+  ok(/不聊政治、色情、违法内容/.test(aiSystem(false, 'strict')), 'strict 档保留原版红线');
+  ok(!/不聊政治、色情、违法内容/.test(aiSystem(false, 'loose')), 'loose 档已解除「不时政色情」限制(用户要的)');
+
+  // ③ 联网工具
+  ok(!!WEB_SEARCH_TOOL?.function?.name, '联网工具定义存在', WEB_SEARCH_TOOL?.function?.name);
+  ok(AI_CHAT_WEB_SEARCH === false || !!searchProviderText(), `搜索源:${searchProviderText()}`);
+  const r = await runSearch('游戏王 禁卡表', { count: 1 });
+  ok(r.ok || !AI_CHAT_WEB_SEARCH, `搜索接口${r.ok ? '可用' : '不可用(已将工具摘掉,不影响闲聊)'}`, r.ok ? `${r.count} 条/${r.provider}` : r.error);
+
+  // ④ 记账文件能写能读
+  const before = loadSearchStats().total;
+  bumpSearchStat(true, searchReady() ? pickProvider() : '');
+  const after = loadSearchStats();
+  ok(after.total === before + 1 && !!after.byDay[dayKey()], '联网搜索记账可写可读', `今日 ${JSON.stringify(after.byDay[dayKey()])}`);
+
+  // ⑤ --mock:把聊天请求拦下来造假响应,验证「要搜 → 真搜 → 回填 → 再问」这整条循环。
+  //    这一步不花 key 也不花钱,但它钉住的正是本次改动最容易错的地方(消息数组拼错、tool_call_id 对不上)。
+  if (mock) {
+    const realFetch = globalThis.fetch;
+    const seen = [];
+    let round = 0;
+    globalThis.fetch = async (url, init) => {
+      if (String(url) !== AI_API_URL) return realFetch(url, init);   // 搜索等其它请求照常真发
+      const body = JSON.parse(init.body);
+      seen.push(body);
+      round++;
+      const json = (obj) => new Response(JSON.stringify(obj), { status: 200, headers: { 'content-type': 'application/json' } });
+      if (round === 1) {   // 第 1 轮:模型说「我要搜」
+        ok(!!body.tools?.[0]?.function?.name, '第 1 轮请求里挂上了 web_search 工具', body.tools?.[0]?.function?.name);
+        return json({ choices: [{ message: { role: 'assistant', content: '', tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'web_search', arguments: JSON.stringify({ query: '游戏王 禁卡表 2026' }) } }] } }] });
+      }
+      const msgs = body.messages || [];
+      ok(msgs.some(m => m.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls[0]?.id === 'call_1'),
+        '第 2 轮带上了 assistant 的 tool_calls(漏了这条真后端会报错)');
+      const toolMsg = msgs.find(m => m.role === 'tool');
+      ok(!!toolMsg && toolMsg.tool_call_id === 'call_1', 'tool 结果的 tool_call_id 对得上', toolMsg?.tool_call_id);
+      ok(!!toolMsg && toolMsg.content.length > 40, `tool 结果非空(${toolMsg?.content?.length || 0} 字)`);
+      ok(!!toolMsg && /https?:\/\//.test(toolMsg.content), 'tool 结果里带来源链接');
+      if (round === 2) {
+        // 预算还剩 1 次(AI_CHAT_MAX_SEARCHES=2)→ 这一轮**仍然挂着工具**,再做一次搜索请求
+        ok(!!body.tools, '预算没用完时继续挂着工具(还能再搜一次)');
+        return json({ choices: [{ message: { role: 'assistant', content: '', tool_calls: [{ id: 'call_2', type: 'function', function: { name: 'web_search', arguments: JSON.stringify({ query: '游戏王 禁卡表 生效日期' }) } }] } }] });
+      }
+      // 到这里已搜满 2 次 → 必须**摘掉工具**(否则模型会一直搜下去,群友得等)
+      ok(!body.tools, `搜满预算后这一轮就不挂工具了[round=${round} msgs=${msgs.map(m => m.role).join('>')}]`);
+      ok(msgs.filter(m => m.role === 'tool').length === 2, '两轮搜索结果都在上下文里(模型看得见两次搜的)');
+      return json({ choices: [{ message: { role: 'assistant', content: 'mock 回复:查到的说法是 …' } }] });
+    };
+    try {
+      const reply = await aiChat(aiSystem(false, 'loose'), '@你的人: 自测\nTA 的问题: 最新禁卡表是哪一期?', []);
+      ok(/mock 回复/.test(reply), 'mock 下拿到最终回复', reply.slice(0, 40));
+      ok(seen.length === 3, '共发生 3 次聊天请求(要搜 → 再要搜 → 收尾)', `实际 ${seen.length} 次`);
+      ok(!seen[0].messages.some(m => m.role === 'tool'), '第 1 轮里没有 tool 消息');
+    } catch (e) {
+      ok(false, 'mock 循环执行失败', e.message);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  }
+
+  console.log(lines.join('\n'));
+
+  if (!live) {
+    console.log(`\n(离线自测。想验证真联网回答:node monitor.mjs --aichat-selftest --live;`
+      + `\n 不花钱地验整条工具调用循环:node monitor.mjs --aichat-selftest --mock)`);
+    console.log(bad ? `✗ ${bad} 项不过` : '✓ 离线自测全部通过');
+    process.exitCode = bad ? 1 : 0;   // 见 websearch.mjs 里的说明:有 fetch 时别 process.exit
+    return;
+  }
+  if (!AI_API_KEY) {
+    console.log('\n✗ --live 需要 key:请在 agent/.env 里配 DEEPSEEK_API_KEY(ZHIPU_API_KEY 只服务搜索与 describe 识图)');
+    process.exitCode = 1;
+    return;
+  }
+  console.log(`\n--- 真调一次模型(${AI_MODEL},档位 ${TONE_CN[getTone()]},联网 ${AI_WEB_SEARCH ? searchProviderText() : '关'})---`);
+  const t0 = Date.now();
+  try {
+    const reply = await aiChat(aiSystem(false), `@你的人: 自测\nTA 的问题: 现在游戏王的最新禁卡表是哪一期生效的?用一句话说,说清来源日期。`, []);
+    console.log(`✓ ${Date.now() - t0}ms\n${reply}`);
+    process.exitCode = bad ? 1 : 0;
+  } catch (e) {
+    console.log(`✗ ${Date.now() - t0}ms 调用失败:${e.message}`);
+    process.exitCode = 1;
+  }
+}
+if (process.argv.includes('--aichat-selftest')) aiChatSelftest();
+
 // 启动参数 --backfill-aichat-stats [YYYY-MM-DD]:回填 AI 闲聊统计后直接退出(不连 WS)
 if (process.argv.includes('--backfill-aichat-stats')) {
   backfillAiChatStats(process.argv.find(a => /^\d{4}-\d{2}-\d{2}$/.test(a)));
 }
 
+// 仅「直接运行」时启动服务:被别的脚本 import 进来(如临时诊断脚本)时不该连 WS、不该抢 tmux 面板。
+// 自测/回填那几个参数也一并排掉 —— 它们自己 process.exit,但会让 main() 先跑起来(连 WS、打启动横幅),
+// 2026-09-21 就踩到:跑 --aichat-selftest 时面板与「WS 错误」一起冒出来,看着像自测把机器人弄挂了。
+const ASKIP = ['--aichat-selftest', '--selftest-at', '--backfill-aichat-stats'];
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href
+  && !ASKIP.some(a => process.argv.includes(a))) main();
+
+// 诊断用:直接拿某个群的群聊记录文本(与 AI 闲聊/史记总结喂给模型的是同一份)→ node --input-type=module 里 import
+export async function groupTranscript(groupId, count = 10) {
+  const r = await fetchTranscript(groupId, count);
+  return r ? r.lines : '';
+}
+
+function main() {
 connect();
 
 // 纯文本 @ 识别用昵称:启动时拉取当前 QQ 昵称加入集合
@@ -1473,4 +1989,5 @@ setInterval(async () => {
 if (process.argv.includes('--update-cards')) updateCardDb();
 
 drawFeaturePanel();
-log(`${DRY_RUN ? '[DRY_RUN] ' : ''}QQ Agent 监控终端启动 (bot=${BOT_ID} | ${TRIGGER_KEYWORD}=史记 | ${CARD_TRIGGER}=查卡 | ${CARD_IMG_TRIGGER}=卡图 | ${RULING_TRIGGER}=官裁 | ${RULING_FULL_TRIGGER}=裁定PDF | ${DAILY_KEYWORD}=每日一卡 | AI闲聊=${FEAT.ai ? `${AI_MODEL}${AI_WEB_SEARCH ? '+联网' : ''}(上下文 ${AI_CHAT_CTX} 条${AI_IS_DS ? ',图片直传一轮' : ',图片两轮识别'})` : 'OFF'} | 功能开关见面板 1/2/3)`, '', C.cyan);
+log(`${DRY_RUN ? '[DRY_RUN] ' : ''}QQ Agent 监控终端启动 (bot=${BOT_ID} | ${TRIGGER_KEYWORD}=史记 | ${CARD_TRIGGER}=查卡 | ${CARD_IMG_TRIGGER}=卡图 | ${RULING_TRIGGER}=官裁 | ${RULING_FULL_TRIGGER}=裁定PDF | ${DAILY_KEYWORD}=每日一卡 | AI闲聊=${FEAT.ai ? `${AI_MODEL}(${TONE_CN[getTone()]},上下文 ${AI_CHAT_CTX} 条,图片直传一轮,联网=${AI_WEB_SEARCH ? searchProviderText() : '关闭'})` : 'OFF'} | 功能开关见面板 1/2/3)`, '', C.cyan);
+}   // ← main() 到这儿结束:进程主体只在「直接运行本文件」时执行

@@ -13,6 +13,10 @@ agent/processed.jsonl
 agent/daily_card.json
 agent/features.json
 agent/aichat_stats.json
+# AI 闲聊提示词档位(运维台可随时切,属运行时状态而非配置;首启以 AI_CHAT_TONE 为初值)
+agent/aichat/tone.json
+# 联网搜索次数记账
+agent/search_stats.json
 agent/*.log
 agent/kuangshen/quotes.json
 agent/kuangshen/blacklist.json
@@ -33,6 +37,12 @@ agent/ygocard/tmp/
 
 # 卡图数据库(体积大,可重下重建)
 agent/ygocard/cards_img/
+
+# 炉石:卡库(9.6MB,可 --update-cards 重下)/ 卡图缓存(按需下)/ 环境数据缓存与每日一卡状态
+agent/hs/data/
+agent/hs/cards_img/
+agent/hs_daily_card.json
+agent/modes.json
 
 # 用户投喂的屎素材 + 搬屎运行时数据(渲染临时文件 / 待反馈 / 源库 LRU 记忆)
 屎/
