@@ -97,7 +97,7 @@ const AI_CHAT_MAX_SEARCHES = Math.max(1, Number(process.env.AI_CHAT_MAX_SEARCHES
 const AI_THINK_OFF = /deepseek/i.test(AI_MODEL) && process.env.AI_CHAT_REASONING !== '1';
 const AI_CHAT_MAX_TOKENS = Number(process.env.AI_CHAT_MAX_TOKENS || 800);       // 上限:留足思考/正文,别像 500 那样被思考吃空
 const AI_CHAT_TIMEOUT_MS = Number(process.env.AI_CHAT_TIMEOUT_MS || 30000);     // 单次请求超时
-const AI_CHAT_COOLDOWN_MS = Number(process.env.AI_CHAT_COOLDOWN_MS || 15000);   // 每人冷却,防连点刷屏
+const AI_CHAT_COOLDOWN_MS = Number(process.env.AI_CHAT_COOLDOWN_MS ?? 15000);   // 每人冷却,**0 = 关掉冷却**(2026-09-21 用户选了 0)
 const AI_CHAT_MAX_CHARS = Number(process.env.AI_CHAT_MAX_CHARS || 400);         // 回复超长截断阈值
 // 搬屎记忆样本库:env 优先 → 本机 memory 目录(Windows 现状)→ 仓库 data/(服务器部署位)
 const SHIT_EXAMPLES_PATH = process.env.SHIT_EXAMPLES_PATH
@@ -358,7 +358,7 @@ ${transcript}
 //
 // **提示词不在这个文件里**:人设、档位(板正/熟人群聊/放开)、时间与工具的拼装都在 aichat/tone.mjs。
 // 2026-09-21 用户要求「解除引战、色情等限制」,做成三档 + 运维 WebUI 可切,所以那段从常量变成了模块。
-const aiCooldown = new Map();   // uid -> 上次触发时间戳(15s 冷却,防连点刷屏)
+const aiCooldown = new Map();   // uid -> 上次触发时间戳(仅在 AI_CHAT_COOLDOWN_MS > 0 时使用)
 
 // 提问正文:剥掉 @ 段标记(形如 [at])与多余空白(降级路径:没有 segs 的老条目 / 解析失败时用)
 function aiQuestionText(entry) {
@@ -614,15 +614,29 @@ function backfillAiChatStats(since = '2026-09-13') {
   process.exit(0);
 }
 
+// 冷却判定抽成小函数(2026-09-21):这样 `--aichat-selftest` 能**直接钉住**「0 = 关掉」这个语义,
+// 不必去跑整条 processAiChat(那会真调模型、真发消息,自测里不能那么干)。
+// 返回 0 = 放行(顺带记下本次时间戳);返回 >0 = 还要等多少毫秒。
+function aiCooldownBlocked(uid, now = Date.now(), ms = AI_CHAT_COOLDOWN_MS) {
+  if (!(ms > 0)) return 0;                        // 0(或配坏了)→ 不拦,也不记时间戳
+  const last = aiCooldown.get(uid);
+  if (last && now - last < ms) return ms - (now - last);
+  aiCooldown.set(uid, now);
+  return 0;
+}
+
 async function processAiChat(entry) {
   const uid = String(entry.user_id);
-  const last = aiCooldown.get(uid);
-  if (last && Date.now() - last < AI_CHAT_COOLDOWN_MS) {
-    log('  AI 闲聊冷却中,本次不回', `${Math.ceil((AI_CHAT_COOLDOWN_MS - (Date.now() - last)) / 1000)}s 后可再问`, C.dim);
+  // 冷却(2026-09-21 用户要求去掉):`AI_CHAT_COOLDOWN_MS=0` 即**彻底关闭** —— 连时间戳都不记,
+  // 也就不会有「跳过时打的日志」和残留状态。默认仍是 15000(15s/人),所以想恢复只要改 .env 再重启,
+  // 不用动代码(改的是启动期常量,必须重启才生效;面板 3 键只管开/关这个功能)。
+  // ⚠ 关掉后没有节流:同一个人连点几下就会真调几次模型(联网时还会真搜几次),这是用户明确的取舍。
+  const waitMs = aiCooldownBlocked(uid);
+  if (waitMs > 0) {
+    log('  AI 闲聊冷却中,本次不回', `${Math.ceil(waitMs / 1000)}s 后可再问(要关掉冷却:agent/.env 里设 AI_CHAT_COOLDOWN_MS=0)`, C.dim);
     appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
     return;
   }
-  aiCooldown.set(uid, Date.now());
   let ctx = '';
   let names = null;
   if (AI_CHAT_CTX > 0) {
@@ -1866,6 +1880,15 @@ async function aiChatSelftest() {
   const after = loadSearchStats();
   ok(after.total === before + 1 && !!after.byDay[dayKey()], '联网搜索记账可写可读', `今日 ${JSON.stringify(after.byDay[dayKey()])}`);
 
+  // ④b 冷却语义(2026-09-21:用户要求去掉冷却,所以「0 = 关掉」必须真的成立)
+  ok(AI_CHAT_COOLDOWN_MS === 0 || AI_CHAT_COOLDOWN_MS > 0, `冷却设置可读:${AI_CHAT_COOLDOWN_MS}ms${AI_CHAT_COOLDOWN_MS > 0 ? `(${AI_CHAT_COOLDOWN_MS / 1000}s/人)` : '(已关闭)'}`);
+  const t0c = 1_800_000_000_000;
+  ok(aiCooldownBlocked('u1', t0c, 0) === 0 && aiCooldownBlocked('u1', t0c + 1, 0) === 0, '冷却=0 时连续两次都放行(真·关闭)');
+  ok(aiCooldownBlocked('u2', t0c, 15000) === 0, '冷却=15000 时第一次放行');
+  ok(aiCooldownBlocked('u2', t0c + 5000, 15000) === 10000, '5 秒后再来被拦,且剩余时间算对');
+  ok(aiCooldownBlocked('u2', t0c + 15000, 15000) === 0, '满 15 秒后放行');
+  ok(aiCooldownBlocked('u3', t0c, 15000) === 0 && aiCooldownBlocked('u4', t0c, 15000) === 0, '冷却是按人各算各的(不同 uid 互不影响)');
+
   // ⑤ --mock:把聊天请求拦下来造假响应,验证「要搜 → 真搜 → 回填 → 再问」这整条循环。
   //    这一步不花 key 也不花钱,但它钉住的正是本次改动最容易错的地方(消息数组拼错、tool_call_id 对不上)。
   if (mock) {
@@ -1989,5 +2012,5 @@ setInterval(async () => {
 if (process.argv.includes('--update-cards')) updateCardDb();
 
 drawFeaturePanel();
-log(`${DRY_RUN ? '[DRY_RUN] ' : ''}QQ Agent 监控终端启动 (bot=${BOT_ID} | ${TRIGGER_KEYWORD}=史记 | ${CARD_TRIGGER}=查卡 | ${CARD_IMG_TRIGGER}=卡图 | ${RULING_TRIGGER}=官裁 | ${RULING_FULL_TRIGGER}=裁定PDF | ${DAILY_KEYWORD}=每日一卡 | AI闲聊=${FEAT.ai ? `${AI_MODEL}(${TONE_CN[getTone()]},上下文 ${AI_CHAT_CTX} 条,图片直传一轮,联网=${AI_WEB_SEARCH ? searchProviderText() : '关闭'})` : 'OFF'} | 功能开关见面板 1/2/3)`, '', C.cyan);
+log(`${DRY_RUN ? '[DRY_RUN] ' : ''}QQ Agent 监控终端启动 (bot=${BOT_ID} | ${TRIGGER_KEYWORD}=史记 | ${CARD_TRIGGER}=查卡 | ${CARD_IMG_TRIGGER}=卡图 | ${RULING_TRIGGER}=官裁 | ${RULING_FULL_TRIGGER}=裁定PDF | ${DAILY_KEYWORD}=每日一卡 | AI闲聊=${FEAT.ai ? `${AI_MODEL}(${TONE_CN[getTone()]},上下文 ${AI_CHAT_CTX} 条,图片直传一轮,联网=${AI_WEB_SEARCH ? searchProviderText() : '关闭'},冷却=${AI_CHAT_COOLDOWN_MS > 0 ? `${AI_CHAT_COOLDOWN_MS / 1000}s/人` : '关'})` : 'OFF'} | 功能开关见面板 1/2/3)`, '', C.cyan);
 }   // ← main() 到这儿结束:进程主体只在「直接运行本文件」时执行
