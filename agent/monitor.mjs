@@ -948,7 +948,7 @@ function tiebaStartupText() {
   const st = allOn();
   const on = st.all ? ['全部群'] : st.groups.filter(g => g !== '*');
   const what = on.length ? on.join(',') : '全部关闭';
-  return `${what}(概率 ${Math.round(TIEBA_PROB * 100)}%${TIEBA_AT_PROB === 1 ? ',@ 必接' : ''},上下文 ${TIEBA_CTX} 条,连发 ≤${TIEBA_MAX_REPLY} 条)`;
+  return `${what}(概率 ${Math.round(TIEBA_PROB * 100)}%,@ 必接且覆盖闲聊,上下文 ${TIEBA_CTX} 条,连发 ≤${TIEBA_MAX_REPLY} 条)`;
 }
 
 async function processTiebaSwitch(entry, cmd) {

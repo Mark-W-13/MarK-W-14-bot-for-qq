@@ -551,7 +551,7 @@ button.mini{min-height:28px;padding:4px 10px;font-size:12px;border-radius:7px}
     <div id="tieba"></div>
     <div style="margin-top:10px"><button onclick="openTieba()">选择群…</button>
       <span class="mut" style="margin-left:8px" id="tiebanote"></span></div>
-    <div class="mut" style="margin-top:8px;font-size:11px">开了之后<strong>不用 @ 也会接话</strong>(脏话全开、短句、可连发,不 @ 人)。
+    <div class="mut" style="margin-top:8px;font-size:11px">开了之后<strong>不用 @ 也会接话</strong>(脏话全开、短句、可连发、不 @ 人),而且 <strong>@ 它也归它管</strong>:那个群的兜底闲聊会被同一套人格覆盖(不答疑、不帮忙、只骂人)。
       <br>⚠ 默认全部关闭:只对这里点开的群生效;群友发「贴吧模式 开 / 关」也能切。</div></div>
 
   <div class="card"><h2>服务</h2><div id="svcs"></div></div>
