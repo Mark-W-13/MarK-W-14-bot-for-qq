@@ -1044,12 +1044,16 @@ async function updateCardDb() {
 }
 
 // ---------- 发送回复(at 触发者 + 正文;message 可为字符串或消息段数组,如含图片段) ----------
+// ⚠ 正文**不要加前置换行**(2026-09-28 用户反馈「发消息时多了一行空行」):
+//   以前这里写的是 `{ text: '\n' + message }`,当时是为了让正文别跟 @ 段挤在一行 —— 但 OneBot/QQ 侧
+//   已经把 at 段单独渲染,那个换行就变成了消息开头的一行空白。所有出站文本统一用 noLead() 削掉行首换行。
+const noLead = s => String(s ?? '').replace(/^[\r\n]+/, '');
 async function sendReply(entry, message) {
   // 兼容三种形态: 字符串(文本) / 段数组(如文本+图片) / 单个段对象(如仅图片)
   const segs = Array.isArray(message)
     ? message
     : typeof message === 'string'
-      ? [{ type: 'text', data: { text: '\n' + message } }]
+      ? [{ type: 'text', data: { text: noLead(message) } }]
       : [message];
   if (DRY_RUN) {
     const first = segs.find(s => s.type === 'text')?.data?.text || '(图片)';
@@ -1071,7 +1075,7 @@ async function sendReply(entry, message) {
 // ---------- 发送纯文本(不 @ 任何人;贴吧模式专用,2026-09-28) ----------
 // 为什么必须另开一个:sendReply 会**先塞一个 at 段**(那是所有功能的约定:回复均 @ 触发者),
 // 而贴吧模式用户明确定调「不 @ 被骂的人」—— 用 sendReply 会把每条回复都变成 @ 某人,群友被反复通知。
-// 所以贴吧模式的连发走这里(首行那个换行照旧:不带换行时 QQ 里会跟机器人上一条消息贴在一起)。
+// 所以贴吧模式的连发走这里(同样**不加前置换行** —— 见上面 noLead 的说明)。
 async function sendGroupText(groupId, text) {
   if (DRY_RUN) {
     log(`  [DRY_RUN] 不发送(贴吧模式): ${String(text).slice(0, 50)} ...`, '', C.yellow);
@@ -1079,7 +1083,7 @@ async function sendGroupText(groupId, text) {
   }
   const r = await api('send_group_msg', {
     group_id: groupId,
-    message: [{ type: 'text', data: { text: `\n${text}` } }],
+    message: [{ type: 'text', data: { text: noLead(text) } }],
   });
   if (r.status !== 'ok') throw new Error(`发送失败: ${JSON.stringify(r).slice(0, 120)}`);
   return r.data?.message_id;
@@ -1267,7 +1271,7 @@ async function processDailyCard(entry) {
   }
   const header = fresh ? '【每日一卡】今日之卡:' : '【每日一卡】今日还是这张:';
   const text = `${header}\n${formatCard(cards[cid])}`;
-  const segs = [{ type: 'text', data: { text: '\n' + text } }];
+  const segs = [{ type: 'text', data: { text } }];
   const img = cardImageSegment(cards[cid]);         // 先文字后卡图;无本地卡图则纯文字
   if (img) segs.push(img);
   log('  回复:', (fresh ? '新卡 ' : '同卡 ') + text.split('\n')[1].slice(0, 40) + (img ? ' +卡图' : ''), C.green);
@@ -1560,7 +1564,7 @@ export async function processHsCardQuery(entry, raw, opts = {}) {
   }
   const more = hits.length > 1 ? `\n(另有 ${hits.length - 1} 张相近结果,可把卡名写全再查)` : '';
   const body = hsFormatCard(hit) + more;
-  const segs = [{ type: 'text', data: { text: '\n' + body } }];
+  const segs = [{ type: 'text', data: { text: body } }];
   if (img) segs.push(img);
   log('  回复:', body.split('\n')[0] + (img ? ' +卡图' : '(无卡图)'), C.green);
   await sendReply(entry, segs);
@@ -1613,7 +1617,7 @@ export async function processHsDailyCard(entry) {
   }
   const header = fresh ? '【每日一卡 · 炉石】今日之卡:' : '【每日一卡 · 炉石】今日还是这张:';
   const text = `${header}\n${hsFormatCard(card)}`;
-  const segs = [{ type: 'text', data: { text: '\n' + text } }];
+  const segs = [{ type: 'text', data: { text } }];
   const img = imageSegmentOf(await fetchCardImage(card.id).catch(() => null));
   if (img) segs.push(img);
   log('  回复:', (fresh ? '新卡 ' : '同卡 ') + `${card.name}${img ? ' +卡图' : '(无卡图)'}`, C.green);
@@ -2326,6 +2330,9 @@ export async function tiebaSelftest() {
       ok(user.includes('还没睡') && user.includes('你妈守灵呢'), '用户消息带上了历史上下文(窗口机制真的在工作)');
       ok(sent.length === 2, `模型的两行被拆成两条**连发**出去(${sent.length} 条)`);
       ok(sent.every(s => (s.message || []).every(seg => seg.type === 'text')), '连发出去的全是纯文本段');
+      // 2026-09-28 用户反馈「发消息时多了一行空行」:出站正文一律不许带前置换行(见 noLead)
+      const leads = sent.map(s => String(s.message?.[0]?.data?.text || ''));
+      ok(leads.every(t => t && !/^[\r\n]/.test(t)), `贴吧模式的连发不带前置换行:${JSON.stringify(leads.map(t => t.slice(0, 8)))}`);
       ok(sent.every(s => !(s.message || []).some(seg => seg.type === 'at')), '**回复里没有任何 @ 段**(用户明确定调)');
       ok((sent[0]?.message?.[0]?.data?.text || '').includes('智能你妈了个逼'), `第一条内容对得上:${sent[0]?.message?.[0]?.data?.text?.trim()}`);
     }
@@ -2353,6 +2360,10 @@ export async function tiebaSelftest() {
       ok(posted[0]?.temperature === TIEBA_TEMPERATURE && !posted[0]?.tools, `@ 这条路也用嘴臭那档采样参数(temp=${posted[0]?.temperature},不挂工具)`);
       ok(sent.length === 2 && sent.every(s => !(s.message || []).some(seg => seg.type === 'at')),
         `@ 的回复同样连发且不带 @(${sent.length} 条)`);
+      // 顺带钉住出站文本的通用规矩:sendGroupText / sendReply 都不许加前置换行
+      ok(sent.every(s => s.message?.[0]?.data?.text && !/^[\r\n]/.test(s.message[0].data.text)),
+        '@ 那条路的出站正文同样不带前置换行');
+      ok(noLead('\n\n喂') === '喂' && noLead('喂') === '喂' && noLead('') === '', 'noLead 只削行首换行、不动正常正文');
     } catch (e) {
       ok(false, `@ 覆盖那一段跑失败:${e.message}`);
     }
