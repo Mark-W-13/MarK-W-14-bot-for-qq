@@ -29,7 +29,8 @@ import { getTone, setTone, TONES, TONE_CN, TONE_DESC, tonePath } from './aichat/
 // 所以这里点一下立刻生效、不用重启 monitor(见下方 /api/tieba)。
 import {
   allOn as tiebaAll, isOn as tiebaOn, setOn as tiebaSetOn, statePath as tiebaStatePath,
-  PROB as TIEBA_PROB, PROB_AT as TIEBA_AT_PROB, CTX as TIEBA_CTX, MAX_REPLY as TIEBA_MAX_REPLY,
+  probOf as tiebaProbOf, probAtOf as tiebaProbAtOf, setProb as tiebaSetProb,
+  PROB_DEFAULT as TIEBA_PROB, PROB_AT_DEFAULT as TIEBA_AT_PROB, CTX as TIEBA_CTX, MAX_REPLY as TIEBA_MAX_REPLY,
   MAX_CHARS as TIEBA_MAX_CHARS, NEW_GAP_MS as TIEBA_GAP_MS, MIN_CHARS as TIEBA_MIN_CHARS,
 } from './tieba/tieba.mjs';
 // ⚠ 这一行只是把 env.mjs **加载**进来 —— 它**被 import 的那一刻**就自己把 agent/.env 读进
@@ -365,10 +366,12 @@ async function buildStatus() {
       })()] || null,
     },
     modes,
-    // 贴吧模式(2026-09-28):分群开关 + 当前生效的口径(概率/窗口/连发条数),界面上一眼看得到
+    // 贴吧模式(2026-09-28):分群开关 + 接话概率(现读 state.json,滑杆可调)+ 其余口径
     tieba: await (async () => {
       const t = await groupsWithTieba().catch(() => ({ all: false, groups: [], opened: 0, file: tiebaStatePath(), updatedAt: 0 }));
-      return { ...t, prob: TIEBA_PROB, probAt: TIEBA_AT_PROB, ctx: TIEBA_CTX, maxReply: TIEBA_MAX_REPLY,
+      return { ...t, prob: tiebaProbOf(), probAt: tiebaProbAtOf(), probEnv: TIEBA_PROB, probAtEnv: TIEBA_AT_PROB,
+        probRange: { min: 0, max: 1, step: 0.05 },
+        ctx: TIEBA_CTX, maxReply: TIEBA_MAX_REPLY,
         maxChars: TIEBA_MAX_CHARS, gapMs: TIEBA_GAP_MS, minChars: TIEBA_MIN_CHARS };
     })(),
     account: info?.data ? { uin: String(info.data.user_id), nickname: info.data.nickname } : null,
@@ -524,6 +527,11 @@ button.mini{min-height:28px;padding:4px 10px;font-size:12px;border-radius:7px}
 .tbrow .tk{flex:1;min-width:0}
 .tbrow .tsub{font-size:11px;color:var(--mut)}
 .tbrow.all{border-bottom:1px solid var(--line);margin-bottom:4px}
+/* 接话概率:一条范围滑杆 + 旁边一个能直接填数字的框(两者同步) */
+.tbprob{display:flex;align-items:center;gap:10px;padding:8px 0}
+.tbprob input[type=range]{flex:1;min-width:90px;accent-color:var(--acc);height:24px;margin:0}
+.tbprob input[type=number]{width:64px;font:inherit;padding:4px 6px;border:1px solid var(--line);border-radius:7px;text-align:center}
+.tbprob .tbpc{font-size:12px;color:var(--mut);flex:0 0 auto}
 </style></head><body>
 
 <div id="login"><div class="box">
@@ -594,6 +602,16 @@ button.mini{min-height:28px;padding:4px 10px;font-size:12px;border-radius:7px}
 <div id="tbmodal"><div class="mbox">
   <h3>贴吧模式 · 按群开关 <button class="mini" style="margin-left:auto" onclick="closeTieba()">关闭</button></h3>
   <div class="mut" id="tbhint"></div>
+  <div class="tbprob">
+    <span class="tbpc">接话概率</span>
+    <input type="range" id="tbprob" min="0" max="1" step="0.05" value="0.7"
+      oninput="tbProbInput(this.value)" onchange="tbProbSave(this.value)">
+    <input type="number" id="tbprobn" min="0" max="1" step="0.05" value="0.7"
+      onchange="tbProbSave(this.value)">
+    <span class="tbpc" id="tbprobv">70%</span>
+  </div>
+  <div class="mut" style="font-size:11px;margin:-2px 0 6px">滑杆/填数字<strong>立即生效</strong>(0 = 完全不自动接话,1 = 每句都接);
+    直接填 0~1 的小数也认。改的是「没人 @ 我时」的概率。</div>
   <div id="tbody"></div>
   <div class="mut" style="margin-top:10px;font-size:11px">开关是<strong>每群各记各的</strong>,点了立刻生效(monitor 每次用到时现读状态文件,不用重启)。
     概率/上下文/连发条数等口径在 agent/.env(TIEBA_PROB / TIEBA_CTX / TIEBA_MAX_REPLY …),改完要重启 monitor。</div>
@@ -623,9 +641,28 @@ function toggle(key,cur){act('feature',{key:key,value:!cur})}
 // 贴吧模式(2026-09-28):分群开关做成弹窗 —— 平时只显示「开了几个群」,点按钮才列出所有群。
 // 状态来自 /api/status 的 tieba(读的就是 monitor 正在用的那份 state.json),所以显示与生效永远一致。
 var tbData={groups:[],all:false,opened:0};
-function openTieba(){renderTieba(true);document.getElementById('tbmodal').className='show'}
+function openTieba(){syncProbInputs(tbData);renderTieba(true);document.getElementById('tbmodal').className='show'}
 function closeTieba(){document.getElementById('tbmodal').className=''}
 function setTieba(groupId,on){act('tieba',{groupId:groupId,on:on})}
+// 接话概率:滑杆与数字框同步。oninput 只改显示(边拉边跳数字),onchange(松手/失焦)才发请求,
+// 免得拖一次滑杆打十几个请求把 state.json 反复重写。后端写的就是 monitor 每次接话现读的那个文件。
+function tbProbInput(v){document.getElementById('tbprobv').textContent=Math.round(Number(v)*100)+'%'}
+function tbProbSave(v){
+  var n=Number(v);
+  if(!isFinite(n))return;
+  n=Math.min(1,Math.max(0,n));
+  tbProbInput(n);
+  document.getElementById('tbprob').value=n;
+  document.getElementById('tbprobn').value=n;
+  act('tieba',{prob:n});
+}
+function syncProbInputs(t){
+  if(!t||t.prob===undefined)return;
+  var s=document.getElementById('tbprob'),n2=document.getElementById('tbprobn');
+  if(s)s.value=t.prob;
+  if(n2)n2.value=t.prob;
+  tbProbInput(t.prob);
+}
 function tbRow(r){
   return '<div class="tbrow"><span class="tk" title="'+h(r.groupId)+'">'+h(r.name||('群 '+r.groupId))+
     '<div class="tsub">'+h(r.groupId)+(r.tieba?' · 已开启':'')+'</div></span>'+
@@ -638,6 +675,8 @@ function renderTieba(force){
   if(!box||(!force&&document.getElementById('tbmodal').className!=='show'))return;
   document.getElementById('tbhint').textContent='共 '+t.groups.length+' 个群;接话概率 '+
     Math.round((t.prob||0)*100)+'%,上下文 '+(t.ctx||0)+' 条,最多连发 '+(t.maxReply||0)+' 条(每条 ≤'+(t.maxChars||0)+' 字)';
+  // 概率框跟着后端当前值走(别人/另一个标签页改过也能对上)
+  if(document.activeElement!==document.getElementById('tbprob')&&document.activeElement!==document.getElementById('tbprobn'))syncProbInputs(t);
   box.innerHTML='<div class="tbrow all"><span class="tk">全部群<div class="tsub">一次把下面所有群都打开/关掉</div></span>'+
     '<div class="sw'+(t.all?' on':'')+'" onclick="setTieba(\\'*\\','+(t.all?'false':'true')+')"><i></i></div></div>'+
     (t.groups.length?t.groups.map(tbRow).join(''):'<div class="mut">读不到群列表(OneBot 可能没起来)</div>');
@@ -951,23 +990,27 @@ const server = createServer(async (req, res) => {
       });
     }
 
-    // 贴吧模式分群开关(2026-09-28):直接写 tieba/state.json —— monitor **每次用到时现读**该文件,
-    // 所以点一下立刻生效,不需要敲 tmux 按键、也不用重启(与 /api/mode、/api/tone 同一套路子)。
-    // groupId='*'(或空)表示「全部群」;选了「全部群」之后 monitor 会忽略分群表、所有群都算开着。
+    // 贴吧模式(2026-09-28):① 分群开关 ② 接话概率(滑杆)—— 都直接写 tieba/state.json,
+    // monitor **每次用到时现读**该文件,所以点一下/拉一下立刻生效,不需要敲 tmux 按键、也不用重启。
+    // 请求体:{ groupId, on } 切某个群(groupId='*' 或空 = 全部群);{ prob } / { probAt } 调概率(0~1)。
     if (path === '/api/tieba' && req.method === 'POST') {
-      const { groupId, on } = await readBody(req);
-      const g = String(groupId ?? '*').trim() || '*';
-      if (g !== '*' && !/^\d{4,12}$/.test(g)) return json(res, 400, { message: '群号不合法' });
-      const r = tiebaSetOn(g, !!on);
-      const where = g === '*' ? '全部群' : ((await groupsWithTieba().catch(() => ({ groups: [] })))
-        .groups.find(x => x.groupId === g)?.name || `群 ${g}`);
-      return json(res, r.ok ? 200 : 400, {
-        ok: r.ok,
-        message: r.ok
-          ? `${where}的贴吧模式已${on ? '开启' : '关闭'}${on && g === '*' ? '(所有群都算开着)' : ''}`
-          : (r.message || '设置失败'),
-        tieba: await groupsWithTieba().catch(() => null),
-      });
+      const { groupId, on, prob, probAt } = await readBody(req);
+      const messages = [];
+      if (prob !== undefined || probAt !== undefined) {
+        const rp = tiebaSetProb({ prob: prob ?? null, probAt: probAt ?? null });
+        messages.push(`接话概率已改为 ${Math.round(rp.prob * 100)}%(@ 时 ${Math.round(rp.probAt * 100)}%)`);
+      }
+      if (groupId !== undefined && on !== undefined) {
+        const g = String(groupId ?? '*').trim() || '*';
+        if (g !== '*' && !/^\d{4,12}$/.test(g)) return json(res, 400, { message: '群号不合法' });
+        const r = tiebaSetOn(g, !!on);
+        if (!r.ok) return json(res, 400, { message: r.message || '设置失败' });
+        const where = g === '*' ? '全部群' : ((await groupsWithTieba().catch(() => ({ groups: [] })))
+          .groups.find(x => x.groupId === g)?.name || `群 ${g}`);
+        messages.push(`${where}的贴吧模式已${on ? '开启' : '关闭'}${on && g === '*' ? '(所有群都算开着)' : ''}`);
+      }
+      if (!messages.length) return json(res, 400, { message: '没给要改的东西(groupId/on 或 prob/probAt)' });
+      return json(res, 200, { ok: true, message: messages.join(';'), tieba: await groupsWithTieba().catch(() => null) });
     }
 
     if (path === '/api/mode' && req.method === 'POST') {      const { groupId, mode } = await readBody(req);

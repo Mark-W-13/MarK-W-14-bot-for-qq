@@ -30,8 +30,9 @@
 //   下面的 STYLE_SAMPLES 是**逐字摘录**,只删掉了与口吻无关的纯图片/表情行。
 //
 // CLI:node agent/tieba/tieba.mjs [--selftest] [群号 [on|off]] [--sample 群号 [条数]]
-import { readFileSync, writeFileSync, renameSync } from 'node:fs';
+import { readFileSync, writeFileSync, renameSync, mkdtempSync } from 'node:fs';
 import { join, dirname } from 'node:path';
+import { tmpdir } from 'node:os';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import './../env.mjs';                     // 与其它模块同规矩:.env 必须先加载,下面的 env 常量才读得到
 import { faceLabel } from '../aichat/aichat.mjs';   // 表情 id → 名字的表只有一份,别在这边再抄一份解析
@@ -39,8 +40,13 @@ import { faceLabel } from '../aichat/aichat.mjs';   // 表情 id → 名字的�
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 // ---------- 配置(全在 agent/.env 里调,改完重启 monitor 生效) ----------
-export const PROB = clamp01(Number(process.env.TIEBA_PROB ?? 0.7));            // 非 @ 消息的接话概率,**需求写死 70%**
-export const PROB_AT = clamp01(Number(process.env.TIEBA_AT_PROB ?? 1));        // @ 了机器人:必接(要改成 0.5 之类也行)
+// 例外:**接话概率**改成了「运维台可调」——它在 state.json 里(normalize 之后每次现读),
+// 见下面的 probOf()/setProb()。env 只是**首启初值**(TIEBA_PROB / TIEBA_AT_PROB)。
+export const PROB_DEFAULT = clamp01(Number(process.env.TIEBA_PROB ?? 0.7));     // 非 @ 消息的接话概率(需求写死 70%)
+export const PROB_AT_DEFAULT = clamp01(Number(process.env.TIEBA_AT_PROB ?? 1)); // @ 了机器人:必接(要改成 0.5 之类也行)
+// ⚠ 这两个常量**只是初值的副本**(给启动横幅/自测看),真正掷骰子用 probOf()/probAtOf() —— 别拿它们去判定。
+export const PROB = PROB_DEFAULT;
+export const PROB_AT = PROB_AT_DEFAULT;
 export const CTX = Math.max(4, Number(process.env.TIEBA_CTX || 30));           // 上下文窗口(条),比 AI 闲聊的 10 条大得多
 export const CTX_FETCH = Math.max(CTX, Number(process.env.TIEBA_CTX_FETCH || 60)); // 从 OneBot 拉多少条历史来凑窗口
 export const MAX_REPLY = Math.max(1, Number(process.env.TIEBA_MAX_REPLY || 3)); // 一次最多连发几条
@@ -86,7 +92,7 @@ function clamp01(n) { return Number.isFinite(n) ? Math.min(1, Math.max(0, n)) : 
 // 两者不一致时**以 state.json 为准**(它是本模块的单一事实源);monitor 里那个 FEAT.tieba 只当兜底缓存。
 function defaults() {
   const on = boolEnv(process.env.TIEBA_ENABLED) === '1';
-  return { groups: on ? { '*': true } : {}, updatedAt: 0 };
+  return { groups: on ? { '*': true } : {}, prob: PROB_DEFAULT, probAt: PROB_AT_DEFAULT, updatedAt: 0 };
 }
 function loadState() {
   try {
@@ -94,17 +100,44 @@ function loadState() {
     if (!j || typeof j !== 'object') return defaults();
     const groups = {};
     for (const [k, v] of Object.entries(j.groups || {})) if (v === true) groups[String(k)] = true;
-    return { groups, updatedAt: Number(j.updatedAt) || 0 };
+    const d = defaults();
+    return {
+      groups,
+      // 概率没写进文件(老文件 / 从没调过)→ 用 env 初值
+      prob: j.prob === undefined ? d.prob : clamp01(Number(j.prob)),
+      probAt: j.probAt === undefined ? d.probAt : clamp01(Number(j.probAt)),
+      updatedAt: Number(j.updatedAt) || 0,
+    };
   } catch { return defaults(); }
 }
 function saveState(st) {
   try {
     const p = statePath();
-    const body = JSON.stringify({ groups: st.groups, updatedAt: Date.now() }, null, 2);
+    const body = JSON.stringify({ groups: st.groups, prob: st.prob, probAt: st.probAt, updatedAt: Date.now() }, null, 2);
     writeFileSync(p + '.tmp', body, 'utf8');
     renameSync(p + '.tmp', p);                           // 原子替换,别让另一个进程读到半截文件
     return true;
   } catch { return false; }                               // 写不了不影响本次运行,只是下次启动丢改动
+}
+
+// ---------- 接话概率(运维台滑杆可调;2026-09-28 用户要求) ----------
+// 为什么放文件不放 env:env 是**启动期常量**,调一次概率得改 .env + 重启 monitor;而概率本来就该是
+// 「随手拧一拧」的东西。放 state.json 里、每次接话前现读(与 tone.json 同一套),滑杆一松手就生效。
+/** 当前「非 @ 消息」的接话概率(0~1)。**每次现读文件** */
+export function probOf() { return loadState().prob; }
+/** 当前「@ 了机器人」的接话概率(0~1)。**每次现读文件** */
+export function probAtOf() { return loadState().probAt; }
+/** 改概率(运维台滑杆 / 直接填数字都走这里)。prob/probAt 传 null 表示不动那一项。返回 { ok, prob, probAt, changed } */
+export function setProb({ prob = null, probAt = null } = {}) {
+  const st = loadState();
+  const before = { prob: st.prob, probAt: st.probAt };
+  if (prob !== null && prob !== undefined && Number.isFinite(Number(prob))) st.prob = clamp01(Number(prob));
+  if (probAt !== null && probAt !== undefined && Number.isFinite(Number(probAt))) st.probAt = clamp01(Number(probAt));
+  const saved = saveState(st);
+  return {
+    ok: true, saved, prob: st.prob, probAt: st.probAt,
+    changed: before.prob !== st.prob || before.probAt !== st.probAt,
+  };
 }
 
 /** 本群开着贴吧模式吗?**每次现读文件** —— 运维台/群里改完立即生效,不用重启(同 modes/tone 的规矩) */
@@ -414,11 +447,15 @@ export function worthReplying(msg, minChars = MIN_CHARS) {
  *   (worthReplying 放行了,decideReply 又拦回来,因为只给它传了 text)。
  * @returns {{reply:boolean, why:string, p:number}}
  */
-export function decideReply(msg, { at = false, rand = Math.random, prob = PROB, probAt = PROB_AT, minChars = MIN_CHARS } = {}) {
+export function decideReply(msg, { at = false, rand = Math.random, prob = null, probAt = null, minChars = MIN_CHARS } = {}) {
   const worth = worthReplying(msg, minChars);
   if (!worth.ok) return { reply: false, why: worth.why, p: 0 };
-  if (at) return { reply: rand() < probAt, why: `@ 了机器人(概率 ${probAt})`, p: probAt };
-  return { reply: rand() < prob, why: `普通消息(概率 ${prob})`, p: prob };
+  if (at) {
+    const p = probAt === null ? probAtOf() : clamp01(Number(probAt));   // 每次现读:运维台滑杆一改就生效
+    return { reply: rand() < p, why: `@ 了机器人(概率 ${p})`, p };
+  }
+  const p = prob === null ? probOf() : clamp01(Number(prob));
+  return { reply: rand() < p, why: `普通消息(概率 ${p})`, p };
 }
 
 // ---------- 自测 ----------
@@ -426,6 +463,10 @@ function selftest() {
   const chunks = [];
   const ok = (c, m) => chunks.push(`${c ? '✓' : '✗'} ${m}`);
   const BOT = '3757588606';
+  // 概率现在住在 state.json 里(运维台滑杆可调),自测**先在临时文件里写死一份**,别受线上那份影响
+  const dir = mkdtempSync(join(tmpdir(), 'tieba-selftest-'));
+  process.env.TIEBA_STATE_PATH = join(dir, 'state.json');
+  setProb({ prob: PROB_DEFAULT, probAt: PROB_AT_DEFAULT });
 
   // 提示词:口吻与人设必须真的在里头
   const p = systemPrompt({ now: '2026 年 9 月 28 日(星期一)12:00' });

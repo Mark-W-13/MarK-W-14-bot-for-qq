@@ -32,7 +32,8 @@ import {
   splitReply as tiebaSplit, decideReply as tiebaDecide, worthReplying as tiebaWorth, buildContext as tiebaBuildContext,
   pickCount as tiebaPickCount, MIN_CHARS as TIEBA_MIN_CHARS,  noteMessage as tiebaNote, ringOf, allOn, statePath as tiebaStatePath, AT_SUFFIX as TIEBA_AT_SUFFIX,
   FEATURE_KEY as TIEBA_KEY, FEATURE_CN as TIEBA_CN, GROUP_CMD as TIEBA_CMD,
-  PROB as TIEBA_PROB, PROB_AT as TIEBA_AT_PROB, CTX as TIEBA_CTX, CTX_FETCH as TIEBA_CTX_FETCH,
+  PROB_DEFAULT as TIEBA_PROB, PROB_AT_DEFAULT as TIEBA_AT_PROB, CTX as TIEBA_CTX, CTX_FETCH as TIEBA_CTX_FETCH,
+  probOf as tiebaProbOf, probAtOf as tiebaProbAtOf, setProb as tiebaSetProb,
   MAX_REPLY as TIEBA_MAX_REPLY, MAX_CHARS as TIEBA_MAX_CHARS, MAX_TOKENS as TIEBA_MAX_TOKENS,
   TEMPERATURE as TIEBA_TEMPERATURE, PASS_IMAGES as TIEBA_IMAGES, NEW_GAP_MS as TIEBA_GAP_MS,
 } from './tieba/tieba.mjs';
@@ -953,7 +954,9 @@ function tiebaStartupText() {
   const st = allOn();
   const on = st.all ? ['全部群'] : st.groups.filter(g => g !== '*');
   const what = on.length ? on.join(',') : '全部关闭';
-  return `${what}(概率 ${Math.round(TIEBA_PROB * 100)}%,@ 必接且覆盖闲聊,上下文 ${TIEBA_CTX} 条,连发 ≤${TIEBA_MAX_REPLY} 条)`;
+  // 概率**现读**(运维台滑杆改了就生效,不用重启)——所以横幅/群里提示都按当前值说,别报初值
+  const p = Math.round(tiebaProbOf() * 100);
+  return `${what}(概率 ${p}%,@ ${tiebaProbAtOf() >= 1 ? '必接' : `概率 ${Math.round(tiebaProbAtOf() * 100)}%`}且覆盖闲聊,上下文 ${TIEBA_CTX} 条,连发 ≤${TIEBA_MAX_REPLY} 条)`;
 }
 
 async function processTiebaSwitch(entry, cmd) {
@@ -967,7 +970,7 @@ async function processTiebaSwitch(entry, cmd) {
   if (r.ok) syncTiebaFeature(cmd.on, { ...(FEAT.tiebaGroups || {}), [String(entry.group_id)]: cmd.on });
   log('▶ 处理', `${entry.group_name} @${entry.nickname} [${TIEBA_CMD} ${cmd.on ? '开' : '关'}]`, C.cyan);
   const extra = cmd.on
-    ? `本群从现在开始:群里说话**不用 @ 我**我也会接(概率约 ${Math.round(TIEBA_PROB * 100)}%,接了可能连发几条;怕吵就发「${TIEBA_CMD} 关」)。`
+    ? `本群从现在开始:群里说话**不用 @ 我**我也会接(概率约 ${Math.round(tiebaProbOf() * 100)}%,接了可能连发几条;怕吵就发「${TIEBA_CMD} 关」)。`
     : `本群「${TIEBA_CMD}」已关:以后只在你 @ 我的时候说话。`;
   await sendReply(entry, extra);
   appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
@@ -2300,8 +2303,17 @@ export async function tiebaSelftest() {
   ok(tiebaReady() || !AI_API_KEY, `没配聊天 key 时贴吧模式整条不开(与 AI 闲聊共用同一把 key):tiebaReady=${tiebaReady()}`);
   ok(decide('这比玩意这么智能?', false, () => 0.01).reply === true, '概率判定本身照常工作(与 key 无关)');
   ok(decide('草', false, () => 0.01).reply === true, '短话照样进概率判定(护栏已拆)');
-  ok(Math.abs(TIEBA_PROB - 0.7) < 1e-9, `默认接话概率就是需求里的 70%(TIEBA_PROB=${TIEBA_PROB})`);
-  ok(TIEBA_AT_PROB === 1, `@ 了必接(TIEBA_AT_PROB=${TIEBA_AT_PROB})`);
+  ok(Math.abs(TIEBA_PROB - 0.7) < 1e-9, `概率的 env 初值仍是需求里的 70%(TIEBA_PROB=${TIEBA_PROB})`);
+  ok(TIEBA_AT_PROB === 1, `@ 的 env 初值仍是必接(TIEBA_AT_PROB=${TIEBA_AT_PROB})`);
+  // 概率现在存在 state.json 里(运维台滑杆可调),这里钉住读写与「现读生效」
+  const p0 = tiebaProbOf();
+  ok(tiebaSetProb({ prob: 0.33 }).prob === 0.33 && tiebaProbOf() === 0.33, '概率可写可读(滑杆走的就是这条路)');
+  ok(tiebaDecide({ text: '这比玩意这么智能?' }, { rand: () => 0.4 }).reply === false
+    && tiebaDecide({ text: '这比玩意这么智能?' }, { rand: () => 0.3 }).reply === true,
+    '改完立刻生效:0.33 时掷 0.4 不接、掷 0.3 接(不用重启)');
+  ok(tiebaSetProb({ prob: 1.5 }).prob === 1 && tiebaSetProb({ prob: -1 }).prob === 0, '越界值被夹到 0~1');
+  tiebaSetProb({ prob: 0.7, probAt: 1 });
+  ok(tiebaProbOf() === 0.7 && p0 === 0.7, `自测收尾把概率还原成 ${p0}`);
 
   // ②b 「开了贴吧模式的群里 @ 也走这套人格」(用户 2026-09-28:开了模式就覆盖闲聊)。
   //     钉的是**提示词本身**:身份前提不许留助手骨架,且必须写死「不帮忙」。
