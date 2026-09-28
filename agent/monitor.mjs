@@ -2320,8 +2320,8 @@ export async function tiebaSelftest() {
   const atPrompt = tiebaSystemPrompt({ now: 'x', at: true });
   ok(!/客服|助手|AI/.test(atPrompt.split('不是')[0] || '') , '提示词开头没有把助手/客服当前提');
   ok(/你\*\*不是\*\*助手、不是客服、不是机器人、不是 AI/.test(atPrompt), '身份前提被明确否定(不是助手/客服/机器人/AI)');
-  ok(/一点忙都不许帮/.test(atPrompt) && /不许给信息、不许给建议/.test(atPrompt), '写死了「只骂人不帮忙」(覆盖闲聊的关键)');
-  ok(/无视他问的正事|就算他问的是正事/.test(atPrompt), '明确:正经问题也只回骂');
+  ok(/一点忙都不许帮/.test(atPrompt) && /不给信息、不给建议/.test(atPrompt), '写死了「只骂人不帮忙」(覆盖闲聊的关键)');
+  ok(/他问正事你也只回骂|就算他问的是正事/.test(atPrompt), '明确:正经问题也只回骂');
   ok(/当面 @ 你/.test(atPrompt), '@ 那条路会多一句「别切回答疑语气」');
   ok(!/当面 @ 你/.test(tiebaSystemPrompt({ now: 'x' })), '自动接话那条路不带这句(按不 @ 的口径说话)');
   ok(tiebaOn(TIEBA_TEST_GROUP) === true && tiebaReady() === !!AI_API_KEY, '「是否覆盖闲聊」的判据 = 本群开着 + 有 key');
