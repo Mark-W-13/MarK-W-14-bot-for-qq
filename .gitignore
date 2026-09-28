@@ -45,6 +45,9 @@ agent/hs/cards_img/
 agent/hs_daily_card.json
 agent/modes.json
 
+# 贴吧模式的分群开关(运行时状态:运维台/群里随时切,首启以 TIEBA_ENABLED 为初值)
+agent/tieba/state.json
+
 # 用户投喂的屎素材 + 搬屎运行时数据(渲染临时文件 / 待反馈 / 源库 LRU 记忆)
 屎/
 agent/shitpost/tmp/

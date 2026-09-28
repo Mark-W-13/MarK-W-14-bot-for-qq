@@ -45,6 +45,14 @@ QQ 机器人「测试bot.fd」(QQ 3757588606)的自动回复系统,两个功能:
     - **抓不到时的两级兜底**:① `hearthstone-decks.net` 的 WordPress REST(境内可达、标准+狂野都有完整代码,**但只有战绩 Score、没有胜率/使用率**,回复里如实标未知);② `metastats.net` 抓 HTML(**只有标准**,但带 `#Games`/`#Win Rate`)。全失败才退回旧缓存并标「时效已过」。手动刷新:`node agent/hs/hs_meta.mjs --refresh [standard|wild|both]`,看库 `--stats`;从文章页补卡组:`node agent/hs/hs_meta_refresh.mjs <文章URL> [--dry]`。
     - **实测走不通的源**(省得再试):hsguru.com / api.hsguru.com / d0nkey.top(DNS 污染 + 连接超时)、hsreplay.net(`/meta/` 纯前端渲染、`/api/v1/*` 全 404)、api.firestoneapp.com(403)、hearthstonetopdecks / vicioussyndicate / hearthpwn(403)、tempostorm(维护中)、NGA(403)、旅法师营地的 api 路径(404)。
 
+9. **贴吧模式(2026-09-28 新增,全自动接话)**:开了之后**不用 @ 机器人**(群里发的话都归它管),它自己盯着上下文插嘴,**一次可以连发好几条**(不是只回一条)。**默认全部群关闭**,开关是**分群参数**、持久化在 `agent/tieba/state.json`,运维台上按群控(平时折叠成一个按钮,点开是弹窗),群里 @ 它发「贴吧模式 开 / 关」也等价。**所有人设口吻照测试群里那份「贴吧鱼」的聊天记录**(详见 `agent/tieba/tieba.mjs` 文件头与里面的 `STYLE_SAMPLES`):短句、连楼、脏话辱骂全开、**回复里不 @ 被骂的人**、谁问它是不是 AI 也不承认只回怼。三条硬规矩(用户 2026-09-28 定):
+
+    - **不抢分流器**:@ 了机器人、或消息里带任何@功能触发词(史记总结 / 效果 / 卡图 / 裁定 / 完整裁定 / 每日一卡 / 生成卡表 / 卡组解析 / 推荐 / 搬屎 / 框神语录 / 帮助 / mode / 贴吧模式)的消息**一律不接**,那些正常走各自的功能或 AI 闲聊;贴吧模式只吃「没人管的普通群聊」。
+    - **不是每句都回**:初始接话概率 **70%**(`TIEBA_PROB`);短于 4 字的碎话(「草」「?」「233」)、纯表情、纯图不接;@ 了机器人则必接(`TIEBA_AT_PROB=1`)。
+    - **不加冷却/限频**(用户明确要求):同一群同时只跑一条(防并发),但**没有**每人冷却 —— 群里聊得越热闹它接得越多。嫌吵就把 `TIEBA_PROB` 调小,或直接把那个群关掉。
+
+    实现要点(复用与差异,踩过的坑在这儿):消息解析**整套复用 AI 闲聊的**(`agent/aichat/aichat.mjs` 的 @/引用/QQ 表情/图片,图片照样直传给模型看懂);聊天后端与 key **同一把**(`DEEPSEEK_API_KEY` / `AI_CHAT_API_KEY`,没配 key 整个功能起不来),但**采样参数与提示词完全分开**(不联网、温度 0.95、输出上限更小);群聊上下文窗口比 AI 闲聊的 10 条大得多(`TIEBA_CTX=30`,并且实时把群消息攒进内存环形缓冲,再用时会补一次 OneBot 历史)。**它不进 inbox/不写 processed.jsonl**(那些是 @ 请求的队列),走的是 WS 层独立一条路;发送走 `sendGroupText`(纯文本、**不 @ 任何人**),与所有其它功能「回复均 at 触发者」的约定相反。连发之间留 `TIEBA_NEW_GAP_MS`(默认 900ms)间隔,像人在打字。自测:`node monitor.mjs --tieba-selftest`(离线跑:关键词排除边界 / 分群开关 / 概率语义 / **整条出话链路**——mock 掉网络,验证「渲染上下文 → 叫模型 → 按条连发」且发出去的段里没有任何 @)、`node agent/tieba/tieba.mjs --selftest`。
+
 > **开发中(默认关闭)**:搬屎功能(随机一搬 = 屎视频源库随机发封面截图;精选一搬 = 规则粗筛 + AI 精筛评论截图)代码在 `agent/shitpost/`,monitor 已接线但需 env `SHIT_ENABLED=1` 才启用,默认不上线。
 
 ## 系统组成
@@ -58,11 +66,13 @@ QQ 机器人「测试bot.fd」(QQ 3757588606)的自动回复系统,两个功能:
 | 炉石环境数据 | `agent/hs/hs_meta.mjs` | 环境热门构筑(Firestone 主源 + 两级兜底)、按职业/体系查询、使用率换算;CLI `--refresh / --stats / <查询>` |
 | 炉石卡组入库 | `agent/hs/hs_meta_refresh.mjs` | 从文章页抠卡组代码入库(解码校验+去重);CLI `<URL…> [--dry]` |
 | 分群游戏模式 | `agent/modes.mjs` | `agent/modes.json`(群号→ygo/hs),monitor 与 opsweb 共用;CLI 无参看表、`<群号> [模式]` 读/写 |
+| 贴吧模式 | `agent/tieba/tieba.mjs` | 不用 @ 的全自动接话:分群开关(`agent/tieba/state.json`)+ 贴吧鱼提示词 + 连发拆分;CLI `--selftest / --prompt`,或 `<群号> on\|off` 读/写开关 |
 | 框神语录模块 | `agent/kuangshen/kuangshen.mjs` | 语录库(quotes.json)+ 历史回填 + 实时采集 + 精筛 + 随机抽取;CLI 自测 `node kuangshen.mjs [--backfill|--dump|--dump-raw]` |
 | AI 闲聊消息解析 | `agent/aichat/aichat.mjs` | @/引用/QQ 表情/图片 → 模型读得懂的正文(**图片默认直传,一轮出结果**;`describe` 模式为两轮识别 → 拼回正文);CLI 自测 `node aichat.mjs [--selftest|--image|--render]` |
 | AI 闲聊提示词 | `agent/aichat/tone.mjs` | 人设 + 三档位(板正/熟人群聊/放开)文案与 `tone.json` 读写;**唯一出处**,opsweb 只 import 它;CLI 自测 `node tone.mjs --selftest` |
 | AI 闲聊联网 | `agent/aichat/websearch.mjs` | `web_search` 工具定义 + 本地搜索执行(智谱 Web Search / Tavily / 博查 / Bing 兜底),结果带日期与链接;CLI 自测 `node websearch.mjs --selftest "查询词"` |
 | AI 闲聊自检 | `agent/monitor.mjs --aichat-selftest [--mock\|--live]` | 离线查配置与提示词 / `--mock` 不花钱验联网循环 / `--live` 真调模型 |
+| 贴吧模式自检 | `agent/monitor.mjs --tieba-selftest` | 离线验「哪些消息不接」的边界、分群开关、概率语义、**整条出话链路**(mock 掉网络,验证连发且不含 @);`node agent/tieba/tieba.mjs --selftest` 另测提示词与拆分 |
 | 一键启动 | `start.bat` | 检测/启动 SnowLuma + 打开 monitor 窗口 |
 | 一键停止 | `stop.bat` | 停止 monitor(可选停 SnowLuma) |
 | 运维台入口 | `webui.bat` | 开 SSH 隧道 + 浏览器打开线上运维 WebUI(8090;本机 Windows 用) |
@@ -108,6 +118,7 @@ http://127.0.0.1:8090
 | 服务 | 看 5 个服务(xvfb/SnowLuma/QQ/monitor/opsweb)运行与自启状态,可单独重启 |
 | 账号 | QQ 昵称与 UIN、OneBot 两个端口是否在听 |
 | **AI 闲聊 · 各用户次数** | 横向条形图、次数降序,标签是「名字（QQ号）」。口径:**以回复实际发给了哪个 @用户为准**(冷却跳过与失败不计入次数,失败单独标出);数据由 monitor 写在 `agent/aichat_stats.json`(不入库),页面每 5 秒随之刷新。历史可用 `node monitor.mjs --backfill-aichat-stats [YYYY-MM-DD]` 回填(默认自 2026-09-13,即 AI 闲聊上线日) |
+| **贴吧模式(按群)** | 卡片上只显示「已开几个群」+ 一个「选择群…」按钮,**点开是弹窗**(用户 2026-09-28 要求界面简洁、平时不显示):弹窗里每个群一个开关,最上面一条是「全部群」。走 `/api/tieba` **直接写 `agent/tieba/state.json`**(不走 tmux 按键:monitor 每次用到时现读该文件),点了**下一句群聊就按新状态生效**。同弹窗里显示当前口径(概率 / 上下文条数 / 连发上限) |
 | 卡库 | 卡牌数 / 卡图数 / 更新时间,一键更新卡库(二次确认,后台跑,进度看日志页) |
 | 主机 | 内存 / 磁盘 / 负载 / 开机时长 |
 | QQ 消息日志 | **SnowLuma 侧的收发记录**:谁在哪个群说了什么、bot 发了什么(默认滤掉调试噪声,可勾选看原始日志) |
@@ -125,7 +136,7 @@ http://127.0.0.1:8090
 2. **等 WebUI 就绪**(轮询端口 + 试连,最多 ~25 秒)
 3. **打开浏览器** `http://127.0.0.1:8090` —— 首次要输令牌(服务器 `~/mc_agent/agent/.env` 的 `OPSWEB_TOKEN`,浏览器可记住)
 
-能干什么:看状态 / 切搬屎·框神语录·AI 闲聊开关 / **切 AI 闲聊提示词档位、看联网源与搜索次数** / 重启服务 / 更新卡库 / 看 QQ 截图 / 看日志。
+能干什么:看状态 / 切搬屎·框神语录·AI 闲聊开关 / **切 AI 闲聊提示词档位、看联网源与搜索次数** / **按群开关贴吧模式(弹窗)** / 重启服务 / 更新卡库 / 看 QQ 截图 / 看日志。
 
 **关隧道**:关掉那个最小化窗口,或跑 `webui.bat /stop`。
 
@@ -138,6 +149,7 @@ http://127.0.0.1:8090
 日常运行(无需操作)
   服务器:systemd --user 五个 unit(xvfb/snowluma/qq/mc-agent/opsweb)常驻
           mc-agent 在 tmux 会话 mc 里跑 monitor,收 @消息后立即分流处理并回复
+          (开了「贴吧模式」的群例外:不用 @,monitor 也会按概率自己接群里的普通聊天)
 本机 Windows:start.bat 起 SnowLuma + monitor(本机那一套,机器人线上在服务器)
 
 恢复运行(机器重启后)
@@ -159,6 +171,9 @@ mc_agent/
     ├── monitor.mjs        # 主进程:连 OneBot,收 @ 消息并回复
     ├── opsweb.mjs         # 运维 WebUI(看状态 / 切开关 / 切分群游戏模式 / 重启服务)
     ├── modes.mjs          # 分群游戏模式(群号→游戏王/炉石),monitor 与 opsweb 共用
+    ├── tieba/             # 贴吧模式:不用 @ 的全自动接话(2026-09-28)
+    │   ├── tieba.mjs          # 分群开关状态 + 贴吧鱼提示词 + 连发拆分(自测 --selftest,看提示词 --prompt)
+    │   └── state.json         # 各群开关持久化(不入库;运维台弹窗/群内指令写它)
     ├── .env               # token 等敏感配置(不入库)
     ├── features.json      # 功能开关持久化(不入库)
     ├── modes.json         # 分群游戏模式持久化(不入库)
@@ -199,6 +214,7 @@ mc_agent/
 - 环境变量可覆盖:WS_URL / API / WS_TOKEN / API_TOKEN / TRIGGER_KEYWORD / CARD_TRIGGER / CARD_IMG_TRIGGER / RULING_TRIGGER / RULING_FULL_TRIGGER / DAILY_KEYWORD / BOT_ID / DRY_RUN。裁定相关:`RULINGS_CACHE_TTL_MS`(缓存时长,默认 24h)。
 - **框神语录**(`agent/kuangshen/quotes.json` 不入库):`KUANGSHEN_TRIGGER`(触发词,默认「框神语录」)/ `KUANGSHEN_GROUP`(群号,默认 793874011)/ `KUANGSHEN_TARGET`(目标 QQ,默认 3080580848)/ `KUANGSHEN_MAX_PAGES`(回填翻页上限,200 条/页)。`node agent/kuangshen/kuangshen.mjs --backfill` 可手动补全历史。
 - **卡库**:`agent/ygocard/cards.json` 不入库(约 14MB,可重建)。monitor 窗口按 `u`、运维 WebUI 的「更新卡库」、或 `node monitor.mjs --update-cards` 联网更新。卡库源(百鸽)在海外,国内机器连它握手常要 9~16 秒,而 Node `fetch` 默认连接超时只有 10 秒 —— 所以更新走「重试 + 放宽超时」:出问题时可用 `CARDS_FETCH_TIMEOUT_MS`(默认 120000)与 `CARDS_FETCH_TRIES`(默认 3)调。
+- **贴吧模式(2026-09-28)**:开关是**分群参数**(`agent/tieba/state.json`,运维台弹窗里按群点,或群里 @ 它发「贴吧模式 开 / 关」;`'*'` = 全部群),**默认全部关闭**;`TIEBA_ENABLED` 只作首启初值,建好文件后以文件为准。口径(改完**要重启 monitor**):`TIEBA_PROB`(非 @ 消息的接话概率,默认 0.7 = 需求定的 70%)/ `TIEBA_AT_PROB`(@ 了机器人时的概率,默认 1 = 必接)/ `TIEBA_CTX`(上下文窗口条数,默认 30)/ `TIEBA_CTX_FETCH`(每次接话向 OneBot 拉多少条历史来凑窗口,默认 60)/ `TIEBA_MAX_REPLY`(一次最多连发几条,默认 3)/ `TIEBA_MAX_CHARS`(单条字数上限,默认 60)/ `TIEBA_MIN_CHARS`(短于此字数的碎话不接,默认 4)/ `TIEBA_TEMPERATURE`(采样温度,默认 0.95)/ `TIEBA_NEW_GAP_MS`(连发间隔,默认 900)/ `TIEBA_IMAGES`(消息里的图是否直传,默认 1;设 0 则只留 `[图片]` 占位不下载)。**没有冷却与限频**(用户明确要求,别自作主张加):唯一的刹车是同一群同时只跑一条,嫌吵就调 `TIEBA_PROB` 或关掉那个群。自测 `node monitor.mjs --tieba-selftest`(离线,不花钱)。
 - **功能开关热控**(`agent/features.json` 不入库):三档副功能总开关(搬屎/框神语录/AI 闲聊),控制台即时切换免重启,原子写持久化。**monitor 控制台按键**:`1`/`2`/`3` = 切搬屎/框神语录/AI 闲聊总开关,`h` = 重画面板,`u` = 更新卡库,`q` = 退出,`Q` = 退出+停 SnowLuma。**服务器上也可用运维 WebUI 切**(见上文,它切的就是同一套按键,所以两条路径的状态天然一致)。首次运行时以 env 初值(`SHIT_ENABLED`/`KUANGSHEN_ENABLED`/`AI_CHAT_ENABLED`)建文件,**之后以文件为准,改 env 不再生效**(删文件即重置回 env 初值);**运行中直接改 `features.json` 文件不生效**,要走按键或 WebUI。AI 闲聊还有一个例外:**没配聊天 key(`DEEPSEEK_API_KEY` 或 `AI_CHAT_API_KEY`)时启动即强制关闭**,配了 key 再开才有效。
 - **AI 闲聊后端(2026-09-21 只剩一套)**:OpenAI 兼容 `/chat/completions`。`DEEPSEEK_API_KEY`(或 `AI_CHAT_API_KEY`)、`AI_CHAT_API_URL`(默认 `https://api.deepseek.com/chat/completions`)、`AI_CHAT_MODEL`(默认 `deepseek-flash`;注意「关思考」是按模型名判断的 —— 只有名字里带 deepseek 才自动塞 `reasoning_effort`)/ `AI_CHAT_REASONING`(deepseek 系**默认关思考**:实测 `reasoning_effort='low'` 会把 max_tokens 全烧在思考上、**正文返回空**,想开思考设 `1`)/ `AI_CHAT_MAX_TOKENS`(上限,默认 800)/ `AI_CHAT_CTX`(附带上下文条数,默认 10,0=不带)/ `AI_CHAT_TIMEOUT_MS`(默认 30000)/ `AI_CHAT_COOLDOWN_MS`(每人冷却,**默认 15000;设 `0` = 彻底关掉冷却**,2026-09-21 用户选了 0 —— 关掉后没有节流:同一个人连点几下就会真调几次模型、联网时真搜几次;想恢复改成毫秒数即可,不用动代码,但改的是启动期常量,**必须重启 monitor 才生效**)/ `AI_CHAT_MAX_CHARS`(回复截断字数,默认 400)/ `AI_CHAT_ENABLED`(首启初值)。**`AI_CHAT_PROVIDER` 与 `GLM_*` 已废弃**(旧的「智谱聊天后端」2026-09-21 删掉了;`ZHIPU_API_KEY` 仍要留着,它现在只服务两件事:**联网搜索**的默认源,以及 `describe` 识图那条老路)。**参数退让**:碰到 4xx 时按「去掉联网工具 → 联网+带思考 → 带上思考 → 去掉图片」依次退让重试,**超时/网络错不重试**(重来一轮只会让群友多等一倍)。
 - **AI 闲聊提示词档位(2026-09-21)**:`AI_CHAT_TONE`(`strict` 板正 / `loose` 熟人群聊 / `wild` 放开)**只在首次建 `agent/aichat/tone.json` 时作初值**,之后以文件为准 —— 平时不用改 env,直接在**运维台「AI 闲聊 · 提示词档位」卡片**上点(即时生效,monitor 每次回复前重读该文件)。档位文字与说明的唯一出处是 `agent/aichat/tone.mjs`。
@@ -211,7 +227,7 @@ mc_agent/
 
 - 修改 `agent/.env` / SnowLuma 配置后需重启才生效;功能开关走控制台面板或 `features.json`,即时生效无需重启
 - QQ 掉线时:用 `stop.bat`(选 Y)停后端 → 重新打开 QQNT 登录 → `start.bat`
-- 机器人只响应**群聊中 @它**的消息(私聊与其他消息不处理);无触发词的 @ 消息交给 **AI 闲聊**兜底接话(可用面板 `3` 键关掉,关掉后恢复为忽略)
+- 机器人只响应**群聊中 @它**的消息(私聊与其他消息不处理);无触发词的 @ 消息交给 **AI 闲聊**兜底接话(可用面板 `3` 键关掉,关掉后恢复为忽略)。**例外是贴吧模式(2026-09-28)**:那个群开着它时,机器人**不用 @ 也会自己接话**(按 70% 概率、可连发几条、口吻是嘴臭的吧友),开关按群控、默认全关 —— 见上文第 9 条
 - **@+「史记总结」** → 史记体总结(触发词可用环境变量 `TRIGGER_KEYWORD` 覆盖);**@+「效果 」+卡名** → 本地卡牌查询(触发词可用 `CARD_TRIGGER` 覆盖,必须后跟空白);**@+「裁定 」+卡名** → 官方裁定(触发词可用 `RULING_TRIGGER` 覆盖,必须后跟空白);**@+「框神语录」** → 抽一条框神语录(触发词可用 `KUANGSHEN_TRIGGER` 覆盖)
 - 卡牌查询支持中/日/英文名与别名(简中官方名、MD 译名等),多关键词空格分隔 AND 匹配
 - 回复均 at 触发者

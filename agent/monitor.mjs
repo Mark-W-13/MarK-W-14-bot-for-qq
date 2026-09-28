@@ -25,6 +25,17 @@ import { buildQuestion as buildAiQuestion, buildQuestionRich as buildAiQuestionR
 import { getTone, setTone, systemPrompt as aiSystemPrompt, TONES, TONE_CN, TONE_DESC, tonePath } from './aichat/tone.mjs';
 import { runSearch, WEB_SEARCH_TOOL, providerText as searchProviderText, searchReady, pickProvider, SEARCH_COUNT } from './aichat/websearch.mjs';
 import { modeOf, setMode, parseModeCommand, MODE_CN, modesPath, allModes } from './modes.mjs';
+// 贴吧模式(2026-09-28):不用 @ 就插嘴的「贴吧鱼」。状态/提示词/连发拆分都在那个模块里,
+// 这里只负责「什么时候叫它」与「把回复发出去」(见本文件的 tiebaOnMessage / tiebaFire)。
+import {
+  isOn as tiebaOn, setOn as tiebaSetOn, parseGroupCommand as tiebaParseCmd, systemPrompt as tiebaSystemPrompt,
+  splitReply as tiebaSplit, decideReply as tiebaDecide, worthReplying as tiebaWorth, buildContext as tiebaBuildContext,
+  noteMessage as tiebaNote, ringOf, allOn, statePath as tiebaStatePath,
+  FEATURE_KEY as TIEBA_KEY, FEATURE_CN as TIEBA_CN, GROUP_CMD as TIEBA_CMD,
+  PROB as TIEBA_PROB, PROB_AT as TIEBA_AT_PROB, CTX as TIEBA_CTX, CTX_FETCH as TIEBA_CTX_FETCH,
+  MAX_REPLY as TIEBA_MAX_REPLY, MAX_CHARS as TIEBA_MAX_CHARS, MAX_TOKENS as TIEBA_MAX_TOKENS,
+  TEMPERATURE as TIEBA_TEMPERATURE, PASS_IMAGES as TIEBA_IMAGES, NEW_GAP_MS as TIEBA_GAP_MS,
+} from './tieba/tieba.mjs';
 import {
   searchCards as hsSearchCards, formatCard as hsFormatCard, queryAndFormat as hsQueryAndFormat,
   fetchCardImage, imageSegmentOf, decodeDeckstring as hsDecodeDeck, formatDeckList as hsFormatDeckList,
@@ -114,8 +125,19 @@ function featDefaults() {                                             // .env �
     shitpost: process.env.SHIT_ENABLED === '1',                    // 搬屎(随机一搬/精选一搬)
     kuangshen: process.env.KUANGSHEN_ENABLED === '1',              // 框神语录(回复+实时采集+回填)
     ai: process.env.AI_CHAT_ENABLED ? process.env.AI_CHAT_ENABLED === '1' : !!AI_API_KEY, // AI 闲聊(兜底;无 key 时强制关)
+    tieba: process.env.TIEBA_ENABLED === '1',                      // 贴吧模式**总开关**(默认关;2026-09-28)
+    tiebaGroups: {},                                              // 贴吧模式**分群**开关(群号 → true;'*' = 全部群)
     updatedAt: 0,
   };
+}
+// 贴吧模式的状态与 AI 闲聊**共用同一把 key**(需求第 6 条):没配 key 就两个都开不起来。
+// 它的单一事实源是 agent/tieba/state.json(**每次现读**,与 modes.json / tone.json 同一套),
+// features.json 里的 tieba / tiebaGroups 只是**镜像** —— 让运维台一页看得全、也方便人直接看文件。
+// 写的时候两份都写(见 processTiebaSwitch),读的时候以 state.json 为准。
+function syncTiebaFeature(on, groups = null) {
+  if (typeof on === 'boolean') FEAT.tieba = on;
+  if (groups) FEAT.tiebaGroups = groups;
+  saveFeatures();
 }
 function loadFeatures() {
   const d = featDefaults();
@@ -125,11 +147,13 @@ function loadFeatures() {
     if (typeof f.shitpost === 'boolean') d.shitpost = f.shitpost;
     if (typeof f.kuangshen === 'boolean') d.kuangshen = f.kuangshen;
     if (typeof f.ai === 'boolean') d.ai = f.ai;
+    if (typeof f.tieba === 'boolean') d.tieba = f.tieba;
+    if (f.tiebaGroups && typeof f.tiebaGroups === 'object') d.tiebaGroups = { ...f.tiebaGroups };
   }
-  if (!AI_API_KEY) d.ai = false;   // 没配 key,开了也是白开
+  if (!AI_API_KEY) { d.ai = false; d.tieba = false; }   // 没配 key,开了也是白开(两者同一把 key)
   // 文件缺字段(老文件遇新开关)时补写一份:否则运维 WebUI 读到 undefined 会显示成 OFF,
   // 与实际运行状态不符,点开关也会对不上。
-  if (!f || ['shitpost', 'kuangshen', 'ai'].some(k => typeof f[k] !== 'boolean')) {
+  if (!f || ['shitpost', 'kuangshen', 'ai', 'tieba'].some(k => typeof f[k] !== 'boolean') || typeof f.tiebaGroups !== 'object') {
     try {
       writeFileSync(FEAT_FILE + '.tmp', JSON.stringify({ ...d, updatedAt: Date.now() }, null, 1), 'utf8');
       renameSync(FEAT_FILE + '.tmp', FEAT_FILE);
@@ -389,23 +413,31 @@ const aiSystem = (hasImages = false, tone = getTone()) => aiSystemPrompt({
 // 网络/超时错误与「后端 4xx」分开:4xx 才值得退让重试(参数不认),超时重来一轮只是把群友的等待翻倍。
 class AiHttpError extends Error {}
 
-async function aiChat(system, userText, images = []) {
+/**
+ * 闲聊调用(带「4xx 就退让」的阶梯)。
+ * @param opts 透传给 aiChatOnce 的采样参数:temperature / maxTokens,以及
+ *   **贴吧模式用的一组**(2026-09-28):`tools:false` + `webSearch:false` —— 一次都不联网,不必退让联网;
+ *   `chatTag` 只改重试日志里的字(贴吧模式的重试别写成「AI 闲聊重试」,不然面板上分不清是谁在重试)。
+ */
+async function aiChat(system, userText, images = [], opts = {}) {
+  const { chatTag = 'AI 闲聊', ...once } = opts;
   // 退让阶梯:先按默认档跑;碰到 4xx(参数/格式不认)依次退,最后连图一起去掉。
   // 换后端/换模型最容易踩的就是参数不认 —— 一个参数不能把整条闲聊弄挂。
   // 顺序讲究:① 去掉联网工具最可能救场(有的后端/模型不支持 function calling);
   //          ② 网页版 deepseek 支持思考模式下的工具调用,所以「不去工具、改开思考」也留一条;
   //          ③ 图片被后端拒(选了没视觉的模型)时最后去掉图,至少还能答字。
+  const searchable = once.webSearch ?? AI_WEB_SEARCH;
   const ladder = [
-    { webSearch: AI_WEB_SEARCH, thinkOff: AI_THINK_OFF, images, tag: '' },
-    ...(AI_WEB_SEARCH ? [{ webSearch: false, thinkOff: AI_THINK_OFF, images, tag: '去掉联网工具' }] : []),
-    ...(AI_WEB_SEARCH && AI_THINK_OFF ? [{ webSearch: true, thinkOff: false, images, tag: '联网+带思考' }] : []),
-    ...(AI_THINK_OFF ? [{ webSearch: false, thinkOff: false, images, tag: '带上思考' }] : []),
-    ...(images.length ? [{ webSearch: false, thinkOff: AI_THINK_OFF, images: [], tag: '去掉图片' }] : []),
+    { ...once, webSearch: searchable, thinkOff: once.thinkOff ?? AI_THINK_OFF, images, tag: '' },
+    ...(searchable ? [{ ...once, webSearch: false, images, tag: '去掉联网工具' }] : []),
+    ...(searchable && AI_THINK_OFF ? [{ ...once, webSearch: true, thinkOff: false, images, tag: '联网+带思考' }] : []),
+    ...(AI_THINK_OFF ? [{ ...once, webSearch: false, thinkOff: false, images, tag: '带上思考' }] : []),
+    ...(images.length ? [{ ...once, webSearch: false, images: [], tag: '去掉图片' }] : []),
   ];
   let lastErr;
   for (const step of ladder) {
     try {
-      if (step.tag) log(`  AI 闲聊重试(${step.tag})...`, '', C.dim);
+      if (step.tag) log(`  ${chatTag}重试(${step.tag})...`, '', C.dim);
       return await aiChatOnce(system, userText, step.images, step);
     } catch (e) {
       lastErr = e;
@@ -449,11 +481,19 @@ async function postChat(body, tag = '') {
  * 为什么这样写(2026-09-21 改):老路子是智谱服务端注入式联网,**只对智谱有效**,deepseek 挂上必 4xx。
  * 现在工具是我们本地实现的,任何 OpenAI 兼容后端都能用,而且搜了什么在面板上看得见(下面那行 log)。
  * 省钱护栏:AI_CHAT_MAX_SEARCHES(默认 2)轮之后就**不再挂工具**,逼它用已有材料作答,别无限搜下去。
+ *
+ * 采样参数与「挂不挂工具」现在可以按调用方覆盖(2026-09-28 加,给贴吧模式用):
+ * 贴吧模式要的是**短、快、野** —— tools:false(一次都不搜)、temperature 更高、max_tokens 更小
+ * (样例里贴吧鱼是短句连发,不是小作文)。注意别把 tools 与 webSearch 弄混:
+ * webSearch 决定「要不要走联网退让阶梯」,tools 决定「这一路挂不挂工具」。
  */
 async function aiChatOnce(system, userText, images = [], opts = {}) {
-  const { webSearch = AI_WEB_SEARCH, thinkOff = AI_THINK_OFF } = opts;
+  const {
+    webSearch = AI_WEB_SEARCH, thinkOff = AI_THINK_OFF, tools = webSearch,
+    temperature = 0.8, maxTokens = AI_CHAT_MAX_TOKENS,
+  } = opts;
   const messages = [{ role: 'system', content: system }, { role: 'user', content: buildUserContent(userText, images) }];
-  const maxSearches = webSearch ? AI_CHAT_MAX_SEARCHES : 0;
+  const maxSearches = tools ? AI_CHAT_MAX_SEARCHES : 0;
   let used = 0;
   for (let round = 0; ; round++) {
     // 预算用完就**停止挂工具**(不再给它搜的机会,逼它用已有材料作答)。
@@ -463,8 +503,8 @@ async function aiChatOnce(system, userText, images = [], opts = {}) {
     const j = await postChat({
       model: AI_MODEL,
       messages,
-      temperature: 0.8,
-      max_tokens: AI_CHAT_MAX_TOKENS,
+      temperature,
+      max_tokens: maxTokens,
       ...(thinkOff ? { reasoning_effort: 'none' } : {}),
       ...(withTools ? { tools: [WEB_SEARCH_TOOL] } : {}),
     });
@@ -681,6 +721,222 @@ async function processAiChat(entry) {
   appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
 }
 
+// ========== 贴吧模式(2026-09-28 新增,需求见 worklist-0928:功能注册名「贴吧模式」) ==========
+// 一句话:开了之后**不用 @ 也会插嘴** —— 盯着群里的话,按概率接一句(还可能连发好几条),口吻照
+// 测试群里那份「贴吧鱼」的聊天记录(骂人、短句、连楼、不 @ 人)。全部文案与拆分逻辑在 tieba/tieba.mjs,
+// 这里只做四件事:① 实时把群消息塞进上下文缓冲 ② 判断该不该接 ③ 叫模型 ④ 连发出去。
+//
+// 为什么不能照搬 AI 闲聊那条路(几条关键差异,改之前先看):
+//   · AI 闲聊**只处理 @ 消息**(entry 从 inbox 来);贴吧模式处理的是**没 @ 的普通群消息**,不进 inbox、
+//     不写 processed.jsonl(它没有 seq 条目的概念),所以走 WS 层直接触发,与 processQueue 那条队列无关;
+//   · AI 闲聊的回调 sendReply 会**先 @ 提问者**;贴吧模式**不许 @ 人**(用户明确定调),所以另走 sendGroupText;
+//   · AI 闲聊要联网查证;贴吧模式把联网整个关掉(短、快、嘴臭,查证反而坏事);
+//   · 用户明确说**不加冷却/限频** —— 所以这里没有 aiCooldown 那类节流,只在同一群正在生成时跳过并发。
+const tiebaBusy = new Set();          // 正在生成的群(同一群同时只跑一条,避免几十条消息并发叫模型)
+const tiebaInFlight = new Set();      // 正在等上下文渲染的消息 seq(渲染要下载图,慢;期间别重复触发)
+let tiebaReplies = 0;                 // 本次运行接了几次话(面板/日志用,不落盘)
+// 贴吧模式的「能不能跑」只看**有没有聊天 key**(需求第 6 条:与 AI 闲聊共用同一把 key)。
+// ⚠ 刻意**不看 FEAT.ai**:面板 3 键关的是「@ 之后的兜底闲聊」,贴吧模式有自己的分群开关,两者不该捆在一起
+//   (2026-09-28 定)。没 key 时两者都开不起来,所以 AI_API_KEY 必须查。
+const tiebaReady = () => !!AI_API_KEY;
+
+// 上下文缓冲:实时收到的每条群消息都记一份 —— 用户要的「群聊消息上下文窗口扩展」靠它,
+// 比每条都去拉一次 OneBot 历史便宜得多(拉历史仍然会拉,见 tiebaContext,那是一次性补齐)。
+function tiebaCollect(j) {
+  const rawText = (j.message || []).map(s => s.type === 'text' ? (s.data?.text || '') : `[${s.type}]`).join('').trim();
+  tiebaNote(j.group_id, {
+    seq: j.message_seq ?? j.message_id,
+    ts: j.time || Math.floor(Date.now() / 1000),
+    uid: String(j.user_id ?? ''),
+    nick: j.sender?.card || j.sender?.nickname || String(j.user_id ?? ''),
+    text: rawText.slice(0, 300),
+    segs: j.message || [],
+  });
+}
+
+// 上下文窗口:缓冲(实时) + 一次历史拉取(补离线期间/启动前的),按 seq 去重后取最近 CTX 条。
+// 拉历史失败**不影响**接话 —— 缓冲里通常已经有最近这些条(尽力而为,失败只记一行日志)。
+async function tiebaContext(groupId) {
+  let history = [];
+  try {
+    const { data } = await api('get_group_msg_history', { group_id: groupId, count: TIEBA_CTX_FETCH });
+    history = (data?.messages || []).map(m => ({
+      seq: m.message_seq ?? m.message_id,
+      ts: m.time || 0,
+      uid: String(m.user_id ?? ''),
+      nick: m.sender?.card || m.sender?.nickname || String(m.user_id ?? ''),
+      text: (m.message || []).map(s => segText(s, new Map())).join('').trim().slice(0, 300),
+    }));
+  } catch (e) {
+    log('  贴吧模式拉历史失败(只用内存缓冲):', e.message, C.yellow);
+  }
+  return tiebaBuildContext(groupId, [...ringOf(groupId, TIEBA_CTX_FETCH), ...history], { botId: BOT_ID, n: TIEBA_CTX });
+}
+
+/**
+ * 该不该接这一条。**所有「不接」的理由都写清楚**,因为线上就靠这几行日志判断行为对不对。
+ * 排除项(用户 2026-09-28 定调 + 需求第 5 条):
+ *   · 机器人自己的消息(一定不能接自己的话,否则自问自答)
+ *   · 空消息 / 纯图纯表情 / 太短的碎话(「草」「?」「233」——接了显得像复读机)
+ *   · **能进分流器的关键词消息**:那些消息正常走各功能(效果/卡图/裁定/每日一卡/史记总结/生成卡表/
+ *     卡组解析/推荐/搬屎/框神语录/帮助/mode…),贴吧模式不抢;@ 了机器人的话又命中关键词 → 走功能,
+ *     没命中关键词 → 交给 AI 闲聊(贴吧模式同样不抢,两条路都别打架)
+ *   · 概率没过(默认 70%)
+ * @returns {Promise<boolean>} 是否真的开火(开火不阻塞调用方,别在 WS 回调里 await 它)
+ */
+export async function tiebaShouldReply(j, { rand = Math.random, log_ = true } = {}) {
+  const gid = String(j.group_id);
+  if (String(j.user_id) === BOT_ID) return false;                      // 自己说的
+  // @ 了机器人的消息一律不接 —— 那些走 inbox/processQueue 那条分流器(AI 闲聊或某个功能)。
+  // ⚠ 这道判断**必须在这里**(而不是只在 tiebaOnMessage 里):tiebaShouldReply 是导出的、自测也直接调它,
+  //   判据集中在一处才不会出现「自测过的路」与「线上跑的路」不是同一条(2026-09-28 就在线上自测里露出来了:
+  //   本机因为没配 key 提前返回,这条断言是「假过」的,线上有 key 才暴露)。
+  if ((j.message || []).some(s => s.type === 'at' && String(s.data?.qq) === BOT_ID)) return false;
+  if (!tiebaOn(gid) || !tiebaReady()) return false;                    // 本群没开 / 没配聊天 key
+  if (tiebaBusy.has(gid)) return false;                                // 上一句还在生成
+  const rawText = (j.message || []).map(s => s.type === 'text' ? (s.data?.text || '') : '').join('').trim();
+  const worth = tiebaWorth({ text: rawText });
+  if (!worth.ok) return false;
+  if (isKeywordMessage(j)) { if (log_) log('  ⏭ 贴吧模式跳过:', `关键词消息(走分流器)—「${rawText.slice(0, 24)}」`, C.dim); return false; }
+  const at = (j.message || []).some(s => s.type === 'at' && String(s.data?.qq) === BOT_ID);
+  const d = tiebaDecide({ text: rawText }, { at, rand });
+  if (!d.reply) { if (log_) log('  ⏭ 贴吧模式不接:', `${d.why} —「${rawText.slice(0, 24)}」`, C.dim); return false; }
+  return true;
+}
+
+/**
+ * 判定「这条消息会不会被别的功能接走」(= 分流器里的触发词)。
+ * ⚠ 触发词改了**这里要跟着改**:漏一个,那个关键词就会被贴吧模式抢去乱骂(需求第 5 条专门写了这条)。
+ * 与 backfillAiChatStats 的 looksLikeAiChat 是同一套判据(那边按 inbox 条目判、是回填统计用,不能直接复用)。
+ */
+export function isKeywordMessage(j) {
+  const text = (j.message || []).map(s => s.type === 'text' ? (s.data?.text || '') : `[${s.type}]`).join('');
+  const mode = modeOf(j.group_id);
+  if (isHelpRequest(text)) return true;
+  if (parseModeCommand(text).triggered) return true;
+  if (parseTiebaCmd(text).triggered) return true;              // 「贴吧模式 开/关」自己也不接
+  if (text.includes(TRIGGER_KEYWORD)) return true;             // 史记总结
+  if (text.includes(DAILY_KEYWORD)) return true;               // 每日一卡
+  if (FEAT.kuangshen && text.includes(KUANGSHEN_TRIGGER)) return true;
+  if (FEAT.shitpost && (text.includes(SHIT_TRIGGER) || text.includes(SHIT_AI_TRIGGER))) return true;
+  if (mode === 'ygo') {
+    if (new RegExp(`${DECK_TRIGGER}[\\s\u3000]`).test(text)) return true;
+    if (new RegExp(`${RULING_FULL_TRIGGER}[\\s\u3000]`).test(text)) return true;
+    if (new RegExp(`${RULING_TRIGGER}[\\s\u3000]`).test(text)) return true;
+  } else {
+    if (text.includes(HS_DECK_TRIGGER)) return true;
+    if (text.includes(HS_RECO_TRIGGER)) return true;
+  }
+  if (new RegExp(`${CARD_TRIGGER}[\\s\u3000]`).test(text)) return true;      // 效果 X(游戏王/炉石共用)
+  if (new RegExp(`${CARD_IMG_TRIGGER}[\\s\u3000]`).test(text)) return true;  // 卡图 X
+  return false;
+}
+
+/**
+ * 开火:渲染那一条(复用 AI 闲聊的解析:@/引用/表情/图片) → 叫模型 → 把回复**按条连发**。
+ * 全程不阻塞调用方(WS 消息处理只调一次、不 await),失败只打日志 —— 贴吧模式挂掉不能拖累别的功能。
+ */
+async function tiebaFire(j) {
+  const gid = String(j.group_id);
+  const uid = String(j.user_id);
+  const msgs = j.message || [];
+  const nick = j.sender?.card || j.sender?.nickname || uid;
+  tiebaBusy.add(gid);
+  const t0 = Date.now();
+  try {
+    const rawText = msgs.map(s => s.type === 'text' ? (s.data?.text || '') : '').join('').trim();
+    log('💬 贴吧模式接话:', `[${j.group_name || gid}] ${nick}: ${rawText.slice(0, 40)}`, C.cyan);
+    // ① 消息解析(与 AI 闲聊同一套):@/引用/表情/图 → 模型读得懂的正文;图直传(用户要的)
+    let text = segText(msgs, new Map());
+    let images = [];
+    try {
+      const rich = await buildAiQuestionRich(null, {
+        segs: msgs,
+        botId: BOT_ID,
+        attachImages: TIEBA_IMAGES,        // 图直传;TIEBA_IMAGES=0 时只留 [图片] 占位(不下载)
+        log: m => log(' ', m, C.dim),
+        getMsg: id => api('get_msg', { message_id: id }),
+        memberName: qq => resolveMemberName(gid, qq),
+      });
+      if (rich?.text) text = rich.text;
+      images = rich?.images || [];
+    } catch (e) {
+      log('  贴吧模式消息解析失败(退回纯文本):', e.message, C.yellow);
+    }
+    // ② 上下文(内存缓冲 + 一次历史拉取)
+    const ctx = await tiebaContext(gid);
+    // ③ 叫模型:贴吧模式**不联网**、温度更高、上限更小(短句连发)
+    const sys = tiebaSystemPrompt({ now: nowText() });
+    const user = `${ctx}\n\n[刚发出来的那条]\n${nick}: ${text}\n\n(${nick} 就是你要接话的人;直接写你要发的短句,一句一行,别 @ 任何人)`;
+    const raw = await aiChat(sys, user, images, {
+      chatTag: '贴吧模式', webSearch: false, tools: false,
+      temperature: TIEBA_TEMPERATURE, maxTokens: TIEBA_MAX_TOKENS,
+    });
+    // ④ 连发:拆成 1~MAX_REPLY 条短句,一条一条发;条与条之间留一点间隔(像人在打字)
+    const parts = tiebaSplit(raw);
+    if (!parts.length) { log('  贴吧模式:模型没说人话(空回复),这条不接', '', C.yellow); return; }
+    for (let i = 0; i < parts.length; i++) {
+      if (i) await new Promise(r => setTimeout(r, TIEBA_GAP_MS));
+      await sendGroupText(j.group_id, parts[i]);
+      log(`  贴吧模式连发 ${i + 1}/${parts.length}:`, parts[i], C.green);
+    }
+    tiebaReplies++;
+    log('  贴吧模式完成:', `${parts.length} 条,用时 ${Date.now() - t0}ms`, C.dim);
+  } catch (e) {
+    log('  贴吧模式失败:', e.message, C.red);      // 静默失败:群里没人 @ 它,回一句「失败」反而莫名其妙
+  } finally {
+    tiebaBusy.delete(gid);
+  }
+}
+
+/** WS 层入口:贴吧模式的**唯一触发点**(@ 消息不进这里 —— 那些走 inbox/processQueue 那条路) */
+export function tiebaOnMessage(j) {
+  if (j.post_type !== 'message' || j.message_type !== 'group') return;
+  if (String(j.user_id) === BOT_ID) return;
+  if ((j.message || []).some(s => s.type === 'at' && String(s.data?.qq) === BOT_ID)) return;   // @ 了 → 走正常分流
+  const gid = String(j.group_id);
+  if (!tiebaOn(gid) || !tiebaReady()) return;
+  tiebaCollect(j);                                   // 先入上下文缓冲,再判定(判定要读缓冲)
+  const seq = j.message_seq ?? j.message_id;
+  if (seq && tiebaInFlight.has(seq)) return;
+  tiebaShouldReply(j).then(ok => {
+    if (!ok) return;
+    if (seq) tiebaInFlight.add(seq);
+    tiebaFire(j).finally(() => { if (seq) tiebaInFlight.delete(seq); });
+  }).catch(e => log('  贴吧模式判定失败:', e.message, C.red));
+}
+
+/** 群里的开关指令「贴吧模式 开 / 关」(在 processEntry 里调用;写 state.json + 镜像进 features.json) */
+export function parseTiebaCmd(text) { return tiebaParseCmd(text); }
+
+/** 启动横幅上那一段贴吧模式摘要:哪几个群开着、口径是多少(看一眼就知道线上什么状态) */
+function tiebaStartupText() {
+  if (!tiebaReady()) return 'OFF(没配聊天 key)';
+  const st = allOn();
+  const on = st.all ? ['全部群'] : st.groups.filter(g => g !== '*');
+  const what = on.length ? on.join(',') : '全部关闭';
+  return `${what}(概率 ${Math.round(TIEBA_PROB * 100)}%${TIEBA_AT_PROB === 1 ? ',@ 必接' : ''},上下文 ${TIEBA_CTX} 条,连发 ≤${TIEBA_MAX_REPLY} 条)`;
+}
+
+async function processTiebaSwitch(entry, cmd) {
+  if (cmd.on === null) {
+    const on = tiebaOn(entry.group_id);
+    await sendReply(entry, `本群「${TIEBA_CMD}」现在是${on ? '开启' : '关闭'}。要改就发「${TIEBA_CMD} 开」或「${TIEBA_CMD} 关」。`);
+    appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
+    return;
+  }
+  const r = tiebaSetOn(entry.group_id, cmd.on);
+  if (r.ok) syncTiebaFeature(cmd.on, { ...(FEAT.tiebaGroups || {}), [String(entry.group_id)]: cmd.on });
+  log('▶ 处理', `${entry.group_name} @${entry.nickname} [${TIEBA_CMD} ${cmd.on ? '开' : '关'}]`, C.cyan);
+  const extra = cmd.on
+    ? `本群从现在开始:群里说话**不用 @ 我**我也会接(概率约 ${Math.round(TIEBA_PROB * 100)}%,接了可能连发几条;怕吵就发「${TIEBA_CMD} 关」)。`
+    : `本群「${TIEBA_CMD}」已关:以后只在你 @ 我的时候说话。`;
+  await sendReply(entry, extra);
+  appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
+}
+
+// ========== 贴吧模式 结束 ==========
+
 // ---------- 卡库更新(下载 → md5 校验 → 解压 → 原子替换 → 重载) ----------
 let updatingDb = false;
 // 带超时与重试的 fetch:百鸽那条国际链路握手经常超过 Node 默认的 10 秒连接超时,
@@ -777,6 +1033,23 @@ async function sendReply(entry, message) {
   if (r.status !== 'ok') throw new Error(`发送失败: ${JSON.stringify(r).slice(0, 120)}`);
   log('  已发送', `message_id=${r.data?.message_id}`, C.green);
   return r.data?.message_id;                        // 供反馈机制关联
+}
+
+// ---------- 发送纯文本(不 @ 任何人;贴吧模式专用,2026-09-28) ----------
+// 为什么必须另开一个:sendReply 会**先塞一个 at 段**(那是所有功能的约定:回复均 @ 触发者),
+// 而贴吧模式用户明确定调「不 @ 被骂的人」—— 用 sendReply 会把每条回复都变成 @ 某人,群友被反复通知。
+// 所以贴吧模式的连发走这里(首行那个换行照旧:不带换行时 QQ 里会跟机器人上一条消息贴在一起)。
+async function sendGroupText(groupId, text) {
+  if (DRY_RUN) {
+    log(`  [DRY_RUN] 不发送(贴吧模式): ${String(text).slice(0, 50)} ...`, '', C.yellow);
+    return null;
+  }
+  const r = await api('send_group_msg', {
+    group_id: groupId,
+    message: [{ type: 'text', data: { text: `\n${text}` } }],
+  });
+  if (r.status !== 'ok') throw new Error(`发送失败: ${JSON.stringify(r).slice(0, 120)}`);
+  return r.data?.message_id;
 }
 
 // ---------- 卡牌/卡图查询(纯本地,无 AI) ----------
@@ -1432,6 +1705,15 @@ export async function processEntry(entry) {
     appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
     return;
   }
+  // 「贴吧模式 开 / 关」:切本群的全自动接话(状态存 tieba/state.json,与运维台同一个口子)。
+  // 放在分流器最前面之一:它跟「mode …」一样是**开关类**指令,不受本群当前开关状态限制
+  // (不然关掉之后就再也发不出「关」了 —— 虽然那种情况下贴吧模式本来也没在接话)。
+  const tiebaCmd = parseTiebaCmd(text);
+  if (tiebaCmd.triggered) {
+    log('▶ 处理', `${entry.group_name} @${entry.nickname} seq=${entry.seq} [${TIEBA_CMD}]`, C.cyan);
+    await processTiebaSwitch(entry, tiebaCmd);
+    return;
+  }
   if (text.includes(TRIGGER_KEYWORD)) {
     log('▶ 处理', `${entry.group_name} @${entry.nickname} seq=${entry.seq} [史记总结]`, C.cyan);
     return processHistory(entry);
@@ -1762,6 +2044,9 @@ function connect() {
           if (q) log('📝 框神语录入库:', q.text.replace(/\n/g, ' ').slice(0, 40), C.dim);
         } catch (e) { log('框神语录入库失败:', e.message, C.red); }
       }
+      // 贴吧模式(2026-09-28):**不 @ 也接话**。同样在 @过滤之前 —— 它要的正是「没 @ 的那些话」。
+      // 内部自己会把「@ 了机器人的消息」排除掉(那些归 inbox/processQueue 那条分流器)。
+      try { tiebaOnMessage(j); } catch (e) { log('贴吧模式处理失败:', e.message, C.red); }
     }
     if (j.post_type !== 'message' || !isMentioningBot(j)) return;
     const seq = j.message_seq ?? j.message_id;
@@ -1836,6 +2121,183 @@ function selftestAt() {
 
 // 自测分支必须在 connect() 之前 —— 它自己 process.exit,不连 WS 也不碰 tmux 面板
 if (process.argv.includes('--selftest-at')) selftestAt();
+
+// ---------- 自测:贴吧模式(2026-09-28 加) ----------
+// 钉住三件「光读代码看不出」的事,而且**不联网、不发消息、不花钱**:
+//   ① 「哪些消息不接」的边界:机器人自己说的、碎话、**关键词消息**(需求第 5 条:那些正常走分流器)、
+//      @ 了机器人的消息(那条走 AI 闲聊/功能,贴吧模式不抢)、没开贴吧模式的群;
+//   ② 分群开关与概率语义:状态读写走真实的 state.json(指到临时文件,不碰线上那份)、rand 钉死;
+//   ③ **整条出话链路**:mock 拦掉聊天请求与 OneBot 接口,喂一条普通群消息进 WS 层,验证它真的
+//      「渲染上下文 → 叫模型 → 按条连发」,且发出去的段里**没有任何 @**(用户明确定调)。
+// 用法:node agent/monitor.mjs --tieba-selftest
+// ⚠ 「整条出话链路」要求本进程配了聊天 key(与 AI 闲聊共用 DEEPSEEK_API_KEY);本机没配就跳过并说明,
+//   线上跑这条自测时会真跑(mock 掉的只是网络,不花钱)。
+export async function tiebaSelftest() {
+  const { mkdtempSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const lines = [];
+  let bad = 0;
+  const ok = (c, m) => { if (!c) bad++; lines.push(`${c ? '✓' : '✗'} ${m}`); };
+  const sleepMs = ms => new Promise(r => setTimeout(r, ms));
+
+  // 状态文件:自测**不碰线上那份**,先把它指到临时目录再读写。
+  // (每次调用都是现读,所以换路径立刻生效 —— 与 monitor 运行时行为一致。)
+  const dir = mkdtempSync(join(tmpdir(), 'tieba-selftest-'));
+  process.env.TIEBA_STATE_PATH = join(dir, 'state.json');
+  const opened = tiebaSetOn(TIEBA_TEST_GROUP, true);
+  ok(opened.ok && tiebaStatePath().includes('tieba-selftest-'), `状态写在临时文件里(不碰线上):${tiebaStatePath()}`);
+  ok(tiebaOn(TIEBA_TEST_GROUP) === true, `测试群 ${TIEBA_TEST_GROUP} 已开(走真实的 state.json 读写)`);
+  ok(tiebaOn('999999999') === false, '没开的群不上贴吧模式');
+  ok(tiebaSetOn(TIEBA_TEST_GROUP2, true).on === true && tiebaOn(TIEBA_TEST_GROUP2) === true, '另一个群各记各的(分群参数)');
+  ok(tiebaOn(TIEBA_TEST_GROUP) === true, '开了第二个群不影响第一个群');
+  tiebaSetOn(TIEBA_TEST_GROUP2, false);
+  ok(tiebaOn(TIEBA_TEST_GROUP2) === false, '关掉之后立刻不接手(现读文件,不用重启)');
+
+  const load = (o) => {
+    const e = {
+      post_type: 'message', message_type: 'group', group_id: Number(TIEBA_TEST_GROUP),
+      group_name: '自测群', user_id: 20001, sender: { card: '何如是' },
+      message_seq: 1, message_id: 1, time: Math.floor(Date.now() / 1000),
+      message: [{ type: 'text', data: { text: '' } }],
+    };
+    Object.assign(e, o);
+    e.raw_message = (e.message || []).map(s => s.type === 'text' ? s.data.text : `[CQ:${s.type}]`).join('');
+    return e;
+  };
+  // ⚠ txt 只在调用方**没给** message 时才塞一条纯文本段 —— 原来写成 `{ ...o, message: [...] }`,
+  //   于是调用方传的 at 段被**静默覆盖**掉:「@ 了机器人的消息不接」那条用例其实一直在测一条纯文本消息,
+  //   本机(没 key,提前 return)还显示 ✓。2026-09-28 在线上自测里才露出来(命中at=false 一眼看破)。
+  const txt = (t, o = {}) => load({ message: [{ type: 'text', data: { text: t } }], ...o });
+  const quiet = o => tiebaShouldReply(o, { log_: false });
+
+  // ① 关键词消息一律不接(需求第 5 条)。**按当前环境的开关状态判**,别写死:
+  //    框神语录/搬屎 关着的时候本来就不接管任何消息(它们的触发词也不该被当成关键词),
+  //    炉石的「卡组解析/推荐」只在本群 mode=炉石 时才存在 —— 这两类要跟着环境走,否则本机自测必红。
+  const KEYWORD_CASES = [
+    ['效果 青眼白龙', '查卡'], ['卡图 白龙', '卡图'], ['每日一卡', '每日一卡'], ['史记总结', '史记'],
+    ['帮助', '帮助'], ['/help', '帮助'], ['mode 炉石', '切模式'], ['生成卡表 x', '卡表'],
+    ['裁定 增殖的G', '裁定'], ['完整裁定 增殖的G', '完整裁定'], ['贴吧模式 关', '贴吧模式自己'],
+  ];
+  for (const [t, why] of KEYWORD_CASES) ok(isKeywordMessage(txt(t)) === true, `关键词消息不接(${why}):「${t}」`);
+  ok(isKeywordMessage(txt(SHIT_TRIGGER)) === FEAT.shitpost, `搬屎开着时才拦「${SHIT_TRIGGER}」(本进程 FEAT.shitpost=${FEAT.shitpost})`);
+  ok(isKeywordMessage(txt(KUANGSHEN_TRIGGER)) === FEAT.kuangshen, `框神语录开着时才拦「${KUANGSHEN_TRIGGER}」`);
+  // 炉石那两个触发词只在 mode=炉石 的群里存在。⚠ 别拿自测群去 setMode —— 那会**真的写 agent/modes.json**
+  //   (污染线上配置)。用两个编出来的群号先设一遍,再判;收尾时删掉,不留痕迹。
+  setMode(TIEBA_TEST_GROUP2, 'hs');
+  ok(isKeywordMessage(txt(HS_DECK_TRIGGER, { group_id: Number(TIEBA_TEST_GROUP2) })) === true, `炉石模式下拦「${HS_DECK_TRIGGER}」`);
+  ok(isKeywordMessage(txt(HS_RECO_TRIGGER, { group_id: Number(TIEBA_TEST_GROUP2) })) === true, `炉石模式下拦「${HS_RECO_TRIGGER}」`);
+  setMode(TIEBA_TEST_GROUP2, 'ygo');
+  ok(isKeywordMessage(txt(HS_DECK_TRIGGER, { group_id: Number(TIEBA_TEST_GROUP2) })) === false, `游戏王模式下不拦「${HS_DECK_TRIGGER}」(那是炉石专属)`);
+  // 收尾:把刚才为自测写进 modes.json 的两个**编出来的群号**删掉(运维台的群列表里不该出现它们)
+  try {
+    const p = modesPath();
+    const m = JSON.parse(readFileSync(p, 'utf8'));
+    delete m[TIEBA_TEST_GROUP];
+    delete m[TIEBA_TEST_GROUP2];
+    writeFileSync(p + '.tmp', JSON.stringify(m, null, 2), 'utf8');
+    renameSync(p + '.tmp', p);
+  } catch { /* 删不掉就算了:那两个号不是真群,不影响功能,只是运维台多两行 */ }
+  ok(isKeywordMessage(txt('这比玩意这么智能?')) === false, '普通吐槽不算关键词消息(该被贴吧模式接)');
+  ok((await quiet(txt('效果 青眼白龙'))) === false && (await quiet(txt('每日一卡'))) === false, '走完整判定也不接关键词消息');
+  ok((await quiet(txt(''))) === false, '空消息不接');
+  ok((await quiet(txt('草'))) === false, '碎话不接(「草」)');
+  ok((await quiet(txt('[表情:微笑]'))) === false, '纯表情不接');
+  ok((await quiet(txt('这比玩意这么智能?', { user_id: Number(BOT_ID) }))) === false, '机器人自己发的消息不接(不能自问自答)');
+  ok((await quiet(txt('这比玩意这么智能?', { group_id: 999999999 }))) === false, '没开贴吧模式的群不接');
+  const atCase = txt('这比玩意这么智能?', {
+    message: [{ type: 'at', data: { qq: BOT_ID } }, { type: 'text', data: { text: ' 这比玩意这么智能?' } }],
+  });
+  // 顺带钉住「这条用例真的是 @ 消息」:helper 若是把段覆盖掉,这里会立刻现形(见 txt 的注释)
+  ok(atCase.message.some(s => s.type === 'at' && String(s.data?.qq) === BOT_ID) && !isKeywordMessage(atCase),
+    '构造出来的确实是「@ 了机器人且无关键词」的消息(不是纯文本)');
+  ok((await quiet(atCase)) === false, '@ 了机器人的消息不接(那条走 AI 闲聊/功能分流)');
+
+  // ② 概率:把随机数钉死,别靠运气(改的是全局 Math.random,这一段结束立刻还原)。
+  // ⚠ tiebaShouldReply 还会先过「有没有聊天 key」那道闸(tiebaReady),本机没配 key 时它永远是 false ——
+  //   所以这里**绕过那个闸直接测概率函数**,不然本机的自测会红一条,看着像概率坏了。
+  const realRandom = Math.random;
+  const decide = (t, at, r) => tiebaDecide({ text: t }, { at, rand: r });
+  try {
+    Math.random = () => 0.99;
+    ok((await quiet(txt('这比玩意这么智能?'))) === false, '掷出 0.99 → 不接(概率 0.7)');
+    Math.random = () => 0.01;
+    ok(decide('这比玩意这么智能?', false, Math.random).reply === true, '掷出 0.01 → 接');
+  } finally { Math.random = realRandom; }
+  ok(tiebaReady() || !AI_API_KEY, `没配聊天 key 时贴吧模式整条不开(与 AI 闲聊共用同一把 key):tiebaReady=${tiebaReady()}`);
+  ok(decide('这比玩意这么智能?', false, () => 0.01).reply === true, '概率判定本身照常工作(与 key 无关)');
+  ok(decide('草', false, () => 0.01).reply === false, '碎话连掷骰子的资格都没有');
+  ok(Math.abs(TIEBA_PROB - 0.7) < 1e-9, `默认接话概率就是需求里的 70%(TIEBA_PROB=${TIEBA_PROB})`);
+  ok(TIEBA_AT_PROB === 1, `@ 了必接(TIEBA_AT_PROB=${TIEBA_AT_PROB})`);
+
+  // ③ 整条出话链路:mock 掉聊天请求与 OneBot 接口(mock 只拦网络,不花钱;逻辑全是真的)
+  const aiReady = tiebaReady();
+  if (!aiReady) {
+    ok(true, '跳过「整条出话链路」:本机没配 DEEPSEEK_API_KEY(正常;线上跑这条自测时会真跑)');
+  }
+  const realFetch = globalThis.fetch;
+  const posted = [];
+  const sent = [];
+  globalThis.fetch = async (url, init) => {
+    const u = String(url);
+    const body = init?.body ? JSON.parse(init.body) : {};
+    if (u === AI_API_URL) {
+      posted.push(body);
+      return new Response(JSON.stringify({
+        choices: [{ message: { role: 'assistant', content: '智能你妈了个逼\n没见过世面搁这狗叫' } }],
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    if (/127\.0\.0\.1|localhost/.test(u)) {          // OneBot HTTP:历史 / 发送 / 群成员都在这儿拦
+      if (body.action === 'send_group_msg') { sent.push(body.params); return new Response(JSON.stringify({ status: 'ok', data: { message_id: 42 } }), { status: 200 }); }
+      if (body.action === 'get_group_msg_history') {
+        return new Response(JSON.stringify({ status: 'ok', data: { messages: [
+          { message_seq: 900, message_id: 900, time: Math.floor(Date.now() / 1000) - 60, user_id: 20002, sender: { card: '还没睡' },
+            message: [{ type: 'text', data: { text: '你妈守灵呢' } }] },
+        ] } }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ status: 'ok', data: {} }), { status: 200 });
+    }
+    return realFetch(url, init);
+  };
+  try {
+    const trigger = txt('这比玩意这么智能?', { message_seq: 777, message_id: 777 });
+    const rand2 = Math.random;
+    Math.random = () => 0.01;                       // 让这条路一定开火
+    try {
+      tiebaOnMessage(trigger);
+      for (let i = 0; i < 40 && !sent.length; i++) await sleepMs(100);   // 等异步链路(渲染 + mock 模型)
+      await sleepMs(1500);                                              // 等第二条连发(条间有间隔)
+    } finally { Math.random = rand2; }
+
+    if (aiReady) {
+      ok(posted.length >= 1, `mock 模型被调用了(${posted.length} 次)`);
+      const p = posted[0] || {};
+      ok(!p.tools, '贴吧模式的请求**不带联网工具**(一次都不搜)');
+      ok(p.temperature === TIEBA_TEMPERATURE, `采样温度用的是贴吧模式那档:${p.temperature}`);
+      const sys = String(p.messages?.[0]?.content || '');
+      ok(/贴吧鱼/.test(sys) && /脏话/.test(sys), '系统提示词是贴吧鱼那一套');
+      const user = String(p.messages?.[1]?.content || '');
+      ok(user.includes('这比玩意这么智能?'), '用户消息带上了触发的那句话');
+      ok(user.includes('还没睡') && user.includes('你妈守灵呢'), '用户消息带上了历史上下文(窗口机制真的在工作)');
+      ok(sent.length === 2, `模型的两行被拆成两条**连发**出去(${sent.length} 条)`);
+      ok(sent.every(s => (s.message || []).every(seg => seg.type === 'text')), '连发出去的全是纯文本段');
+      ok(sent.every(s => !(s.message || []).some(seg => seg.type === 'at')), '**回复里没有任何 @ 段**(用户明确定调)');
+      ok((sent[0]?.message?.[0]?.data?.text || '').includes('智能你妈了个逼'), `第一条内容对得上:${sent[0]?.message?.[0]?.data?.text?.trim()}`);
+    }
+  } catch (e) {
+    ok(false, `整条链路跑失败:${e.message}`);
+  } finally {
+    globalThis.fetch = realFetch;
+    tiebaSetOn(TIEBA_TEST_GROUP, false);            // 收尾:临时文件里的开关也关掉
+  }
+
+  console.log(lines.join('\n'));
+  console.log(bad ? `\n✗ ${bad} 项不过` : '\n✓ 贴吧模式自测全部通过(mock 掉的只有网络,未发任何消息)');
+  process.exitCode = bad ? 1 : 0;
+}
+// 自测用的测试群号(**编出来的号**,不碰任何真实群:临时状态文件里只开了它们)
+export const TIEBA_TEST_GROUP = '100000001';
+export const TIEBA_TEST_GROUP2 = '100000002';
+if (process.argv.includes('--tieba-selftest')) tiebaSelftest();
 
 // 启动参数 --aichat-selftest [--live|--mock]:查 AI 闲聊这条链的配置与拼装。
 //   · 默认**离线**:档位 / 提示词 / 联网工具 / 记账,不联网也不调模型 —— 随便跑,不花钱。
@@ -1969,7 +2431,7 @@ if (process.argv.includes('--backfill-aichat-stats')) {
 // 仅「直接运行」时启动服务:被别的脚本 import 进来(如临时诊断脚本)时不该连 WS、不该抢 tmux 面板。
 // 自测/回填那几个参数也一并排掉 —— 它们自己 process.exit,但会让 main() 先跑起来(连 WS、打启动横幅),
 // 2026-09-21 就踩到:跑 --aichat-selftest 时面板与「WS 错误」一起冒出来,看着像自测把机器人弄挂了。
-const ASKIP = ['--aichat-selftest', '--selftest-at', '--backfill-aichat-stats'];
+const ASKIP = ['--aichat-selftest', '--selftest-at', '--backfill-aichat-stats', '--tieba-selftest'];
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href
   && !ASKIP.some(a => process.argv.includes(a))) main();
 
@@ -2012,5 +2474,5 @@ setInterval(async () => {
 if (process.argv.includes('--update-cards')) updateCardDb();
 
 drawFeaturePanel();
-log(`${DRY_RUN ? '[DRY_RUN] ' : ''}QQ Agent 监控终端启动 (bot=${BOT_ID} | ${TRIGGER_KEYWORD}=史记 | ${CARD_TRIGGER}=查卡 | ${CARD_IMG_TRIGGER}=卡图 | ${RULING_TRIGGER}=官裁 | ${RULING_FULL_TRIGGER}=裁定PDF | ${DAILY_KEYWORD}=每日一卡 | AI闲聊=${FEAT.ai ? `${AI_MODEL}(${TONE_CN[getTone()]},上下文 ${AI_CHAT_CTX} 条,图片直传一轮,联网=${AI_WEB_SEARCH ? searchProviderText() : '关闭'},冷却=${AI_CHAT_COOLDOWN_MS > 0 ? `${AI_CHAT_COOLDOWN_MS / 1000}s/人` : '关'})` : 'OFF'} | 功能开关见面板 1/2/3)`, '', C.cyan);
+log(`${DRY_RUN ? '[DRY_RUN] ' : ''}QQ Agent 监控终端启动 (bot=${BOT_ID} | ${TRIGGER_KEYWORD}=史记 | ${CARD_TRIGGER}=查卡 | ${CARD_IMG_TRIGGER}=卡图 | ${RULING_TRIGGER}=官裁 | ${RULING_FULL_TRIGGER}=裁定PDF | ${DAILY_KEYWORD}=每日一卡 | AI闲聊=${FEAT.ai ? `${AI_MODEL}(${TONE_CN[getTone()]},上下文 ${AI_CHAT_CTX} 条,图片直传一轮,联网=${AI_WEB_SEARCH ? searchProviderText() : '关闭'},冷却=${AI_CHAT_COOLDOWN_MS > 0 ? `${AI_CHAT_COOLDOWN_MS / 1000}s/人` : '关'})` : 'OFF'} | 贴吧模式=${tiebaStartupText()} | 功能开关见面板 1/2/3)`, '', C.cyan);
 }   // ← main() 到这儿结束:进程主体只在「直接运行本文件」时执行

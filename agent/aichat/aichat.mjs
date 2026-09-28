@@ -510,6 +510,7 @@ function renderToken(tk, descs, deps, opts = {}) {
     case 'face': return `[表情${faceLabel(tk.id) ? ':' + faceLabel(tk.id) : (tk.id ? '#' + tk.id : '')}]`;
     case 'image': {
       const what = isSticker(tk) ? '表情包' : '图片';
+      if (opts.plain) return `[${what}]`;         // 不附也不识别(贴吧模式 TIEBA_IMAGES=0):别写「没能识别」,那是我方内部的失败说法
       if (opts.direct) {                          // 直传:图另附在消息里,正文只留编号占位
         const ord = opts.imageOrder?.get(tk.idx);
         return ord ? `[${what}${ord}]` : `[${what}(没能识别)]`;
@@ -527,8 +528,12 @@ function renderToken(tk, descs, deps, opts = {}) {
 }
 
 // 消息段 → token,并摊平引用、把 @ 换成昵称(两条路都要先走这一步)
-async function prepareTokens(entry, deps = {}) {
-  const tokens = (entry.segs && entry.segs.length) ? parseSegments(entry.segs) : parseLegacyText(entry.text);
+//
+// `segs` 入参是 2026-09-28 加的:贴吧模式要渲染**别人发的**那一条(它只拿到 OneBot 原始段
+// [{type,data:{…}}],没有 inbox 条目的外壳)。不传就照旧看 entry.segs / entry.text 的降级路径。
+async function prepareTokens(entry, deps = {}, segs = null) {
+  const list = segs || entry?.segs;
+  const tokens = (list && list.length) ? parseSegments(list) : parseLegacyText(entry?.text);
 
   // 引用:先取回被引消息(只展开一层)
   for (const tk of tokens) {
@@ -580,10 +585,12 @@ export async function buildQuestion(entry, deps = {}) {
  */
 export async function buildQuestionRich(entry, deps = {}) {
   const log = deps.log || (() => {});
-  const tokens = await prepareTokens(entry, deps);
+  const tokens = await prepareTokens(entry, deps, deps.segs);   // deps.segs:直接喂原始消息段(贴吧模式那条路)
   const imgTokens = collectImages(tokens);
-
-  if (imageMode() === 'direct' && imgTokens.length) {
+  // attachImages=false(贴吧模式可以用 TIEBA_IMAGES=0 关掉):图**不下载不附**,正文里只留 [图片] 占位,
+  // 走的是 describe 那条分支但一个描述都不取(没有视觉模型也可能返回 null)→ 省一次下载与几百 token。
+  const attach = deps.attachImages !== false;
+  if (imageMode() === 'direct' && imgTokens.length && attach) {
     const raw = await sendableImages(imgTokens, log);
     const images = raw.filter(Boolean);
     // 只给**真的送出去的那几张**编号,免得正文写 [图片2] 而附的其实只有一张
@@ -593,8 +600,8 @@ export async function buildQuestionRich(entry, deps = {}) {
     return { text, images, mode: images.length ? 'direct' : 'direct(图片没送成,退化成纯文字)' };
   }
 
-  const descs = imgTokens.length ? await describeImages(imgTokens, log) : [];
-  return { text: flatten(tokens.map(tk => renderToken(tk, descs, deps)).join('')), images: [], mode: 'describe' };
+  const descs = imgTokens.length && attach ? await describeImages(imgTokens, log) : [];
+  return { text: flatten(tokens.map(tk => renderToken(tk, descs, deps, { plain: !attach })).join('')), images: [], mode: attach ? 'describe' : 'text-only' };
 }
 
 // ---------- 自测 ----------

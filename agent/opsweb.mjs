@@ -24,6 +24,14 @@ import { fileURLToPath } from 'node:url';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { allModes, setMode as setGroupMode, modeOf, MODE_CN, MODES } from './modes.mjs';
 import { getTone, setTone, TONES, TONE_CN, TONE_DESC, tonePath } from './aichat/tone.mjs';
+// 贴吧模式(2026-09-28):分群开关与状态都在 tieba/tieba.mjs 里,本文件只画界面、写文件。
+// **不走 tmux 按键**:它和游戏模式/提示词档位一样是「文件即状态」,monitor 每次用到时现读,
+// 所以这里点一下立刻生效、不用重启 monitor(见下方 /api/tieba)。
+import {
+  allOn as tiebaAll, isOn as tiebaOn, setOn as tiebaSetOn, statePath as tiebaStatePath,
+  PROB as TIEBA_PROB, PROB_AT as TIEBA_AT_PROB, CTX as TIEBA_CTX, MAX_REPLY as TIEBA_MAX_REPLY,
+  MAX_CHARS as TIEBA_MAX_CHARS, NEW_GAP_MS as TIEBA_GAP_MS, MIN_CHARS as TIEBA_MIN_CHARS,
+} from './tieba/tieba.mjs';
 // ⚠ 这一行只是把 env.mjs **加载**进来 —— 它**被 import 的那一刻**就自己把 agent/.env 读进
 //   process.env 了(env.mjs 文件末尾有 loadEnvFile())。所以本文件**不要再自己调一次** loadEnvFile():
 //   那时 .env 的键已经在 process.env 里,再调会因为「已存在」而全部跳过、返回空数组,
@@ -225,6 +233,23 @@ async function groupsWithMode() {
     .sort((a, b) => String(a.name || a.groupId).localeCompare(String(b.name || b.groupId), 'zh'));
 }
 
+// ---------- 贴吧模式(2026-09-28) ----------
+// 界面用的是**同一份群列表**(get_group_list),但每群多带一个「贴吧模式开没开」。
+// 开关状态读 tieba/state.json(与 monitor 同一个文件),所以这里显示的就是线上正在生效的状态。
+async function groupsWithTieba() {
+  const st = tiebaAll();
+  const nameOf = new Map();
+  const j = await onebot('get_group_list');
+  for (const g of (j?.data || [])) if (g?.group_id) nameOf.set(String(g.group_id), g.group_name || '');
+  // 已经开着贴吧模式、但不在群列表里的群(退群/接口拿不到)也要显示出来,否则关不掉
+  for (const gid of st.groups) if (gid !== '*' && !nameOf.has(gid)) nameOf.set(gid, '');
+  const rows = [...nameOf.entries()]
+    .map(([groupId, name]) => ({ groupId, name, tieba: st.all ? true : tiebaOn(groupId) }))
+    .sort((a, b) => Number(b.tieba) - Number(a.tieba)
+      || String(a.name || a.groupId).localeCompare(String(b.name || b.groupId), 'zh'));
+  return { all: st.all, groups: rows, opened: rows.filter(r => r.tieba).length, file: tiebaStatePath(), updatedAt: st.updatedAt };
+}
+
 function hostStats() {
   const num = (s, re) => { const m = String(s).match(re); return m ? Number(m[1]) : 0; };
   let load = '', memTotal = 0, memAvail = 0, uptimeS = 0;
@@ -340,6 +365,12 @@ async function buildStatus() {
       })()] || null,
     },
     modes,
+    // 贴吧模式(2026-09-28):分群开关 + 当前生效的口径(概率/窗口/连发条数),界面上一眼看得到
+    tieba: await (async () => {
+      const t = await groupsWithTieba().catch(() => ({ all: false, groups: [], opened: 0, file: tiebaStatePath(), updatedAt: 0 }));
+      return { ...t, prob: TIEBA_PROB, probAt: TIEBA_AT_PROB, ctx: TIEBA_CTX, maxReply: TIEBA_MAX_REPLY,
+        maxChars: TIEBA_MAX_CHARS, gapMs: TIEBA_GAP_MS, minChars: TIEBA_MIN_CHARS };
+    })(),
     account: info?.data ? { uin: String(info.data.user_id), nickname: info.data.nickname } : null,
     cards: { mtime: cardsMtime, count: cards ? Object.keys(cards).length : 0, images: countImages() },
     host: { ...host, disk, uptimeText: fmtDuration(host.uptimeS) },
@@ -483,6 +514,16 @@ input[type=password]{font:inherit;width:100%;padding:10px;border:1px solid var(-
 .aibar>i{display:block;height:100%;border-radius:4px;background:linear-gradient(90deg,#fb7299,#ffa8c3);min-width:3px}
 .aicnt{flex:0 0 auto;color:var(--mut);font-size:11px;font-variant-numeric:tabular-nums}
 button.mini{min-height:28px;padding:4px 10px;font-size:12px;border-radius:7px}
+/* 贴吧模式的按群开关弹窗(用户要求「叠加弹窗,平时不显示」):整屏蒙层 + 中间一张卡片 */
+#tbmodal{position:fixed;inset:0;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center;padding:16px;z-index:40}
+#tbmodal.show{display:flex}
+#tbmodal .mbox{background:var(--card);border-radius:14px;padding:16px;width:100%;max-width:520px;max-height:82vh;overflow:auto;box-shadow:0 8px 30px rgba(0,0,0,.2)}
+#tbmodal h3{font-size:15px;margin:0 0 8px;display:flex;align-items:center;gap:8px}
+.tbrow{display:flex;align-items:center;gap:10px;padding:7px 0;border-bottom:1px solid var(--line)}
+.tbrow:last-child{border-bottom:0}
+.tbrow .tk{flex:1;min-width:0}
+.tbrow .tsub{font-size:11px;color:var(--mut)}
+.tbrow.all{border-bottom:1px solid var(--line);margin-bottom:4px}
 </style></head><body>
 
 <div id="login"><div class="box">
@@ -505,6 +546,13 @@ button.mini{min-height:28px;padding:4px 10px;font-size:12px;border-radius:7px}
   <div class="card wide"><h2>游戏模式 <span class="mut" style="font-weight:400">(按群)</span></h2>
     <div id="modes"></div>
     <div class="mut" style="margin-top:8px;font-size:11px">决定该群「效果 / 卡图 / 每日一卡 / 卡组」按哪个游戏走(默认游戏王);群友发「mode 炉石」「mode 游戏王」也能改,与此处同步。</div></div>
+
+  <div class="card"><h2>贴吧模式 <span class="mut" style="font-weight:400">(按群)</span></h2>
+    <div id="tieba"></div>
+    <div style="margin-top:10px"><button onclick="openTieba()">选择群…</button>
+      <span class="mut" style="margin-left:8px" id="tiebanote"></span></div>
+    <div class="mut" style="margin-top:8px;font-size:11px">开了之后<strong>不用 @ 也会接话</strong>(脏话全开、短句、可连发,不 @ 人)。
+      <br>⚠ 默认全部关闭:只对这里点开的群生效;群友发「贴吧模式 开 / 关」也能切。</div></div>
 
   <div class="card"><h2>服务</h2><div id="svcs"></div></div>
 
@@ -542,6 +590,15 @@ button.mini{min-height:28px;padding:4px 10px;font-size:12px;border-radius:7px}
 
 <div id="toast"></div>
 
+<!-- 贴吧模式:按群开关做成**弹窗**(用户 2026-09-28 要求:平时不占版面,点按钮才出来) -->
+<div id="tbmodal"><div class="mbox">
+  <h3>贴吧模式 · 按群开关 <button class="mini" style="margin-left:auto" onclick="closeTieba()">关闭</button></h3>
+  <div class="mut" id="tbhint"></div>
+  <div id="tbody"></div>
+  <div class="mut" style="margin-top:10px;font-size:11px">开关是<strong>每群各记各的</strong>,点了立刻生效(monitor 每次用到时现读状态文件,不用重启)。
+    概率/上下文/连发条数等口径在 agent/.env(TIEBA_PROB / TIEBA_CTX / TIEBA_MAX_REPLY …),改完要重启 monitor。</div>
+</div></div>
+
 <script>
 function h(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
 function toast(m){var t=document.getElementById('toast');t.textContent=m;t.className='show';clearTimeout(t._h);t._h=setTimeout(function(){t.className=''},3600)}
@@ -563,6 +620,28 @@ function act(path,body,confirmMsg){
    .finally(function(){for(var i=0;i<bs.length;i++)bs[i].disabled=false})
 }
 function toggle(key,cur){act('feature',{key:key,value:!cur})}
+// 贴吧模式(2026-09-28):分群开关做成弹窗 —— 平时只显示「开了几个群」,点按钮才列出所有群。
+// 状态来自 /api/status 的 tieba(读的就是 monitor 正在用的那份 state.json),所以显示与生效永远一致。
+var tbData={groups:[],all:false,opened:0};
+function openTieba(){renderTieba(true);document.getElementById('tbmodal').className='show'}
+function closeTieba(){document.getElementById('tbmodal').className=''}
+function setTieba(groupId,on){act('tieba',{groupId:groupId,on:on})}
+function tbRow(r){
+  return '<div class="tbrow"><span class="tk" title="'+h(r.groupId)+'">'+h(r.name||('群 '+r.groupId))+
+    '<div class="tsub">'+h(r.groupId)+(r.tieba?' · 已开启':'')+'</div></span>'+
+    '<div class="sw'+(r.tieba?' on':'')+'" onclick="setTieba(\\''+r.groupId+'\\','+(r.tieba?'false':'true')+')"><i></i></div></div>';
+}
+function renderTieba(force){
+  var t=tbData;
+  document.getElementById('tiebanote').textContent = t.opened? ('已开 '+t.opened+' 个群') : '当前:全部关闭';
+  var box=document.getElementById('tbody');
+  if(!box||(!force&&document.getElementById('tbmodal').className!=='show'))return;
+  document.getElementById('tbhint').textContent='共 '+t.groups.length+' 个群;接话概率 '+
+    Math.round((t.prob||0)*100)+'%,上下文 '+(t.ctx||0)+' 条,最多连发 '+(t.maxReply||0)+' 条(每条 ≤'+(t.maxChars||0)+' 字)';
+  box.innerHTML='<div class="tbrow all"><span class="tk">全部群<div class="tsub">一次把下面所有群都打开/关掉</div></span>'+
+    '<div class="sw'+(t.all?' on':'')+'" onclick="setTieba(\\'*\\','+(t.all?'false':'true')+')"><i></i></div></div>'+
+    (t.groups.length?t.groups.map(tbRow).join(''):'<div class="mut">读不到群列表(OneBot 可能没起来)</div>');
+}
 // 分群游戏模式:每群两个小按钮(游戏王/炉石),当前那个高亮;点了就走 /api/mode 直接写 modes.json。
 // 不用开关样式的原因:这是「二选一」而不是开关,而且要一眼看出这群现在按哪个游戏走。
 function setMode(groupId,mode){act('mode',{groupId:groupId,mode:mode})}
@@ -602,6 +681,9 @@ function tick(){
       frow('AI 闲聊','${AI_CHAT_DESC}',s.features.ai,'ai');
 
     document.getElementById('modes').innerHTML=modesHtml(s.modes);
+
+    tbData=s.tieba||{groups:[],all:false,opened:0};
+    renderTieba(false);
 
     renderTones(s.tone);
     renderNets(s.search);
@@ -869,8 +951,26 @@ const server = createServer(async (req, res) => {
       });
     }
 
-    if (path === '/api/mode' && req.method === 'POST') {
-      const { groupId, mode } = await readBody(req);
+    // 贴吧模式分群开关(2026-09-28):直接写 tieba/state.json —— monitor **每次用到时现读**该文件,
+    // 所以点一下立刻生效,不需要敲 tmux 按键、也不用重启(与 /api/mode、/api/tone 同一套路子)。
+    // groupId='*'(或空)表示「全部群」;选了「全部群」之后 monitor 会忽略分群表、所有群都算开着。
+    if (path === '/api/tieba' && req.method === 'POST') {
+      const { groupId, on } = await readBody(req);
+      const g = String(groupId ?? '*').trim() || '*';
+      if (g !== '*' && !/^\d{4,12}$/.test(g)) return json(res, 400, { message: '群号不合法' });
+      const r = tiebaSetOn(g, !!on);
+      const where = g === '*' ? '全部群' : ((await groupsWithTieba().catch(() => ({ groups: [] })))
+        .groups.find(x => x.groupId === g)?.name || `群 ${g}`);
+      return json(res, r.ok ? 200 : 400, {
+        ok: r.ok,
+        message: r.ok
+          ? `${where}的贴吧模式已${on ? '开启' : '关闭'}${on && g === '*' ? '(所有群都算开着)' : ''}`
+          : (r.message || '设置失败'),
+        tieba: await groupsWithTieba().catch(() => null),
+      });
+    }
+
+    if (path === '/api/mode' && req.method === 'POST') {      const { groupId, mode } = await readBody(req);
       if (!groupId || !MODES.includes(mode)) return json(res, 400, { message: '群号或模式不合法(mode 只能是 ygo / hs)' });
       const r = setGroupMode(String(groupId), mode);
       return json(res, r.ok ? 200 : 400, {
