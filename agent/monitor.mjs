@@ -30,7 +30,7 @@ import { modeOf, setMode, parseModeCommand, MODE_CN, modesPath, allModes } from 
 import {
   isOn as tiebaOn, setOn as tiebaSetOn, parseGroupCommand as tiebaParseCmd, systemPrompt as tiebaSystemPrompt,
   splitReply as tiebaSplit, decideReply as tiebaDecide, worthReplying as tiebaWorth, buildContext as tiebaBuildContext,
-  noteMessage as tiebaNote, ringOf, allOn, statePath as tiebaStatePath,
+  noteMessage as tiebaNote, ringOf, allOn, statePath as tiebaStatePath, AT_SUFFIX as TIEBA_AT_SUFFIX,
   FEATURE_KEY as TIEBA_KEY, FEATURE_CN as TIEBA_CN, GROUP_CMD as TIEBA_CMD,
   PROB as TIEBA_PROB, PROB_AT as TIEBA_AT_PROB, CTX as TIEBA_CTX, CTX_FETCH as TIEBA_CTX_FETCH,
   MAX_REPLY as TIEBA_MAX_REPLY, MAX_CHARS as TIEBA_MAX_CHARS, MAX_TOKENS as TIEBA_MAX_TOKENS,
@@ -703,9 +703,42 @@ async function processAiChat(entry) {
   } catch (e) {
     log('  AI 闲聊消息解析失败(退回纯文本):', e.message, C.yellow);
   }
-  q = q.replace(/@你(史官)/g, ' ').replace(/\s+/g, ' ').trim() || '(无文字,仅@)';
+  // 剥掉 @ 段标记(形如 [at])与多余空白 —— 只作用于**降级路径**(没有 segs 的老条目 / 解析失败时)。
+  // 两条路都会被这个占位符碰到:AI 闲聊把它渲染成「@你(史官)」,贴吧模式渲染成「@你(贴吧鱼)」,
+  // 两个都剥掉(以前只剥史官那个,贴吧模式下「@你(贴吧鱼)」会被当成提问正文,模型还以为是别人说的)。
+  q = q.replace(/@你\((?:史官|贴吧鱼)\)/g, ' ').replace(/\s+/g, ' ').trim() || '(无文字,仅@)';
   // 档位**每次请求现读**(tone.json 是热切的,运维台一点就生效;读几 KB 的 JSON 相比一次模型调用可忽略)
   const tone = getTone();
+  // ===== 贴吧模式开着时,**这条 @ 的路整条被贴吧模式覆盖**(用户 2026-09-28 明确要求)=====
+  // 为什么不是「再挂一段补充说明」:实测那样压不住 —— 提示词里只要还留着助手骨架(档位/工具/答疑语气),
+  // 它就会滑回「我来帮你」「说吧,想聊什么」那套。所以直接把 system prompt 换掉、并在提示词里
+  // 写死「你不是助手、只骂人不帮忙」(见 tieba.mjs 的 PERSONA),采样参数也换成嘴臭那一档。
+  // 保留的只有:消息解析(@/引用/表情/图片)、上下文、记账、失败兜底 —— 那些是共用的管道。
+  const tiebaPersona = tiebaOn(entry.group_id) && tiebaReady();
+  if (tiebaPersona) {
+    log(`  ${AI_MODEL} 生成中 ...(人格:${TIEBA_CN}/贴吧鱼${images.length ? `,含 ${images.length} 张图` : ''})`, '', C.dim);
+    try {
+      const raw = await aiChat(tiebaSystemPrompt({ now: nowText(), at: true }), `${ctx}@你的人: ${entry.nickname}\nTA 的问题: ${q}`, images, {
+        chatTag: '贴吧模式', webSearch: false, tools: false,
+        temperature: TIEBA_TEMPERATURE, maxTokens: TIEBA_MAX_TOKENS,
+      });
+      // 与自动接话同一套连发:模型一句一行 → 拆成 1~3 条短句发出去(也**不 @ 触发者**)
+      const parts = tiebaSplit(raw);
+      if (!parts.length) throw new Error('模型没说人话(空回复)');
+      for (let i = 0; i < parts.length; i++) {
+        if (i) await new Promise(r => setTimeout(r, TIEBA_GAP_MS));
+        await sendGroupText(entry.group_id, parts[i]);
+        log(`  贴吧模式连发 ${i + 1}/${parts.length}:`, parts[i], C.green);
+      }
+      if (!DRY_RUN) bumpAiChatStat(entry, true);
+    } catch (e) {
+      log('  贴吧模式(@)失败:', e.message, C.red);
+      await sendGroupText(entry.group_id, '行,你赢了,我没词了。');   // 兜底也不切换回助手口吻
+      if (!DRY_RUN) bumpAiChatStat(entry, false);
+    }
+    appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
+    return;
+  }
   log(`  ${AI_MODEL} 生成中 ...(档位 ${TONE_CN[tone]}${AI_WEB_SEARCH ? ',可联网' : ''}${images.length ? `,含 ${images.length} 张图` : ''})`, '', C.dim);
   try {
     let reply = await aiChat(aiSystem(images.length > 0, tone), `${ctx}@你的人: ${entry.nickname}\nTA 的问题: ${q}`, images);
@@ -1638,7 +1671,7 @@ function isHelpRequest(text) {
   const clean = (text || '').replace(/\[at\]/g, ' ').trim();
   return /^(?:\/help|帮助)/i.test(clean);
 }
-export function buildHelpText(mode = 'ygo') {
+export function buildHelpText(mode = 'ygo', groupId = '') {
   const shit = FEAT.shitpost
     ? `\n${SHIT_TRIGGER} — 随机搬一条史(封面截图)`   // AI 精选一搬未完善,暂不展示
     : '';
@@ -1648,6 +1681,9 @@ export function buildHelpText(mode = 'ygo') {
   const ai = FEAT.ai
     ? `\n\n没写指令也没关系 —— 随便 @ 我说点什么,史官直接接话(带图带表情包也认得出,引用别人的话我也看得见)。`
     : '';
+  // ⚠ 帮助文本里**不写贴吧模式**(用户 2026-09-28 明确要求):那是运维侧/管理侧的能力,
+  //   摆在群友看得见的说明书里等于教人怎么把它关掉,也显得像个待关的开关而不是「群里一个人」。
+  //   (groupId 参数保留:以前这行给贴吧模式写过一段提示,现在虽然不用了,签名不改免得调用方跟着动。)
   const common = `
 ${TRIGGER_KEYWORD} — 以史记体文言文总结最近群聊
 ${HELP_CMD} — 看这份说明${kuangshen}${shit}${ai}`;
@@ -1682,7 +1718,7 @@ export async function processEntry(entry) {
   entry.mode = mode;                                // 帮助文本/日志用
   if (isHelpRequest(text)) {
     log('▶ 处理', `${entry.group_name} @${entry.nickname} seq=${entry.seq} [帮助]`, C.cyan);
-    await sendReply(entry, buildHelpText(mode));
+    await sendReply(entry, buildHelpText(mode, entry.group_id));
     appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
     return;
   }
@@ -2160,8 +2196,7 @@ export async function tiebaSelftest() {
       message_seq: 1, message_id: 1, time: Math.floor(Date.now() / 1000),
       message: [{ type: 'text', data: { text: '' } }],
     };
-    Object.assign(e, o);
-    e.raw_message = (e.message || []).map(s => s.type === 'text' ? s.data.text : `[CQ:${s.type}]`).join('');
+    Object.assign(e, o);    e.raw_message = (e.message || []).map(s => s.type === 'text' ? s.data.text : `[CQ:${s.type}]`).join('');
     return e;
   };
   // ⚠ txt 只在调用方**没给** message 时才塞一条纯文本段 —— 原来写成 `{ ...o, message: [...] }`,
@@ -2229,6 +2264,17 @@ export async function tiebaSelftest() {
   ok(Math.abs(TIEBA_PROB - 0.7) < 1e-9, `默认接话概率就是需求里的 70%(TIEBA_PROB=${TIEBA_PROB})`);
   ok(TIEBA_AT_PROB === 1, `@ 了必接(TIEBA_AT_PROB=${TIEBA_AT_PROB})`);
 
+  // ②b 「开了贴吧模式的群里 @ 也走这套人格」(用户 2026-09-28:开了模式就覆盖闲聊)。
+  //     钉的是**提示词本身**:身份前提不许留助手骨架,且必须写死「不帮忙」。
+  const atPrompt = tiebaSystemPrompt({ now: 'x', at: true });
+  ok(!/客服|助手|AI/.test(atPrompt.split('不是')[0] || '') , '提示词开头没有把助手/客服当前提');
+  ok(/你\*\*不是\*\*助手、不是客服、不是机器人、不是 AI/.test(atPrompt), '身份前提被明确否定(不是助手/客服/机器人/AI)');
+  ok(/一点忙都不许帮/.test(atPrompt) && /不许给信息、不许给建议/.test(atPrompt), '写死了「只骂人不帮忙」(覆盖闲聊的关键)');
+  ok(/无视他问的正事|就算他问的是正事/.test(atPrompt), '明确:正经问题也只回骂');
+  ok(/当面 @ 你/.test(atPrompt), '@ 那条路会多一句「别切回答疑语气」');
+  ok(!/当面 @ 你/.test(tiebaSystemPrompt({ now: 'x' })), '自动接话那条路不带这句(按不 @ 的口径说话)');
+  ok(tiebaOn(TIEBA_TEST_GROUP) === true && tiebaReady() === !!AI_API_KEY, '「是否覆盖闲聊」的判据 = 本群开着 + 有 key');
+
   // ③ 整条出话链路:mock 掉聊天请求与 OneBot 接口(mock 只拦网络,不花钱;逻辑全是真的)
   const aiReady = tiebaReady();
   if (!aiReady) {
@@ -2285,10 +2331,36 @@ export async function tiebaSelftest() {
     }
   } catch (e) {
     ok(false, `整条链路跑失败:${e.message}`);
-  } finally {
-    globalThis.fetch = realFetch;
-    tiebaSetOn(TIEBA_TEST_GROUP, false);            // 收尾:临时文件里的开关也关掉
+  } finally { /* fetch 的还原挪到下面 @ 覆盖那段之后(两段共用同一个 mock) */ }
+
+  // ③b 「开了贴吧模式的群里 @ 也走这套人格」(用户 2026-09-28:开了模式就覆盖闲聊)。
+  //     这条路走的是 processAiChat(不是 tiebaFire),所以必须**单独钉一次**:
+  //     否则「@ 之后又滑回史官助手口吻」这种回归没人看得见(用户就是这么发现第一版的)。
+  if (aiReady) {
+    try {
+      posted.length = 0; sent.length = 0;
+      const atEntry = {
+        seq: 888, message_id: 888, time: Math.floor(Date.now() / 1000),
+        group_id: Number(TIEBA_TEST_GROUP), group_name: '自测群', user_id: 20001, nickname: 'W-13',
+        text: '煞笔[at]', targets: [String(BOT_ID)],
+      };
+      await processAiChat(atEntry);
+      ok(posted.length >= 1, `@ 那条路也叫了模型(${posted.length} 次)`);
+      const sys = String(posted[0]?.messages?.[0]?.content || '');
+      ok(/你\*\*不是\*\*助手、不是客服、不是机器人、不是 AI/.test(sys), '@ 之后用的仍是贴吧鱼人格(没有滑回史官助手)');
+      ok(!/赛博史官|档位/.test(sys), '提示词里没有史官/档位那套骨架');
+      ok(/当面 @ 你/.test(sys), '@ 这条路带上了「别切回答疑语气」那句');
+      ok(posted[0]?.temperature === TIEBA_TEMPERATURE && !posted[0]?.tools, `@ 这条路也用嘴臭那档采样参数(temp=${posted[0]?.temperature},不挂工具)`);
+      ok(sent.length === 2 && sent.every(s => !(s.message || []).some(seg => seg.type === 'at')),
+        `@ 的回复同样连发且不带 @(${sent.length} 条)`);
+    } catch (e) {
+      ok(false, `@ 覆盖那一段跑失败:${e.message}`);
+    }
+  } else {
+    ok(true, '跳过「@ 覆盖闲聊」链路:本机没配 DEEPSEEK_API_KEY(线上跑这条自测时会真跑)');
   }
+  globalThis.fetch = realFetch;
+  tiebaSetOn(TIEBA_TEST_GROUP, false);            // 收尾:临时文件里的开关也关掉
 
   console.log(lines.join('\n'));
   console.log(bad ? `\n✗ ${bad} 项不过` : '\n✓ 贴吧模式自测全部通过(mock 掉的只有网络,未发任何消息)');
