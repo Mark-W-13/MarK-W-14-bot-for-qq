@@ -30,7 +30,7 @@ import { modeOf, setMode, parseModeCommand, MODE_CN, modesPath, allModes } from 
 import {
   isOn as tiebaOn, setOn as tiebaSetOn, parseGroupCommand as tiebaParseCmd, systemPrompt as tiebaSystemPrompt,
   splitReply as tiebaSplit, decideReply as tiebaDecide, worthReplying as tiebaWorth, buildContext as tiebaBuildContext,
-  pickCount as tiebaPickCount, MIN_CHARS as TIEBA_MIN_CHARS,  noteMessage as tiebaNote, ringOf, allOn, statePath as tiebaStatePath, AT_SUFFIX as TIEBA_AT_SUFFIX,
+  pickCount as tiebaPickCount, MIN_CHARS as TIEBA_MIN_CHARS, emojiAllowed as tiebaEmojiAllowed,  noteMessage as tiebaNote, ringOf, allOn, statePath as tiebaStatePath, AT_SUFFIX as TIEBA_AT_SUFFIX,
   FEATURE_KEY as TIEBA_KEY, FEATURE_CN as TIEBA_CN, GROUP_CMD as TIEBA_CMD,
   PROB_DEFAULT as TIEBA_PROB, PROB_AT_DEFAULT as TIEBA_AT_PROB, CTX as TIEBA_CTX, CTX_FETCH as TIEBA_CTX_FETCH,
   probOf as tiebaProbOf, probAtOf as tiebaProbAtOf, setProb as tiebaSetProb,
@@ -719,7 +719,7 @@ async function processAiChat(entry) {
   if (tiebaPersona) {
     log(`  ${AI_MODEL} 生成中 ...(人格:${TIEBA_CN}/贴吧鱼${images.length ? `,含 ${images.length} 张图` : ''})`, '', C.dim);
     try {
-      const raw = await aiChat(tiebaSystemPrompt({ now: nowText(), at: true }), `${ctx}@你的人: ${entry.nickname}\nTA 的问题: ${q}`, images, {
+      const raw = await aiChat(tiebaSystemPrompt({ now: nowText(), at: true, emoji: tiebaEmojiAllowed() }), `${ctx}@你的人: ${entry.nickname}\nTA 的问题: ${q}`, images, {
         chatTag: '贴吧模式', webSearch: false, tools: false,
         temperature: TIEBA_TEMPERATURE, maxTokens: TIEBA_MAX_TOKENS,
       });
@@ -903,7 +903,9 @@ async function tiebaFire(j) {
     // ② 上下文(内存缓冲 + 一次历史拉取)
     const ctx = await tiebaContext(gid);
     // ③ 叫模型:贴吧模式**不联网**、温度更高、上限更小(短句连发)
-    const sys = tiebaSystemPrompt({ now: nowText() });
+    // 表情这一条由**代码掷骰子**决定允不允许(约 25%,见 tieba.mjs 的 EMOJI_PROB):
+    // 实测让提示词自己把握频率根本靠不住 —— 说「每两三条」它就一半带表情,说「每五条」它一条都不发。
+    const sys = tiebaSystemPrompt({ now: nowText(), emoji: tiebaEmojiAllowed() });
     const user = `${ctx}\n\n[刚发出来的那条]\n${nick}: ${text}\n\n(${nick} 就是你要接话的人;直接写你要发的短句,一句一行,别 @ 任何人)`;
     const raw = await aiChat(sys, user, images, {
       chatTag: '贴吧模式', webSearch: false, tools: false,
