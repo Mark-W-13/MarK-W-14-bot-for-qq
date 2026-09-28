@@ -30,6 +30,7 @@ import { modeOf, setMode, parseModeCommand, MODE_CN, modesPath, allModes } from 
 import {
   isOn as tiebaOn, setOn as tiebaSetOn, parseGroupCommand as tiebaParseCmd, systemPrompt as tiebaSystemPrompt,
   splitReply as tiebaSplit, decideReply as tiebaDecide, worthReplying as tiebaWorth, buildContext as tiebaBuildContext,
+  pickCount as tiebaPickCount, MIN_CHARS as TIEBA_MIN_CHARS,
   noteMessage as tiebaNote, ringOf, allOn, statePath as tiebaStatePath, AT_SUFFIX as TIEBA_AT_SUFFIX,
   FEATURE_KEY as TIEBA_KEY, FEATURE_CN as TIEBA_CN, GROUP_CMD as TIEBA_CMD,
   PROB as TIEBA_PROB, PROB_AT as TIEBA_AT_PROB, CTX as TIEBA_CTX, CTX_FETCH as TIEBA_CTX_FETCH,
@@ -722,8 +723,9 @@ async function processAiChat(entry) {
         chatTag: '贴吧模式', webSearch: false, tools: false,
         temperature: TIEBA_TEMPERATURE, maxTokens: TIEBA_MAX_TOKENS,
       });
-      // 与自动接话同一套连发:模型一句一行 → 拆成 1~3 条短句发出去(也**不 @ 触发者**)
-      const parts = tiebaSplit(raw);
+      // 与自动接话同一套连发:随机抽这次发几条(1 条最多见)→ 拆 → 发出去(也**不 @ 触发者**)
+      const want = tiebaPickCount();
+      const parts = tiebaSplit(raw, { max: want });
       if (!parts.length) throw new Error('模型没说人话(空回复)');
       for (let i = 0; i < parts.length; i++) {
         if (i) await new Promise(r => setTimeout(r, TIEBA_GAP_MS));
@@ -905,8 +907,10 @@ async function tiebaFire(j) {
       chatTag: '贴吧模式', webSearch: false, tools: false,
       temperature: TIEBA_TEMPERATURE, maxTokens: TIEBA_MAX_TOKENS,
     });
-    // ④ 连发:拆成 1~MAX_REPLY 条短句,一条一条发;条与条之间留一点间隔(像人在打字)
-    const parts = tiebaSplit(raw);
+    // ④ 连发:先**随机抽这次发几条**(1 条最多见,见 tieba.mjs 的 pickCount),再按这个上限拆;
+    //    模型写了 3 行而这次抽中 1 条时,多出来的行会并进最后一条(并不下就丢),不会话说一半。
+    const want = tiebaPickCount();
+    const parts = tiebaSplit(raw, { max: want });
     if (!parts.length) { log('  贴吧模式:模型没说人话(空回复),这条不接', '', C.yellow); return; }
     for (let i = 0; i < parts.length; i++) {
       if (i) await new Promise(r => setTimeout(r, TIEBA_GAP_MS));
@@ -914,7 +918,7 @@ async function tiebaFire(j) {
       log(`  贴吧模式连发 ${i + 1}/${parts.length}:`, parts[i], C.green);
     }
     tiebaReplies++;
-    log('  贴吧模式完成:', `${parts.length} 条,用时 ${Date.now() - t0}ms`, C.dim);
+    log('  贴吧模式完成:', `${parts.length} 条(抽中 ${want} 条上限),用时 ${Date.now() - t0}ms`, C.dim);
   } catch (e) {
     log('  贴吧模式失败:', e.message, C.red);      // 静默失败:群里没人 @ 它,回一句「失败」反而莫名其妙
   } finally {
@@ -2328,7 +2332,9 @@ export async function tiebaSelftest() {
       const user = String(p.messages?.[1]?.content || '');
       ok(user.includes('这比玩意这么智能?'), '用户消息带上了触发的那句话');
       ok(user.includes('还没睡') && user.includes('你妈守灵呢'), '用户消息带上了历史上下文(窗口机制真的在工作)');
-      ok(sent.length === 2, `模型的两行被拆成两条**连发**出去(${sent.length} 条)`);
+      // ⚠ 条数现在是**随机抽**的(1 条最多见),所以这里不能写死「2 条」——只断言 1..上限 之间,
+      //   精确的条数与并句行为在 tieba.mjs 的自测里用钉死的随机数验(见那边的 pickCount 用例)。
+      ok(sent.length >= 1 && sent.length <= TIEBA_MAX_REPLY, `连发条数落在 1..${TIEBA_MAX_REPLY} 之间(随机抽):${sent.length} 条`);
       ok(sent.every(s => (s.message || []).every(seg => seg.type === 'text')), '连发出去的全是纯文本段');
       // 2026-09-28 用户反馈「发消息时多了一行空行」:出站正文一律不许带前置换行(见 noLead)
       const leads = sent.map(s => String(s.message?.[0]?.data?.text || ''));
@@ -2358,8 +2364,8 @@ export async function tiebaSelftest() {
       ok(!/赛博史官|档位/.test(sys), '提示词里没有史官/档位那套骨架');
       ok(/当面 @ 你/.test(sys), '@ 这条路带上了「别切回答疑语气」那句');
       ok(posted[0]?.temperature === TIEBA_TEMPERATURE && !posted[0]?.tools, `@ 这条路也用嘴臭那档采样参数(temp=${posted[0]?.temperature},不挂工具)`);
-      ok(sent.length === 2 && sent.every(s => !(s.message || []).some(seg => seg.type === 'at')),
-        `@ 的回复同样连发且不带 @(${sent.length} 条)`);
+      ok(sent.length >= 1 && sent.length <= TIEBA_MAX_REPLY,
+        `@ 的回复条数同样在 1..${TIEBA_MAX_REPLY} 之间且不带 @(${sent.length} 条)`);
       // 顺带钉住出站文本的通用规矩:sendGroupText / sendReply 都不许加前置换行
       ok(sent.every(s => s.message?.[0]?.data?.text && !/^[\r\n]/.test(s.message[0].data.text)),
         '@ 那条路的出站正文同样不带前置换行');

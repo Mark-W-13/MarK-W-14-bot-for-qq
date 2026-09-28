@@ -44,6 +44,15 @@ export const PROB_AT = clamp01(Number(process.env.TIEBA_AT_PROB ?? 1));        /
 export const CTX = Math.max(4, Number(process.env.TIEBA_CTX || 30));           // 上下文窗口(条),比 AI 闲聊的 10 条大得多
 export const CTX_FETCH = Math.max(CTX, Number(process.env.TIEBA_CTX_FETCH || 60)); // 从 OneBot 拉多少条历史来凑窗口
 export const MAX_REPLY = Math.max(1, Number(process.env.TIEBA_MAX_REPLY || 3)); // 一次最多连发几条
+// 实际发几条**随机**(2026-09-28 用户:「不一定每次都发三条,你可以随机一下条数,自然一点」):
+// 权重按索引给,索引 0 = 1 条。默认 1 条 45% / 2 条 35% / 3 条 20% —— 单句最多、三条最少,
+// 读起来像水友随口一句、有时火上来连着补两句。可用 TIEBA_COUNT_WEIGHTS 覆盖(逗号分隔,自动归一化)。
+const COUNT_WEIGHTS = (() => {
+  const raw = String(process.env.TIEBA_COUNT_WEIGHTS || '45,35,20').split(',')
+    .map(s => Number(s.trim())).filter(n => Number.isFinite(n) && n > 0);
+  const w = raw.slice(0, MAX_REPLY);
+  return w.length ? w : [1];
+})();
 export const MAX_CHARS = Math.max(10, Number(process.env.TIEBA_MAX_CHARS || 60)); // **单条**回复的字数上限(样例都是短句)
 export const MAX_TOKENS = Math.max(64, Number(process.env.TIEBA_MAX_TOKENS || 1200));
 export const TEMPERATURE = Number(process.env.TIEBA_TEMPERATURE || 0.95);      // 嘴臭要野一点,采样温度给高
@@ -284,11 +293,13 @@ const HOWTO_REPLY = `怎么回:
 - 就算他是在提问、求助、讲正经事:你也一律骂,别给他任何有用的答案
 - 万一上下文里没什么可接的,就随便找个由头损一句,反正别不回`;
 
-const OUTPUT = `输出格式(**只有这一段的规矩必须严格照做**):
-- 直接写你要发到群里的内容,一句一条,用换行分开;**1~3 条**,每条都是短句
+// 输出格式那一段随「最多几条」变,所以写成函数(别再往里引外面的变量,容易前后顺序踩坑)
+const outputRules = (maxReply) => `输出格式(**只有这一段的规矩必须严格照做**):
+- 直接写你要发到群里的内容,一句一条,用换行分开;**大多数时候就 1 条,偶尔 2 条,最多 ${maxReply} 条**
+- **别每次都写满 ${maxReply} 条**:那是上限不是标配。多数时候一句话骂完就收手,像随口甩一句;
+  只有火真上来了才补第二、第三条 —— 每次都写满反而像刷屏的机器人
 - 不要加引号、不要加「贴吧鱼:」这种前缀、不要写序号、不要解释你为什么这么说
 - 一条写不下就再换一行接着骂,别把所有话堆在一行里(那样看着不像真人发的)`;
-
 // 「@ 了机器人」那条路(AI 闲聊)也共用这套人格时的补充说明:那边会多一层「是谁 @ 你的」交代,
 // 但要求一样 —— 还是骂,不许切换成答疑/客服模式(用户 2026-09-28 明确:开了这个模式的群,@ 也这么回)。
 export const AT_SUFFIX = `
@@ -310,17 +321,33 @@ ${HOWTO}${ref}
 ${HOWTO_REPLY}${at ? AT_SUFFIX : ''}
 - 每条不超过 ${maxChars} 字,最多 ${maxReply} 条${now ? `\n- 现在是 ${now}(你说话时的真实时间;没人问就别主动报时间)` : ''}
 
-${OUTPUT}`;
+${outputRules(maxReply)}`;
+}
+
+/**
+ * 这次发几条?按 COUNT_WEIGHTS 抽(默认 1 条最多)。
+ * 抽样只在这一个地方 —— 自测里把 rand 钉死就能钉住「条数是随机的、且分布正确」。
+ */
+export function pickCount(rand = Math.random, weights = COUNT_WEIGHTS) {
+  const total = weights.reduce((a, b) => a + b, 0);
+  let x = rand() * total;
+  for (let i = 0; i < weights.length; i++) {
+    x -= weights[i];
+    if (x < 0) return i + 1;
+  }
+  return weights.length;
 }
 
 /**
  * 把模型返回的整段拆成**要连发的几条**。
- * 为什么要有这一步:模型被要求「一句一行」,但也经常一口气写成一整段 —— 那样直接发出去就是
- * 一大坨,完全不像贴吧鱼(样例里它一次连发 2~4 条短句)。所以这里兜底:
+ * 为什么要拆:模型被要求「一句一行」,但也经常一口气写成一整段 —— 那样直接发出去就是
+ * 一大坨,完全不像贴吧鱼(样例里它一次连发 2~4 条短句)。拆法:
  *   ① 先按行拆;② 行太长就按**句末标点**切句,再把短句合并到不超字数为止(切在标点上比切在字数上自然得多);
  *   ③ 实在没有标点(整句就一个逗号没有的长串)才按字数硬切;④ 最多 max 条、每条 ≤maxChars 字。
+ * @param opts.max 这次最多发几条 —— **由 pickCount() 随机决定**(默认顶格)。模型写了 3 行而这次抽中 1 条时,
+ *   多的那几行会**并进最后一条**(并得下就并,并不下就丢掉),这样不会出现「话说到一半就没了」。
  */
-export function splitReply(text, { max = MAX_REPLY, maxChars = MAX_CHARS } = {}) {
+export function splitReply(text, { max = MAX_REPLY, maxChars = MAX_CHARS, mergeExtra = true } = {}) {
   const raw = String(text || '').trim();
   if (!raw) return [];
   const lines = raw.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
@@ -347,7 +374,17 @@ export function splitReply(text, { max = MAX_REPLY, maxChars = MAX_CHARS } = {})
     }
     if (buf) out.push(buf);
   }
-  return out.slice(0, max);
+  if (out.length <= max) return out;
+  const head = out.slice(0, max);
+  const extra = out.slice(max);
+  // 多出来的行:能并进最后一条就并(并的时候补个空格,别把两句话粘成一个词),并不下就丢
+  if (mergeExtra) {
+    for (const e of extra) {
+      const last = head[head.length - 1];
+      if (last.length + 1 + e.length <= maxChars) head[head.length - 1] = `${last} ${e}`;
+    }
+  }
+  return head;
 }
 
 /** 这条消息值不值得接:太短的碎话不接(「草」「?」「233」「6」);返回 { ok, why } */
@@ -382,7 +419,7 @@ function selftest() {
   ok(p.includes('贴吧鱼'), '提示词里有人设名「贴吧鱼」');
   ok(/脏话、生殖器、亲属问候、人身攻击放开写/.test(p), '提示词明确放开辱骂(用户要的)');
   ok(/不要 @ 任何人/.test(p), '提示词要求回复里不 @ 人(用户要的)');
-  ok(/1~3 条/.test(p) && /用换行分开/.test(p), '提示词要求「一句一条、1~3 条」连发');
+  ok(/大多数时候就 1 条/.test(p) && /别每次都写满/.test(p), '提示词要求「多数只发 1 条、别每次写满上限」(用户要的自然感)');
   ok(/别承认、别解释/.test(p), '带「被问是不是 AI」的处理规则(样例里的关键梗)');
   ok(p.includes('字多不看'), '参考样例被拼进了提示词');
   ok(p.includes('2026 年 9 月 28 日'), '时间现算并写进提示词');
@@ -403,6 +440,28 @@ function selftest() {
   ok(splitReply('只有一条').length === 1, '单条回复照原样发');
   ok(splitReply('').length === 0, '空回复 → 不发');
   ok(splitReply('a\n\n\nb').length === 2, '空行被忽略');
+
+  // 条数随机(用户 2026-09-28:「不一定每次都发三条,随机一下条数,自然一点」)
+  const w = [45, 35, 20];
+  ok(pickCount(() => 0, w) === 1 && pickCount(() => 0.4499, w) === 1, '抽到 1 条(权重最高的那档)');
+  ok(pickCount(() => 0.45, w) === 2 && pickCount(() => 0.7999, w) === 2, '抽到 2 条');
+  ok(pickCount(() => 0.80, w) === 3 && pickCount(() => 0.9999, w) === 3, '抽到 3 条');
+  const dist = { 1: 0, 2: 0, 3: 0 };
+  for (let i = 0; i < 4000; i++) dist[pickCount(Math.random, w)]++;
+  const share = n => dist[n] / 4000;
+  ok(Math.abs(share(1) - 0.45) < 0.05 && Math.abs(share(3) - 0.20) < 0.05,
+    `4000 次抽样分布接近权重:1条 ${(share(1) * 100).toFixed(1)}% / 2条 ${(share(2) * 100).toFixed(1)}% / 3条 ${(share(3) * 100).toFixed(1)}%`);
+  ok(dist[1] > dist[2] && dist[2] > dist[3], '「一条」比「两条」多、「两条」比「三条」多(不是平均分布)');
+
+  // 抽中 1 条但模型写了 2~3 行:多出来的行**并进最后一条**(不许把话丢一半)
+  const two = splitReply('就你那根牙签\n捅你自己皮炎都费劲', { max: 1 });
+  ok(two.length === 1 && two[0] === '就你那根牙签 捅你自己皮炎都费劲', `抽中 1 条时多出的行并进末条:${JSON.stringify(two)}`);
+  const three = splitReply('字多不看，急了\n还没睡？你妈守灵呢\n废物还挑起来了', { max: 1, maxChars: 40 });
+  ok(three.length === 1 && three[0].includes('废物还挑起来了'), `三行并成一条(≤40 字):${JSON.stringify(three)}`);
+  const tooLong = splitReply('你'.repeat(30) + '\n' + '我'.repeat(30), { max: 1, maxChars: 10 });
+  ok(tooLong.length === 1 && tooLong[0].length <= 10, `并不下就不硬并(仍守字数上限):${JSON.stringify(tooLong)}`);
+  const cap = splitReply('a\nb\nc\nd\ne', { max: 2, maxChars: 4 });
+  ok(cap.length <= 2, `上限 2 条时不会发出第 3 条:${JSON.stringify(cap)}`);
 
   // 值不值得接
   ok(worthReplying({ text: '草' }).ok === false, '「草」这种碎话不接');
