@@ -30,8 +30,7 @@ import { modeOf, setMode, parseModeCommand, MODE_CN, modesPath, allModes } from 
 import {
   isOn as tiebaOn, setOn as tiebaSetOn, parseGroupCommand as tiebaParseCmd, systemPrompt as tiebaSystemPrompt,
   splitReply as tiebaSplit, decideReply as tiebaDecide, worthReplying as tiebaWorth, buildContext as tiebaBuildContext,
-  pickCount as tiebaPickCount, MIN_CHARS as TIEBA_MIN_CHARS,
-  noteMessage as tiebaNote, ringOf, allOn, statePath as tiebaStatePath, AT_SUFFIX as TIEBA_AT_SUFFIX,
+  pickCount as tiebaPickCount, MIN_CHARS as TIEBA_MIN_CHARS,  noteMessage as tiebaNote, ringOf, allOn, statePath as tiebaStatePath, AT_SUFFIX as TIEBA_AT_SUFFIX,
   FEATURE_KEY as TIEBA_KEY, FEATURE_CN as TIEBA_CN, GROUP_CMD as TIEBA_CMD,
   PROB as TIEBA_PROB, PROB_AT as TIEBA_AT_PROB, CTX as TIEBA_CTX, CTX_FETCH as TIEBA_CTX_FETCH,
   MAX_REPLY as TIEBA_MAX_REPLY, MAX_CHARS as TIEBA_MAX_CHARS, MAX_TOKENS as TIEBA_MAX_TOKENS,
@@ -812,11 +811,12 @@ async function tiebaContext(groupId) {
  * 该不该接这一条。**所有「不接」的理由都写清楚**,因为线上就靠这几行日志判断行为对不对。
  * 排除项(用户 2026-09-28 定调 + 需求第 5 条):
  *   · 机器人自己的消息(一定不能接自己的话,否则自问自答)
- *   · 空消息 / 纯图纯表情 / 太短的碎话(「草」「?」「233」——接了显得像复读机)
  *   · **能进分流器的关键词消息**:那些消息正常走各功能(效果/卡图/裁定/每日一卡/史记总结/生成卡表/
  *     卡组解析/推荐/搬屎/框神语录/帮助/mode…),贴吧模式不抢;@ 了机器人的话又命中关键词 → 走功能,
  *     没命中关键词 → 交给 AI 闲聊(贴吧模式同样不抢,两条路都别打架)
  *   · 概率没过(默认 70%)
+ *   · **只有「连文字带图都没有」才不接** —— 「碎话护栏」(以前 4 字以下不接)已被用户要求拆掉:
+ *     现在「草」「煞笔」「?」照样掷骰子,纯表情/纯图也接(图能看懂,正好该损一句)。
  * @returns {Promise<boolean>} 是否真的开火(开火不阻塞调用方,别在 WS 回调里 await 它)
  */
 export async function tiebaShouldReply(j, { rand = Math.random, log_ = true } = {}) {
@@ -830,11 +830,12 @@ export async function tiebaShouldReply(j, { rand = Math.random, log_ = true } = 
   if (!tiebaOn(gid) || !tiebaReady()) return false;                    // 本群没开 / 没配聊天 key
   if (tiebaBusy.has(gid)) return false;                                // 上一句还在生成
   const rawText = (j.message || []).map(s => s.type === 'text' ? (s.data?.text || '') : '').join('').trim();
-  const worth = tiebaWorth({ text: rawText });
+  const hasImage = (j.message || []).some(s => s.type === 'image' || s.type === 'mface');
+  const worth = tiebaWorth({ text: rawText, hasImage });
   if (!worth.ok) return false;
   if (isKeywordMessage(j)) { if (log_) log('  ⏭ 贴吧模式跳过:', `关键词消息(走分流器)—「${rawText.slice(0, 24)}」`, C.dim); return false; }
   const at = (j.message || []).some(s => s.type === 'at' && String(s.data?.qq) === BOT_ID);
-  const d = tiebaDecide({ text: rawText }, { at, rand });
+  const d = tiebaDecide({ text: rawText, hasImage }, { at, rand });   // ⚠ hasImage 要一起传,否则纯图会被二次拦掉
   if (!d.reply) { if (log_) log('  ⏭ 贴吧模式不接:', `${d.why} —「${rawText.slice(0, 24)}」`, C.dim); return false; }
   return true;
 }
@@ -2210,7 +2211,13 @@ export async function tiebaSelftest() {
   // ⚠ txt 只在调用方**没给** message 时才塞一条纯文本段 —— 原来写成 `{ ...o, message: [...] }`,
   //   于是调用方传的 at 段被**静默覆盖**掉:「@ 了机器人的消息不接」那条用例其实一直在测一条纯文本消息,
   //   本机(没 key,提前 return)还显示 ✓。2026-09-28 在线上自测里才露出来(命中at=false 一眼看破)。
-  const txt = (t, o = {}) => load({ message: [{ type: 'text', data: { text: t } }], ...o });
+  const txt = (t, o = {}) => {
+    const e = load({ message: [{ type: 'text', data: { text: t } }], ...o });
+    // hasImage 是从**段**里推出来的(与线上 tiebaShouldReply 同一口径)。⚠ 别再写先 txt() 再覆盖 message:
+    // 那样推出来的 hasImage 会是 false,「纯图也接」那条用例就假红(2026-09-28 在本机/线上各栽一次)。
+    e.hasImage = (e.message || []).some(s => s.type === 'image' || s.type === 'mface');
+    return e;
+  };
   const quiet = o => tiebaShouldReply(o, { log_: false });
 
   // ① 关键词消息一律不接(需求第 5 条)。**按当前环境的开关状态判**,别写死:
@@ -2242,9 +2249,33 @@ export async function tiebaSelftest() {
   } catch { /* 删不掉就算了:那两个号不是真群,不影响功能,只是运维台多两行 */ }
   ok(isKeywordMessage(txt('这比玩意这么智能?')) === false, '普通吐槽不算关键词消息(该被贴吧模式接)');
   ok((await quiet(txt('效果 青眼白龙'))) === false && (await quiet(txt('每日一卡'))) === false, '走完整判定也不接关键词消息');
-  ok((await quiet(txt(''))) === false, '空消息不接');
-  ok((await quiet(txt('草'))) === false, '碎话不接(「草」)');
-  ok((await quiet(txt('[表情:微笑]'))) === false, '纯表情不接');
+  // 「碎话护栏」已被用户 2026-09-28 拆掉:短话、纯表情、纯图都要照掷骰子(以前这几条断言是「不接」)。
+  // ⚠ 这里用「必中」的随机数,否则 70% 会把断言变成看运气的。
+  const always = () => 0.01;                        // 必中:断言「接不接」时必须钉死随机数,否则看运气
+  const never = () => 0.99;
+  ok(TIEBA_MIN_CHARS === 0, `碎话护栏默认关掉(TIEBA_MIN_CHARS=${TIEBA_MIN_CHARS},0 = 不按字数拦)`);
+  // ⚠ 「短话/纯表情/纯图现在也接」要在**两道闸都过得了**的前提下断言:tiebaShouldReply 还会先查
+  //   「有没有聊天 key」(tiebaReady),本机没配 key 时它永远返回 false —— 那正是本机第一次跑这几条时
+  //   红掉的原因(不是护栏没拆)。所以:本机断言「值不值得接 + 概率判定」这两层,线上再跑一次整条链。
+  ok(tiebaWorth({ text: '草' }).ok === true, '「草」这种短话算「值得接」(护栏已拆)');
+  ok(tiebaWorth({ text: '煞笔' }).ok === true, '「煞笔」两个字也算值得接');
+  ok(tiebaWorth({ text: '[表情:微笑]' }).ok === true, '纯表情算值得接');
+  ok(tiebaWorth({ text: '[图片]', hasImage: true }).ok === true, '纯图算值得接(图能看懂,正好损一句)');
+  ok(tiebaWorth({ text: '' }).ok === false, '真的什么都没有(无文字也无图)才不接');
+  ok(tiebaDecide({ text: '草' }, { rand: always }).reply === true, '短话照样进概率判定并且掷中会接');
+  ok(tiebaDecide({ text: '草' }, { rand: never }).reply === false, '短话也照样受 70% 概率约束(掷不中就静默)');
+  if (tiebaReady()) {
+    const willReply = o => tiebaShouldReply(o, { rand: always, log_: false });
+    ok((await willReply(txt('草'))) === true, '线上整条链:「草」也接');
+    ok((await willReply(txt('[表情:微笑]'))) === true, '线上整条链:纯表情也接');
+    const imgCase = txt('', { message: [{ type: 'image', data: { url: 'u', file: 'f' } }] });
+    const imgWorth = tiebaWorth({ text: '', hasImage: imgCase.hasImage });
+    ok((await willReply(imgCase)) === true,
+      `线上整条链:纯图也接(worth=${imgWorth.ok} 关键词=${isKeywordMessage(imgCase)} 群开着=${tiebaOn(imgCase.group_id)})`);
+    ok((await willReply(txt(''))) === false, '线上整条链:真的什么都没有才不接');
+  } else {
+    ok(true, '跳过「线上整条链」的几条:本机没配聊天 key(tiebaReady=false),线上跑自测时会真跑');
+  }
   ok((await quiet(txt('这比玩意这么智能?', { user_id: Number(BOT_ID) }))) === false, '机器人自己发的消息不接(不能自问自答)');
   ok((await quiet(txt('这比玩意这么智能?', { group_id: 999999999 }))) === false, '没开贴吧模式的群不接');
   const atCase = txt('这比玩意这么智能?', {
@@ -2268,7 +2299,7 @@ export async function tiebaSelftest() {
   } finally { Math.random = realRandom; }
   ok(tiebaReady() || !AI_API_KEY, `没配聊天 key 时贴吧模式整条不开(与 AI 闲聊共用同一把 key):tiebaReady=${tiebaReady()}`);
   ok(decide('这比玩意这么智能?', false, () => 0.01).reply === true, '概率判定本身照常工作(与 key 无关)');
-  ok(decide('草', false, () => 0.01).reply === false, '碎话连掷骰子的资格都没有');
+  ok(decide('草', false, () => 0.01).reply === true, '短话照样进概率判定(护栏已拆)');
   ok(Math.abs(TIEBA_PROB - 0.7) < 1e-9, `默认接话概率就是需求里的 70%(TIEBA_PROB=${TIEBA_PROB})`);
   ok(TIEBA_AT_PROB === 1, `@ 了必接(TIEBA_AT_PROB=${TIEBA_AT_PROB})`);
 

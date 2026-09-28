@@ -56,7 +56,10 @@ const COUNT_WEIGHTS = (() => {
 export const MAX_CHARS = Math.max(10, Number(process.env.TIEBA_MAX_CHARS || 60)); // **单条**回复的字数上限(样例都是短句)
 export const MAX_TOKENS = Math.max(64, Number(process.env.TIEBA_MAX_TOKENS || 1200));
 export const TEMPERATURE = Number(process.env.TIEBA_TEMPERATURE || 0.95);      // 嘴臭要野一点,采样温度给高
-export const MIN_CHARS = Math.max(1, Number(process.env.TIEBA_MIN_CHARS || 4)); // 短于此的碎话不接(「草」「?」「233」)
+// 「碎话不接」的门槛:**默认 0 = 关掉这道闸**(用户 2026-09-28:「4 字以下算碎话直接不接,这个护栏改掉」)。
+// 以前默认 4,于是「草」「煞笔」「?」这类短话全被吃掉,看着就像「它不理我」。现在只要不是「连文字带图
+// 一个都没有」,再短也照掷骰子;想恢复旧行为就设 TIEBA_MIN_CHARS=4。
+export const MIN_CHARS = Math.max(0, Number(process.env.TIEBA_MIN_CHARS ?? 0));
 export const NEW_GAP_MS = Math.max(0, Number(process.env.TIEBA_NEW_GAP_MS ?? 900)); // 连发两条之间的间隔(模拟手打)
 
 const boolEnv = v => String(v ?? '').toLowerCase();
@@ -387,18 +390,28 @@ export function splitReply(text, { max = MAX_REPLY, maxChars = MAX_CHARS, mergeE
   return head;
 }
 
-/** 这条消息值不值得接:太短的碎话不接(「草」「?」「233」「6」);返回 { ok, why } */
+/**
+ * 这条消息值不值得接。**现在的答案基本永远是「值得」**(2026-09-28 用户要求拆掉「碎话护栏」):
+ * 只有「连文字带图一个都没有」才不接(比如纯转发/纯语音那种没有正文的段,接了也不知道接什么)。
+ * minChars 默认 0 = 不按字数拦;真想要「短话不接」的老行为,设 TIEBA_MIN_CHARS=4 即可。
+ * ⚠ 图片/表情**不算「没有内容」**:段里有图时正文可能只有一个 [图片] 占位,但模型能看图,该接就接。
+ * @returns {{ok:boolean, why:string}}
+ */
 export function worthReplying(msg, minChars = MIN_CHARS) {
   const text = String(msg?.text || '').trim();
-  if (!text) return { ok: false, why: '空消息' };
+  const hasImage = !!msg?.hasImage;
+  if (!text && !hasImage) return { ok: false, why: '这条没有任何内容(没有文字也没有图)' };
   // 去掉占位标记后看「真正说了几个字」:[图片][表情:微笑] 这类当然不算话
   const bare = text.replace(/\[[^\]]*\]/g, '').replace(/@\S+/g, '').replace(/[\s,，。.!！?？~～、。]+/g, '');
-  if (bare.length < minChars) return { ok: false, why: `只有「${text.slice(0, 12)}」这种碎话` };
+  if (minChars > 0 && bare.length < minChars && !hasImage) return { ok: false, why: `只有「${text.slice(0, 12)}」这种碎话` };
   return { ok: true, why: '' };
 }
 
 /**
  * 掷骰子决定接不接。**抽随机数的动作只在这一处**(自测里替换 rand 就能钉住概率语义)。
+ * ⚠ hasImage 必须一起传进来:纯图消息的正文可能只有一个 [图片] 占位(甚至空),不告诉这一层
+ *   「有图」的话,它会在这里被当成「没有内容」第二次拦掉 —— 2026-09-28 线上自测就是这么红的
+ *   (worthReplying 放行了,decideReply 又拦回来,因为只给它传了 text)。
  * @returns {{reply:boolean, why:string, p:number}}
  */
 export function decideReply(msg, { at = false, rand = Math.random, prob = PROB, probAt = PROB_AT, minChars = MIN_CHARS } = {}) {
@@ -463,18 +476,21 @@ function selftest() {
   const cap = splitReply('a\nb\nc\nd\ne', { max: 2, maxChars: 4 });
   ok(cap.length <= 2, `上限 2 条时不会发出第 3 条:${JSON.stringify(cap)}`);
 
-  // 值不值得接
-  ok(worthReplying({ text: '草' }).ok === false, '「草」这种碎话不接');
-  ok(worthReplying({ text: '?' }).ok === false, '「?」不接');
-  ok(worthReplying({ text: '[表情:微笑]' }).ok === false, '纯表情不接');
-  ok(worthReplying({ text: '[图片]' }).ok === false, '纯图片不接');
+  // 值不值得接:「碎话护栏」已按用户要求拆掉(2026-09-28),现在只有「连文字带图都没有」才不接
+  ok(worthReplying({ text: '草' }).ok === true, '「草」这种短话也算值得接(护栏已拆)');
+  ok(worthReplying({ text: '?' }).ok === true, '「?」也值得接');
+  ok(worthReplying({ text: '[表情:微笑]' }).ok === true, '纯表情值得接');
+  ok(worthReplying({ text: '[图片]', hasImage: true }).ok === true, '纯图片值得接');
+  ok(worthReplying({ text: '' }).ok === false, '真的什么都没有(无文字也无图)才不接');
   ok(worthReplying({ text: '这比玩意这么智能?' }).ok === true, '有内容的吐槽要接');
+  ok(MIN_CHARS === 0, `护栏门槛默认 0(想恢复旧行为设 TIEBA_MIN_CHARS=4):当前 ${MIN_CHARS}`);
+  ok(worthReplying({ text: '草' }, 4).ok === false, '把门槛手动设成 4 时,「草」又会被拦(说明这个开关还在)');
 
   // 概率语义(把随机数钉死,别靠运气)
   const never = () => 0.99, always = () => 0.01;
   ok(decideReply({ text: '这比玩意这么智能?' }, { rand: never }).reply === false, '掷出 0.99 > 0.7 → 不接');
   ok(decideReply({ text: '这比玩意这么智能?' }, { rand: always }).reply === true, '掷出 0.01 < 0.7 → 接');
-  ok(decideReply({ text: '草' }, { rand: always }).reply === false, '碎话连掷骰子的资格都没有');
+  ok(decideReply({ text: '草' }, { rand: always }).reply === true, '碎话照样进概率判定(护栏已拆)');
   ok(decideReply({ text: '这比玩意这么智能?' }, { at: true, rand: never, probAt: 0.7 }).reply === false, '@ 也要掷骰子(TIEBA_AT_PROB=0.7 时掷出 0.99 → 不接)');
   ok(decideReply({ text: '这比玩意这么智能?' }, { at: true, rand: always, probAt: 0.7 }).reply === true, 'TIEBA_AT_PROB=0.7 时掷出 0.01 → 接');
   ok(decideReply({ text: '这比玩意这么智能?' }, { at: true, rand: never }).reply === true, '@ 了必接(默认 TIEBA_AT_PROB=1:掷什么都接)');
