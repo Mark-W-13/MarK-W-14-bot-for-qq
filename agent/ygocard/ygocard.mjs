@@ -5,7 +5,7 @@
 //   searchCards('青眼白龙')          -> 单关键词
 //   searchCards('青眼 白龙')          -> 空格分隔多关键词 AND 查询
 //   命令行自测: node ygocard.mjs "关键词..."
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync, statSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { inflateRawSync } from 'node:zlib';
@@ -47,10 +47,12 @@ export function getCardsPath() { return CARDS_PATH; }
 
 // ---------- 卡图 ----------
 // 本地卡图文件路径(不存在返回 null)。卡无官方密码(id=0)或无图文件时无卡图。
+// 小于 1KB 的当半张残图(下载中断留下的),同样不发。
 export function cardImagePath(c) {
   if (!c?.id) return null;
   const p = join(IMG_DIR, `${c.id}.jpg`);
-  return existsSync(p) ? p : null;
+  if (!existsSync(p)) return null;
+  try { return statSync(p).size >= 1024 ? p : null; } catch { return null; }
 }
 
 // 构造 OneBot 图片消息段(base64://,无需 SnowLuma 读本地路径);无本地卡图返回 null
