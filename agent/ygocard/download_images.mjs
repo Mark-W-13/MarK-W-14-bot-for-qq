@@ -4,6 +4,7 @@
 //   node download_images.mjs 1000       # 只下前 1000 张(试跑)
 //   node download_images.mjs --repair   # 只重下「最后 200 张(按 cid)」, 修历史错图(先删后下, 不跳过)
 //   node download_images.mjs --repair 500   # 同上, 窗口改成最后 500 张
+//   node download_images.mjs --repair-one 100268004 100268001   # 只修指定密码 id(最精确)
 //   node download_images.mjs --audit    # 只体检不下载: 报覆盖/错图风险清单
 //   模块导入: import { downloadImages } from './download_images.mjs'
 //     (monitor 卡库更新后调用,只补缺失的,增量很快)
@@ -188,6 +189,17 @@ export async function repairImages(n = 200) {
   return runQueue(queue, { force: true });
 }
 
+// 只修指定的密码 id(先删后下;不可信 id 走回退源)。用于线上按清单精确修错图。
+export async function repairOne(id) {
+  mkdirSync(OUT, { recursive: true });
+  const r = await fetchOne(id, { force: true });
+  saveMoeList();
+  const p = join(OUT, `${id}.jpg`);
+  const size = existsSync(p) ? statSync(p).size : 0;
+  console.log(`${id}: ${r.kind} ${size} 字节 来源=${moeLogged.has(String(id)) ? '回退源' : '官方源'}`);
+  return { ...r, size, source: moeLogged.has(String(id)) ? 'moe' : 'official' };
+}
+
 // 体检: 报卡图覆盖情况 + 错图风险清单(不联网,只看本地文件与来源标记)
 export function auditImages() {
   const cards = readCards();
@@ -231,6 +243,16 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
         `无密码 id 的卡 ${a.noIdCards.length} 张(官方无卡图,正常)`);
       if (a.risky.length) { console.log('疑似错图(跑 --repair 或全量重跑即可修):'); show(a.risky); }
       if (a.missing.length) { console.log('缺图(跑全量下载补):'); show(a.missing); }
+    } else if (args.includes('--repair-one')) {
+      const ids = args.slice(args.indexOf('--repair-one') + 1).filter(a => !a.startsWith('--'));
+      if (!ids.length) throw new Error('--repair-one 后面要跟密码 id,如 --repair-one 100268004 100268001');
+      let fail = 0;
+      for (const id of ids) {
+        const r = await repairOne(id);
+        if (r.kind !== 'ok') fail++;
+      }
+      console.log(`\n定向修复完成: ${ids.length} 个 id, 失败 ${fail} 个`);
+      if (fail) process.exit(1);
     } else if (args.includes('--repair')) {
       const n = Number(args[args.indexOf('--repair') + 1]) || 200;
       const stats = await repairImages(n);
