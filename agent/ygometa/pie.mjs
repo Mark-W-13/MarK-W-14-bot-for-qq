@@ -87,8 +87,26 @@ function sectorPath(cx, cy, r, a0, a1) {
   const large = a1 - a0 > 180 ? 1 : 0;
   return [`M ${cx} ${cy}`, `L ${p0.x.toFixed(2)} ${p0.y.toFixed(2)}`, `A ${r} ${r} 0 ${large} 1 ${p1.x.toFixed(2)} ${p1.y.toFixed(2)}`, 'Z'].join(' ');
 }
-function bandPath(cx, cy, rOut, rIn, a0, a1) {
-  if (a1 - a0 >= 359.999) {
+/** 采样扇区/圆环的包围盒和近似中心,给单张卡图定位 */
+function arcBox(cx, cy, rOut, rIn, a0, a1) {
+  const pts = [];
+  if (!rIn) pts.push({ x: cx, y: cy });
+  const n = Math.max(8, Math.ceil(Math.abs(a1 - a0) / 10));
+  for (let i = 0; i <= n; i++) {
+    const deg = a0 + (a1 - a0) * i / n;
+    pts.push(polar(cx, cy, rOut, deg));
+    if (rIn) pts.push(polar(cx, cy, rIn, deg));
+  }
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity, sx = 0, sy = 0;
+  for (const p of pts) {
+    minX = Math.min(minX, p.x); maxX = Math.max(maxX, p.x);
+    minY = Math.min(minY, p.y); maxY = Math.max(maxY, p.y);
+    sx += p.x; sy += p.y;
+  }
+  return { x: sx / pts.length, y: sy / pts.length, w: maxX - minX, h: maxY - minY, minX, minY, maxX, maxY };
+}
+
+function bandPath(cx, cy, rOut, rIn, a0, a1) {  if (a1 - a0 >= 359.999) {
     const o1 = polar(cx, cy, rOut, a0), o2 = polar(cx, cy, rOut, a0 + 180);
     const i1 = polar(cx, cy, rIn, a0), i2 = polar(cx, cy, rIn, a0 + 180);
     return [
@@ -156,14 +174,10 @@ export async function renderMetaPie(opt) {
   if (arts.size) log(`  卡组代表图:${arts.size}/${needArt.size} 张`);
 
   let pseq = 0;
-  const mainPat = new Map(), subPat = new Map(), patDefs = [];
-  const patternFor = (name, tile, bucket) => {
-    const a = arts.get(name);
-    if (!a) return null;
-    if (bucket.has(name)) return bucket.get(name);
-    const id = `art${++pseq}`;
-    bucket.set(name, id);
-    patDefs.push(`<pattern id="${id}" patternUnits="userSpaceOnUse" width="${tile}" height="${tile}"><image href="${a.dataUri}" x="0" y="0" width="${tile}" height="${tile}" preserveAspectRatio="xMidYMid slice" opacity="0.92"/></pattern>`);
+  const clipDefs = [];
+  const clipFor = (d) => {
+    const id = `clip${++pseq}`;
+    clipDefs.push(`<clipPath id="${id}"><path d="${d}"/></clipPath>`);
     return id;
   };
 
@@ -224,10 +238,19 @@ export async function renderMetaPie(opt) {
       a = a1;
       const bodyColor = s.isOthers ? OTHERS_COLOR : colorOf(s.name);
       const bodyPath = sectorPath(cx, cy, r, a0, a1);
-      const bodyPat = s.isOthers ? null : patternFor(s.name, 210, mainPat);
-      // 主轴用代表卡插画填充;叠一层淡主轴色,仍能看出图片
-      chart += `<path d="${bodyPath}" fill="${bodyPat ? `url(#${bodyPat})` : bodyColor}" stroke="${PAPER}" stroke-width="2.4" stroke-linejoin="round"/>`;
-      if (bodyPat) chart += `<path d="${bodyPath}" fill="${bodyColor}" opacity="0.20" stroke="none"/>`;
+      const art = s.isOthers ? null : arts.get(s.name);
+      // 主轴:单张代表图,按扇区包围盒铺一块,不重复平铺
+      if (art) {
+        const box = arcBox(cx, cy, r, 0, a0, a1);
+        const clip = clipFor(bodyPath);
+        chart += `<path d="${bodyPath}" fill="${bodyColor}" stroke="none"/>`;
+        // 单张图,中心对准扇区质心;整圈尺寸保证扇区里没有纯色缺口
+        chart += `<image href="${art.dataUri}" x="${box.x - r}" y="${box.y - r}" width="${r * 2}" height="${r * 2}" preserveAspectRatio="xMidYMid slice" clip-path="url(#${clip})"/>`;
+        chart += `<path d="${bodyPath}" fill="${bodyColor}" opacity="0.14" stroke="none"/>`;
+        chart += `<path d="${bodyPath}" fill="none" stroke="${PAPER}" stroke-width="2.4" stroke-linejoin="round"/>`;
+      } else {
+        chart += `<path d="${bodyPath}" fill="${bodyColor}" stroke="${PAPER}" stroke-width="2.4" stroke-linejoin="round"/>`;
+      }
 
       // 只在外圈(rBody..r)叠「显著混轴」的弧段:
       // 占本块 ≥40%,或者本身是露出来的大主轴且在本块 ≥10%;其余混轴不体现颜色。
@@ -241,9 +264,19 @@ export async function renderMetaPie(opt) {
           if (span <= 0) continue;
           const color = topNames.has(b.name) ? colorOf(b.name) : MIX_OTHER_COLOR;
           const band = bandPath(cx, cy, r, rBody, pa, pa + span);
-          const subPatId = patternFor(b.name, 100, subPat);
-          chart += `<path d="${band}" fill="${subPatId ? `url(#${subPatId})` : color}" fill-rule="evenodd" stroke="${PAPER}" stroke-width="1.2"/>`;
-          if (subPatId) chart += `<path d="${band}" fill="${color}" opacity="0.12" fill-rule="evenodd" stroke="none"/>`;
+          const subArt = arts.get(b.name);
+          if (subArt) {
+            const mid = pa + span / 2;
+            const c = polar(cx, cy, (r + rBody) / 2, mid);
+            const clip = clipFor(band);
+            chart += `<path d="${band}" fill="${color}" fill-rule="evenodd" stroke="none"/>`;
+            // 副轴不缩图:直接按原图 256px 盖在弧段上,裁掉多余部分
+            chart += `<image href="${subArt.dataUri}" x="${c.x - 128}" y="${c.y - 128}" width="256" height="256" preserveAspectRatio="xMidYMid slice" clip-path="url(#${clip})"/>`;
+            chart += `<path d="${band}" fill="${color}" opacity="0.10" fill-rule="evenodd" stroke="none"/>`;
+          } else {
+            chart += `<path d="${band}" fill="${color}" fill-rule="evenodd" stroke="none"/>`;
+          }
+          chart += `<path d="${band}" fill="none" stroke="${PAPER}" stroke-width="1.2" fill-rule="evenodd"/>`;
           // 副轴小色块单独引一条线,标签写成「+ 副轴名」
           subs.push({ kind: 'sub', text: `+ ${b.name}`, color, mid: pa + span / 2, share: b.share });
           pa += span;
@@ -308,7 +341,7 @@ export async function renderMetaPie(opt) {
 
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" font-family="'Noto Sans CJK SC','Source Han Sans SC','Microsoft YaHei','PingFang SC',sans-serif">
     ${bg}
-    ${patDefs.length ? `<defs>${patDefs.join('')}</defs>` : ''}
+    ${clipDefs.length ? `<defs>${clipDefs.join('')}</defs>` : ''}
     <g>${chart}</g>
     ${header}
     ${footer}

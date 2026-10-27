@@ -10,6 +10,9 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const CACHE_DIR = join(__dirname, 'cache', 'cardart');
 const MAP_FILE = join(CACHE_DIR, 'map.json');
 const CDN = 'https://cdn.233.momobako.com/ygopro/pics';
+// 个别卡组的代表卡手动钉死(用户指定:狱神用「混绝狱神」)
+const PINNED = { '狱神': 70488851 };
+const PINNED_CARD = { '狱神': '混绝狱神 比托利姆' };
 
 let memo = null; // axis -> { id, mime, dataUri, card }
 let map = null;
@@ -69,6 +72,24 @@ export async function cardArtFor(axis) {
   ensure();
   if (memo.has(axis)) return memo.get(axis);
   const task = (async () => {
+    const pin = PINNED[axis];
+    if (pin) {
+      const img = await downloadArt(pin);
+      if (img) {
+        let card = PINNED_CARD[axis] || axis;
+        if (!PINNED_CARD[axis]) {
+          try {
+            const h = searchCards(String(pin), 1)[0];
+            card = h?.sc_name || h?.cn_name || axis;
+          } catch { /* ignore */ }
+        }
+        const rec = { id: pin, mime: img.mime, card, dataUri: `data:${img.mime};base64,${img.buf.toString('base64')}` };
+        memo.set(axis, rec);
+        map[axis] = { id: pin, card, file: img.file || `${pin}.${img.ext || 'webp'}`, mime: img.mime, ext: img.ext || extOf(img.mime) };
+        saveMap();
+        return rec;
+      }
+    }
     // 对应表优先:手动改 map.json 的 id/file 后直接复用,不再被搜索覆盖
     const mapped = map[axis];
     if (mapped?.id && mapped.file) {
