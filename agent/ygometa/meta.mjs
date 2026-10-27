@@ -49,9 +49,9 @@ const THREADS_FILE = join(CACHE_DIR, 'threads.json');
 
 // 版本号:改了抓取/解析/画图口径就 +1,旧缓存自动失效(不用手删文件)
 const STORE_VERSION = 3;
-const PARSE_VERSION = 11;   // 2026-10-27:标题「XX人 卡组 亚军」按标题名次,不再默认冠军
-const PIE_VERSION = 27;     // 2026-10-27:黯蜜/刻魔归一后的统计
-const PDF_VERSION = 11;     // 2026-10-27:个人战报名次按标题
+const PARSE_VERSION = 13;   // 2026-10-28:磁石战士轴;单卡组战报正文名次
+const PIE_VERSION = 28;     // 2026-10-28:磁石战士纳入统计
+const PDF_VERSION = 13;     // 2026-10-28:磁石战士/正文名次
 
 const FORUM_KW = process.env.YGOMETA_FORUM || '上位卡组';
 const PAGE_RN = Math.min(100, Math.max(20, Number(process.env.YGOMETA_PAGE_RN || 100)));
@@ -551,6 +551,7 @@ const RULES = [
   ['星辰', /星辰/],
   ['光与暗的仪式', /光与暗|光暗/],
   ['转生炎兽', /炎兽/],
+  ['磁石战士', /磁石/],
   ['恐龙', /恐龙/],
   ['魔法师均', /魔法师均/],
   ['混沌道化', /道化/],
@@ -771,6 +772,10 @@ export function analyzeThread(thread) {
   const tr = parseTitleRole(title);
   const firstLine = body.split(/\n/).map(x => x.trim()).filter(Boolean)[0] || '';
   const useDeck = body.match(/(?:使用)?卡组\s*(?!分布|统计|数量|如下)[:：]?\s*([^\n，,。；;]{2,30})/);
+  // 单卡组战报的名次有时不写标题,写在正文前几行(如「135人7轮出16 亚军」)
+  const bodyHead = body.split(/\n/).slice(0, 6).join('\n');
+  const bodyRole = (bodyHead.match(/(冠军|亚军|四强|八强|十六强|优胜)/) || [])[1] || '';
+  const role = tr.role || bodyRole || '上位';
   const score = listScore(body);
   const list = parseRoleList(body);
   const matched = list.filter(x => x.matched);
@@ -780,13 +785,13 @@ export function analyzeThread(thread) {
   if (score >= 2 && matched.length) { entries = matched; mode = 'list'; }
   else if (useDeck && !/^[（(]|合计|如下|分布/.test(useDeck[1].trim())) {
     const parts = splitMulti(useDeck[1]).map(p => canonicalDeck(p)).filter(c => c.name);
-    if (parts.length) { entries = parts.map(c => ({ role: tr.role || '上位', ...c })); mode = 'report'; }
+    if (parts.length) { entries = parts.map(c => ({ role, ...c })); mode = 'report'; }
   }
   if (!entries.length && tr.name) { entries = [{ ...tr }]; mode = 'title'; }
   if (!entries.length && score >= 1 && matched.length) { entries = matched; mode = 'list'; }
   if (!entries.length && firstLine && !LOG_RE.test(firstLine)) {
     const c = canonicalDeck(firstLine);
-    if (c.name) { entries = [{ role: tr.role || '上位', ...c }]; mode = 'report'; }
+    if (c.name) { entries = [{ role, ...c }]; mode = 'report'; }
   }
   if (entries.length > 24) return [];            // 明显解析炸了(一帖 24 个上位),宁可不计
   return entries;
@@ -1825,6 +1830,13 @@ export async function metaSelftest() {
   ok(parseDeckAxes('味美喵').axes.join('|') === '黯蜜', '别名归一:味美喵 → 黯蜜');
   ok(parseDeckAxes('黯蜜').axes.join('|') === '黯蜜', '别名归一:黯蜜', parseDeckAxes('黯蜜').axes.join('+|'));
   ok(parseDeckAxes('魔镌').axes.join('|') === '刻魔', '别名归一:魔镌 → 刻魔');
+  ok(parseDeckAxes('磁石战士').axes.join('|') === '磁石战士', '磁石战士轴');
+  ok(parseDeckAxes('磁石魔救').axes.includes('磁石战士'), '磁石魔救识别为磁石战士', parseDeckAxes('磁石魔救').axes.join('+'));
+  const mag = analyzeThread({
+    title: '10.17简中沈阳巡回赛',
+    text: '10.17简中沈阳巡回赛\n使用卡组:磁石战士\n使用id:顺飞马\n135人7轮出16 亚军\nr1 输骰升月 oo',
+  });
+  ok(mag.length === 1 && mag[0].name === '磁石战士' && mag[0].role === '亚军', '磁石战士单卡组战报按正文亚军', mag.map(x => `${x.role}:${x.name}`).join(','));
   const b = analyzeThread({
     title: '栖风营地卡牌12人冠军',
     text: '使用卡组：D.D.炸药\n第一轮 对战升月白银城 输骰 oo\n四强 对战升月 赢骰 oo\n决赛 对战归光黑魔女黑魔导 输骰 oo',
