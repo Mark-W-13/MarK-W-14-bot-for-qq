@@ -49,9 +49,9 @@ const THREADS_FILE = join(CACHE_DIR, 'threads.json');
 
 // 版本号:改了抓取/解析/画图口径就 +1,旧缓存自动失效(不用手删文件)
 const STORE_VERSION = 3;
-const PARSE_VERSION = 10;   // 2026-10-27:味美喵/黯密→黯蜜(官方简中 sc_name);魔镌→刻魔
+const PARSE_VERSION = 11;   // 2026-10-27:标题「XX人 卡组 亚军」按标题名次,不再默认冠军
 const PIE_VERSION = 27;     // 2026-10-27:黯蜜/刻魔归一后的统计
-const PDF_VERSION = 10;     // 2026-10-27:数量表/附录按官方简中名
+const PDF_VERSION = 11;     // 2026-10-27:个人战报名次按标题
 
 const FORUM_KW = process.env.YGOMETA_FORUM || '上位卡组';
 const PAGE_RN = Math.min(100, Math.max(20, Number(process.env.YGOMETA_PAGE_RN || 100)));
@@ -705,14 +705,13 @@ function roleNorm(r) { return r === '冠' ? '冠军' : r === '亚' ? '亚军' : 
 
 function parseTitleRole(title) {
   const t = cleanText(title).replace(/\s+/g, ' ');
-  let m = t.match(/使用卡组[:：]?\s*([^\s，,。；;]{2,20})/);
-  if (m) return { role: '上位', ...canonicalDeck(m[1]) };
-  m = t.match(/\d+\s*人\s*(冠军|冠|亚军|亚|四强|八强|4强|8强)\s*([^\s，,。；;]{2,20})/);
+  const useDeckTitle = t.match(/使用卡组[:：]?\s*([^\s，,。；;]{2,20})/);
+  let m = t.match(/\d+\s*人\s*(冠军|冠|亚军|亚|四强|八强|4强|8强)\s*([^\s，,。；;]{2,20})/);
   if (m) return { role: roleNorm(m[1].replace('4强', '四强').replace('8强', '八强')), ...canonicalDeck(m[2]) };
   m = t.match(/(冠军|亚军|四强|八强|优胜)\s*[:：，,]?\s*([^\s，,。；;]{2,20})/);
   if (m) return { role: roleNorm(m[1]), ...canonicalDeck(m[2]) };
-  m = t.match(/\d+\s*人\s*([^\s，,。；;]{2,20}?)\s*(?:冠|亚军|四强|八强)(?:$|\s)/);
-  if (m) return { role: '冠军', ...canonicalDeck(m[1]) };
+  m = t.match(/\d+\s*人\s*([^\s，,。；;]{2,20}?)\s*(冠军|冠|亚军|亚|四强|八强|4强|8强)(?:$|\s)/);
+  if (m) return { role: roleNorm(m[2].replace('4强', '四强').replace('8强', '八强')), ...canonicalDeck(m[1]) };
   // 单字「冠/亚」:逐个位置试,后面能认出卡组才算(例:10.24北京泛亚冠原石白龙)
   for (const mm of t.matchAll(/冠(?!军)/g)) {
     const c = canonicalDeck(t.slice(mm.index + 1, mm.index + 21));
@@ -721,6 +720,11 @@ function parseTitleRole(title) {
   for (const mm of t.matchAll(/亚(?!军|冠)/g)) {
     const c = canonicalDeck(t.slice(mm.index + 1, mm.index + 21));
     if (c.matched) return { role: '亚军', ...c };
+  }
+  // 标题写了「使用卡组」但排名在别处:至少别把亚军记成冠军
+  if (useDeckTitle) {
+    const r = t.match(/(冠军|亚军|四强|八强|十六强|优胜)/);
+    return { role: r ? roleNorm(r[1]) : '上位', ...canonicalDeck(useDeckTitle[1]) };
   }
   return { role: '', name: '', matched: false };
 }
@@ -1781,6 +1785,21 @@ export async function metaSelftest() {
     text: '第一轮轮空第二轮对战60烙印OXO第三轮对战道化光与暗仪式OO第四轮直接点负休息了八强对战星辰烙印XOO四强对战奥义耀圣OXO决赛投骰子胜',
   });
   ok(d.length === 1 && d[0].name === '命运英雄', '标题名次+卡组,正文对战记录不算', d.map(x => x.name).join(','));
+  const e = analyzeThread({
+    title: '10.26 成都XX店赛 21人 烙印 亚军',
+    text: '使用卡组：烙印\n第一轮 对战升月 输骰 oo\n四强 对战刻魔 赢骰 oo',
+  });
+  ok(e.length === 1 && e[0].name === '烙印' && e[0].role === '亚军', '标题写亚军不能因为只有一个卡组就记冠军', e.map(x => `${x.role}:${x.name}`).join(','));
+  const f = analyzeThread({
+    title: '10.26 成都XX店赛 21人 烙印 冠军',
+    text: '使用卡组：烙印\n第一轮 对战升月 输骰 oo',
+  });
+  ok(f.length === 1 && f[0].name === '烙印' && f[0].role === '冠军', '标题写冠军仍记冠军', f.map(x => `${x.role}:${x.name}`).join(','));
+  const g = analyzeThread({
+    title: '10.26 成都XX店赛 21人 使用卡组：烙印 亚军',
+    text: '第一轮 对战升月 输骰 oo',
+  });
+  ok(g.length === 1 && g[0].name === '烙印' && g[0].role === '亚军', '标题同时有使用卡组和亚军', g.map(x => `${x.role}:${x.name}`).join(','));
 
   console.log(lines.join('\n'));
   console.log(`\n${lines.length - bad}/${lines.length} 通过`);
