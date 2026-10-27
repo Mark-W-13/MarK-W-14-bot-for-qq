@@ -50,8 +50,8 @@ const THREADS_FILE = join(CACHE_DIR, 'threads.json');
 // 版本号:改了抓取/解析/画图口径就 +1,旧缓存自动失效(不用手删文件)
 const STORE_VERSION = 3;
 const PARSE_VERSION = 14;   // 2026-10-28:补混沌/黑魔导/雷盟/幕帘猫等卡组字段
-const PIE_VERSION = 29;     // 2026-10-28:补卡组字段后的统计
-const PDF_VERSION = 14;     // 2026-10-28:补卡组字段后的数量表
+const PIE_VERSION = 30;     // 2026-10-28:混轴按全局主轴承组 + 同场去重
+const PDF_VERSION = 15;     // 2026-10-28:混轴主轴承组 + 同场去重
 
 const FORUM_KW = process.env.YGOMETA_FORUM || '上位卡组';
 const PAGE_RN = Math.min(100, Math.max(20, Number(process.env.YGOMETA_PAGE_RN || 100)));
@@ -905,30 +905,69 @@ function cacheFresh(period, range) {
 // 主流程
 // =====================================================================================
 
+// 同一个比赛经常有「个人战报 + 完整战报」两个帖子;标题去掉日期/名次/人数后做近似,
+// 用来避免同一副上位被记两次。只用于统计聚合,不改原始 threads。
+function eventTitleKey(title) {
+  return String(title || '')
+    .replace(/20\d{2}\s*[.\-/年]\s*/g, ' ')
+    .replace(/\d{1,2}\s*[.\-/月]\s*\d{1,2}\s*日?/g, ' ')
+    .replace(/[【】\[\]（）()「」《》]/g, '')
+    .replace(/(?:冠军|亚军|四强|八强|十六强|上位|战报|比赛|锦标赛|积分赛|店赛)/g, '')
+    .replace(/\d+\s*人/g, ' ')
+    .replace(/[^\u4e00-\u9fa5A-Za-z0-9]/g, '')
+    .trim();
+}
+function sameEventKey(a, b) {
+  if (!a || !b) return false;
+  if (a === b) return true;
+  const min = Math.min(a.length, b.length);
+  return min >= 4 && (a.includes(b) || b.includes(a));
+}
+
 function aggregate(records) {
-  // 按「主轴」归组:一个卡组只算 1 副,不会因为混轴被重复计数。
-  // 组内再按「一个副轴桶」拆分:纯 / 某个副轴 / 其他混轴,三者相加 = 该组总数。
-  // 规则:副轴如果本身是更大的主轴(已经有自己的整块),就不再在小主轴里重复提它。
-  const groups = new Map();       // 主轴 → { name, num, decks: axes[][] }
-  const axisOcc = new Map();      // 轴 → 含该轴的副数(主/副都算),用于判断谁更大
+  // 一个卡组只算 1 副:混轴先选「全局出现次数最多的轴」当主轴,其余进副轴桶。
+  // 例:原石白龙 2 + 白龙 1 → 白龙 3(纯1 + 原石2),不会拆成原石2 + 白龙1。
+  const items = [];
+  const seenEvents = new Set();   // 同一场比赛只算一次「赛事」
+  const seenEntries = new Map();  // 比赛+名次+卡组 → 已见过的标题 key,防同场双帖
   let posts = 0;
   let entries = 0;
   for (const t of records) {
     const list = t.entries || [];
     if (!list.length) continue;
-    posts++;
+    const day = eventDateFromTitle(t.title, t.create);
+    const ek = eventTitleKey(t.title);
+    const eventKey = `${day}|${ek}`;
+    if (!seenEvents.has(eventKey)) { seenEvents.add(eventKey); posts++; }
     for (const e of list) {
       const axes = (Array.isArray(e?.axes) && e.axes.length ? e.axes : [e?.name]).filter(Boolean);
       if (!axes.length) continue;
-      const primary = axes[0];
-      let g = groups.get(primary);
-      if (!g) { g = { name: primary, num: 0, decks: [] }; groups.set(primary, g); }
-      g.num++;
-      g.decks.push(axes);
-      for (const a of axes) axisOcc.set(a, (axisOcc.get(a) || 0) + 1);
+      const sig = `${day}|${e.role || ''}|${e.name || axes[0]}`;
+      const prev = seenEntries.get(sig) || [];
+      if (prev.some(x => sameEventKey(x, ek))) continue;  // 同场同名的重复战报
+      prev.push(ek);
+      seenEntries.set(sig, prev);
+      items.push({ axes, role: e.role || '', name: e.name || axes[0] });
       entries++;
     }
   }
+
+  // 先统计每个轴在全部样本里的出现次数,再决定混轴的主轴
+  const axisOcc = new Map();
+  for (const it of items) for (const a of it.axes) axisOcc.set(a, (axisOcc.get(a) || 0) + 1);
+  const groups = new Map();       // 主轴 → { name, num, decks: axes[][] }
+  for (const it of items) {
+    let primary = it.axes[0];
+    for (const a of it.axes) {
+      if ((axisOcc.get(a) || 0) > (axisOcc.get(primary) || 0)) primary = a;
+    }
+    const ordered = [primary, ...it.axes.filter(a => a !== primary)];
+    let g = groups.get(primary);
+    if (!g) { g = { name: primary, num: 0, decks: [] }; groups.set(primary, g); }
+    g.num++;
+    g.decks.push(ordered);
+  }
+
   const list = [...groups.values()].map(g => {
     let pure = 0;
     const bmap = new Map();
@@ -1501,7 +1540,7 @@ export async function searchTopDeck(primary, range = null, opts = {}) {
     for (const t of Object.values(store.threads || {})) {
       if (!t?.entries?.length) continue;
       for (const e of t.entries) {
-        if (e?.axes?.[0] === primary) out.push({ thread: t, entry: e, url: t.url || `https://tieba.baidu.com/p/${t.tid}` });
+        if (e?.axes?.includes(primary)) out.push({ thread: t, entry: e, url: t.url || `https://tieba.baidu.com/p/${t.tid}` });
       }
     }
     return out;
@@ -1855,6 +1894,31 @@ export async function metaSelftest() {
   ok(parseDeckAxes('召唤兽阿莱斯特').axes.includes('召唤兽'), '召唤兽轴');
   ok(parseDeckAxes('朱罗纪炎王').axes.join('|') === '朱罗纪|炎王', '朱罗纪/炎王拆轴', parseDeckAxes('朱罗纪炎王').axes.join('+'));
   ok(parseDeckAxes('地中族').axes.includes('地中骇界') && parseDeckAxes('翼神龙').axes.includes('翼神龙'), '地中族/翼神龙轴');
+  const k1 = eventTitleKey('10.18 共青咕咕屋24人迎新杯亚军');
+  const k2 = eventTitleKey('10.18 【共青】咕咕屋迎新杯24人');
+  ok(sameEventKey(k1, k2), '同场不同战报标题可归并', `${k1} / ${k2}`);
+  const agg = aggregate([
+    { title: '10.18 共青咕咕屋24人迎新杯亚军', create: 1792000000, entries: [{ role: '亚军', name: '教导', axes: ['教导'] }] },
+    { title: '10.18 【共青】咕咕屋迎新杯24人', create: 1792000000, entries: [
+      { role: '亚军', name: '教导', axes: ['教导'] },
+      { role: '八强', name: '烙印', axes: ['烙印'] },
+    ] },
+  ]);
+  ok(agg.posts === 1 && agg.entries === 2, '同场个人战报+完整战报不重复计样本', JSON.stringify({ posts: agg.posts, entries: agg.entries }));
+  const agg2 = aggregate([
+    { title: '10.20 A赛 原石白龙', create: 1792000000, entries: [{ role: '冠军', name: '原石白龙', axes: ['原石', '白龙'] }] },
+    { title: '10.21 B赛 原石白龙', create: 1792100000, entries: [{ role: '冠军', name: '原石白龙', axes: ['原石', '白龙'] }] },
+    { title: '10.22 C赛 白龙', create: 1792200000, entries: [{ role: '冠军', name: '白龙', axes: ['白龙'] }] },
+  ]);
+  const white = agg2.list.find(x => x.name === '白龙');
+  ok(white?.num === 3 && white.pure === 1 && white.buckets.some(b => b.name === '原石' && b.count === 2) && !agg2.list.some(x => x.name === '原石'),
+    '混轴按全局主轴承组:原石白龙2+白龙1 → 白龙3', JSON.stringify(agg2.list));
+  const agg3 = aggregate([
+    { title: '10.20 伟魔教导', create: 1792000000, entries: [{ role: '冠军', name: '伟魔教导', axes: ['伟魔', '教导'] }] },
+    { title: '10.21 伟魔教导', create: 1792100000, entries: [{ role: '冠军', name: '伟魔教导', axes: ['伟魔', '教导'] }] },
+    { title: '10.22 教导', create: 1792200000, entries: [{ role: '冠军', name: '教导', axes: ['教导'] }] },
+  ]);
+  ok(agg3.list.find(x => x.name === '教导')?.num === 3 && !agg3.list.some(x => x.name === '伟魔'), '混轴不拆成两个主轴:伟魔教导 + 教导 → 教导3', JSON.stringify(agg3.list));
   const mag = analyzeThread({
     title: '10.17简中沈阳巡回赛',
     text: '10.17简中沈阳巡回赛\n使用卡组:磁石战士\n使用id:顺飞马\n135人7轮出16 亚军\nr1 输骰升月 oo',
