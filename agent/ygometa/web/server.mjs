@@ -98,7 +98,7 @@ function parseYmd(s) {
 }
 
 async function handleQuery(req, res, url) {
-  const ip = String(req.socket.remoteAddress || '');
+  const ip = String(req.headers['x-real-ip'] || String(req.headers['x-forwarded-for'] || '').split(',')[0] || req.socket.remoteAddress || '');
   if (rateLimited(ip)) return json(res, 429, { error: '请求太快了,缓一下再试。' });
   const start = url.searchParams.get('start') || '';
   const end = url.searchParams.get('end') || '';
