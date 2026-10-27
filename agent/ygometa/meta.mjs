@@ -1391,37 +1391,67 @@ export async function downloadTiebaImage(src) {
   return { ...(await shrinkImage(buf, mime)), url };
 }
 
-/** 用 DS 视觉接口读图片底部/角落的卡组名;读不出返回空串 */
-async function readDeckName(buf) {
+/** 解析识图模型返回的严格 JSON;解析不了返回 null(交给旧启发式兜底) */
+function parseVisionVerdict(text) {
+  const raw = String(text || '').trim();
+  if (!raw) return null;
+  const m = raw.replace(/```(?:json)?/gi, '').match(/\{[\s\S]*\}/);
+  let o = null;
+  if (m) { try { o = JSON.parse(m[0]); } catch { o = null; } }
+  if (!o) return null;
+  const yes = v => v === true || /^(yes|true|是|1)$/i.test(String(v ?? '').trim());
+  const no = v => v === false || /^(no|false|否|不是|0)$/i.test(String(v ?? '').trim());
+  const isDeck = no(o.is_deck) ? false : yes(o.is_deck);
+  const mr = String(o.matches ?? o.match ?? '').trim().toLowerCase();
+  // 先判否定:中文「不是」里也含「是」,不能先看正关键词
+  const match = /不是|不同|不匹配|否|(^|[\s"'])no|false/.test(mr) ? 'no'
+    : /同一|匹配|(^|[\s"'])yes|true|^是/.test(mr) ? 'yes' : 'unsure';
+  const confidence = Math.max(0, Math.min(100, Number(o.confidence) || 0));
+  const deckName = String(o.deck_name || o.deck || '').trim().slice(0, 40);
+  return { isDeck, deckName, match, confidence };
+}
+
+/**
+ * 开放识图:不再只读图内文字,而是判断「这是不是构筑图」+「这套构筑是不是 primary」。
+ * 能看卡图/卡名/主卡额外副卡布局;失败返回 null,由旧启发式兜底。
+ */
+async function inspectDeckImage(buf, primary) {
   const key = process.env.DEEPSEEK_API_KEY || process.env.AI_CHAT_API_KEY || '';
-  if (!key) return '';
+  if (!key) return null;
   try {
     const prep = await shrinkImage(buf, 'image/jpeg');
+    const prompt = `你是游戏王 OCG 卡组构筑识别器。只判断这张图本身,不要猜。
+任务:
+1. 这张图是不是「卡组构筑图/卡表」?包括主卡组+额外+副卡的截图、实体卡摆拍、卡组清单。
+   不是:环境饼图、比赛场照、合影、海报、奖品、聊天截图、单卡特写、二维码。
+2. 如果是构筑图,根据图中卡名/卡图判断这套卡组的主轴/类型,并判断是否属于「${primary}」这个卡组(含混轴)。
+   图上写了卡组名就以图上为准;没写就根据卡面判断。
+3. 只输出严格 JSON,不要解释:
+{"is_deck":true或false,"deck_name":"简短卡组名,没有就空字符串","matches":"yes"或"no"或"unsure","confidence":0到100}
+matches 表示与「${primary}」是否同一套卡组;看不出填 "unsure"。`;
     const r = await fetch(process.env.AI_CHAT_API_URL || 'https://api.deepseek.com/chat/completions', {
       method: 'POST',
       headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({
         model: process.env.AI_CHAT_MODEL || 'deepseek-flash',
         reasoning_effort: 'none',
-        max_tokens: 80,
-        temperature: 0.1,
+        max_tokens: 180,
+        temperature: 0,
         messages: [{
           role: 'user',
           content: [
             { type: 'image_url', image_url: { url: `data:${prep.mime};base64,${prep.buf.toString('base64')}` } },
-            { type: 'text', text: '只读出图片底部/角落的卡组名称或标题(通常是一个游戏王卡组名),原样输出;没有就回答:无' },
+            { type: 'text', text: prompt },
           ],
         }],
       }),
-      signal: AbortSignal.timeout(25000),
+      signal: AbortSignal.timeout(30000),
     });
     const j = await r.json().catch(() => null);
-    if (!r.ok) return '';
-    let t = String(j?.choices?.[0]?.message?.content || '').trim();
-    t = t.replace(/^["'“”「」\s]+|["'“”「」\s]+$/g, '').trim();
-    return /^(无|没有|none|null)$/i.test(t) ? '' : t.slice(0, 40);
+    if (!r.ok) return null;
+    return parseVisionVerdict(j?.choices?.[0]?.message?.content || '');
   } catch {
-    return '';
+    return null;
   }
 }
 
@@ -1504,7 +1534,7 @@ export async function searchTopDeck(primary, range = null, opts = {}) {
         .sort((a, b) => b.score - a.score);
       // 帖子有「图N: ...」图注时,只认图注里真的提到该卡组的图;
       // 图注只有「场照 / 八强上位 / 环境分布」而没有该卡组 → 整帖跳过,换下一个来源。
-      let needsVision = false;
+      const visionOn = !!(process.env.DEEPSEEK_API_KEY || process.env.AI_CHAT_API_KEY);
       const labeled = ranked.filter(x => x.im.label);
       if (labeled.length) {
         const exact = ranked.filter(x => x.im.label && parseDeckAxes(x.im.label).axes.includes(primary));
@@ -1524,21 +1554,12 @@ export async function searchTopDeck(primary, range = null, opts = {}) {
           if (roles > 1 || /以下图片|按顺序|图片对应|名单[:：]/i.test(near)) return false;
           return true;
         });
-        if (nearHits.length) {
-          ranked = nearHits;
-        } else {
-          // 没图注又多图:不猜。只有 1~3 张、且正文明确提卡组/构筑/卡表才敢用
-          const allText = `${threadText} ${imgs.map(im => im.postText || '').join(' ')}`;
-          const strong = /卡组|构筑|卡表|主卡|额外|side|deck/i.test(allText);
-          if (imgs.length > 3 || (imgs.length > 1 && !strong)) {
-            log(`  多图但无图注/无卡组关键词,不猜图,换下一个来源 ...`);
-            continue;
-          }
-          if (imgs.length > 1) needsVision = true;   // 无图注多图:读图里的卡组名再选
-        }
+        // 不再因为「多图/没有图注」直接放弃;交给识图逐张判断是不是对应构筑
+        if (nearHits.length) ranked = nearHits;
       }
       const prepared = [];
-      for (const { im } of ranked.slice(0, 5)) {
+      const maxPrep = visionOn ? 4 : 1;
+      for (const { im } of ranked.slice(0, 6)) {
         if (im.label && !(primary && im.label.includes(primary))
           && /场照|环境|店|token|海报|合影|奖品|场地|活动|现场|裁判/i.test(im.label)) {
           log(`  跳过非卡组图:${im.label.slice(0, 30)} ...`);
@@ -1552,7 +1573,7 @@ export async function searchTopDeck(primary, range = null, opts = {}) {
             continue;
           }
           prepared.push({ im, image });
-          if (prepared.length >= (needsVision ? 2 : 1)) break;
+          if (prepared.length >= maxPrep) break;
         } catch (e) {
           log(`  图 ${im.src.slice(-40)} 下载失败:${e.message}`);
         }
@@ -1561,15 +1582,37 @@ export async function searchTopDeck(primary, range = null, opts = {}) {
         log(`  帖 ${c.thread.tid} 没有可用图片,换下一个 ...`);
         continue;
       }
-      if (needsVision) {
-        for (const x of prepared) x.name = await readDeckName(x.image.buf);
-        log(`  图内卡组名:${prepared.map(x => x.name || '(无)').join(' / ')}`);
-        const hit = prepared.find(x => x.name
-          && (x.name.includes(primary) || parseDeckAxes(x.name).axes.includes(primary)));
-        if (!hit) {
-          log(`  图内卡组名对不上「${primary}」,换下一个来源 ...`);
+      if (visionOn) {
+        const inspected = [];
+        for (const x of prepared) {
+          const v = await inspectDeckImage(x.image.buf, primary);
+          inspected.push({ ...x, v });
+          if (v) {
+            log(`  识图 ${x.im.label || x.im.src.slice(-28)}: deck=${v.isDeck ? 'Y' : 'N'} match=${v.match} conf=${v.confidence}${v.deckName ? ` name=${v.deckName}` : ''}`);
+          } else {
+            log(`  识图失败 ${x.im.label || x.im.src.slice(-28)}`);
+          }
+        }
+        const got = inspected.filter(x => x.v);
+        if (!got.length) {
+          log(`  识图接口不可用,不发图,换下一个来源 ...`);
           continue;
         }
+        const contextHit = x => {
+          const s = `${x.im.label || ''} ${x.im.nearText || ''} ${x.im.postText || ''} ${threadText}`;
+          return s.includes(primary) || parseDeckAxes(s).axes.includes(primary);
+        };
+        const usable = got
+          .filter(x => x.v.isDeck && x.v.match !== 'no'
+            && (x.v.match === 'yes' || x.v.confidence >= 65 || contextHit(x)))
+          .sort((a, b) => (a.v.match === 'yes' ? 0 : 1) - (b.v.match === 'yes' ? 0 : 1)
+            || b.v.confidence - a.v.confidence);
+        if (!usable.length) {
+          log(`  识图判断都不是「${primary}」构筑,换下一个来源 ...`);
+          continue;
+        }
+        const hit = usable[0];
+        log(`  选构筑图:${hit.im.label || hit.im.src.slice(-28)} (${hit.v.deckName || primary})`);
         return {
           ...c, image: hit.image, attempts, target, list,
           eventDate: eventDateFromTitle(c.thread.title, c.thread.create),
@@ -1800,6 +1843,14 @@ export async function metaSelftest() {
     text: '第一轮 对战升月 输骰 oo',
   });
   ok(g.length === 1 && g[0].name === '烙印' && g[0].role === '亚军', '标题同时有使用卡组和亚军', g.map(x => `${x.role}:${x.name}`).join(','));
+  const v1 = parseVisionVerdict('```json\n{"is_deck":true,"deck_name":"烙印","matches":"yes","confidence":88}\n```');
+  ok(v1?.isDeck && v1.match === 'yes' && v1.deckName === '烙印', '识图判定:构筑图且匹配', JSON.stringify(v1));
+  const v2 = parseVisionVerdict('{"is_deck":false,"deck_name":"","matches":"no","confidence":95}');
+  ok(v2?.isDeck === false && v2.match === 'no', '识图判定:不是构筑图', JSON.stringify(v2));
+  const v3 = parseVisionVerdict('{"is_deck":true,"deck_name":"闪刀姬","matches":"不是","confidence":90}');
+  ok(v3?.match === 'no', '识图判定:不是同一卡组(中文否定)', JSON.stringify(v3));
+  const v4 = parseVisionVerdict('{"is_deck":true,"deck_name":"闪刀姬","matches":false,"confidence":90}');
+  ok(v4?.match === 'no', '识图判定:布尔 false 也是不匹配', JSON.stringify(v4));
 
   console.log(lines.join('\n'));
   console.log(`\n${lines.length - bad}/${lines.length} 通过`);
