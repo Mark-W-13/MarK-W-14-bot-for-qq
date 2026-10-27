@@ -1,5 +1,5 @@
 // AI 闲聊的消息解析(2026-09-13 落地):把一条 QQ 消息里除文字以外的东西全部还原成模型看得懂的文字
-//   ① @某人      → 查群名片换成「@昵称」(机器人自己被 @ → 「@你(史官)」)
+//   ① @某人      → 查群名片换成「@昵称」(机器人自己被 @ → 「@你(史官)」,deps.botName 可换人格称呼)
 //   ② 引用消息   → get_msg 取回被引的那条,摊平成「[引用 @昵称: 内容]」(它自己带图也一并识别)
 //   ③ QQ 表情    → face id 查表换成「[表情:微笑]」(表见同目录 qq_faces.json)
 //   ④ 图片/表情包 → 两条路,由 AI_CHAT_IMAGE_MODE 选:
@@ -364,6 +364,7 @@ const DESC_MAX_CHARS = Number(process.env.AI_CHAT_IMG_TEXT_MAX || 1500);   // �
 // 实测:同一张 780x700 的图,不提分段能抄满 29 行,一提「第 1/2 段」就只抄 11 行收工。
 // 分块对模型透明:它只看见一张图,照抄即可;拼接与去重由 stitchText 负责。
 function visionAsk(seg) {
+  if (seg?.visionPrompt) return seg.visionPrompt;
   const sticker = isSticker(seg);
   const what = sticker ? '一张自定义表情(表情包)' : '一张图片(可能是截图/照片/梗图,常来自群聊或网页)';
   return [
@@ -379,8 +380,7 @@ function visionAsk(seg) {
 }
 
 // 一块图 → 视觉模型原始输出(未解析)
-async function visionRaw(buf, seg) {
-  const r = await fetch(glmUrl(), {
+async function visionRaw(buf, seg) {  const r = await fetch(glmUrl(), {
     method: 'POST',
     headers: { Authorization: `Bearer ${glmKey()}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -402,6 +402,11 @@ async function visionRaw(buf, seg) {
   // 输出被 token 上限截断 —— 标出来,免得对话模型以为图上就这么多字
   if (j?.choices?.[0]?.finish_reason === 'length') text += '…(这一段没抄完)';
   return text;
+}
+
+/** 只读图上的字(给上位检索核对卡组名用);buf 需是 JPEG/PNG,建议 ≤1200px */
+export async function readImageText(buf, prompt) {
+  return visionRaw(buf, { visionPrompt: prompt });
 }
 
 /** 单张图(可能切了多块)→ 一行「描述;文字:…」;模型不按格式来时原样压成一行(内容一条不丢) */
@@ -497,7 +502,9 @@ async function fetchQuote(id, deps) {
 
 async function nameOf(qq, deps) {
   if (!qq) return '';
-  if (qq === botIdOf(deps)) return '你(史官)';
+  // deps.botName 让「人格换了」的调用方(银河皇帝)把「你(史官)」换成「你(贝利亚)」;
+  // 不传就是老行为,AI 闲聊/贴吧模式/自测都不受影响。
+  if (qq === botIdOf(deps)) return `你(${deps.botName || '史官'})`;
   try { return (await deps.memberName?.(qq)) || `成员${qq}`; }
   catch { return `成员${qq}`; }
 }
@@ -506,7 +513,7 @@ async function nameOf(qq, deps) {
 function renderToken(tk, descs, deps, opts = {}) {
   switch (tk.kind) {
     case 'text': return tk.text;
-    case 'at': return tk.qq === botIdOf(deps) ? '@你(史官)' : (tk.name ? `@${tk.name}` : (tk.qq ? `@成员${tk.qq}` : '@某人'));
+    case 'at': return tk.qq === botIdOf(deps) ? `@你(${deps.botName || '史官'})` : (tk.name ? `@${tk.name}` : (tk.qq ? `@成员${tk.qq}` : '@某人'));
     case 'face': return `[表情${faceLabel(tk.id) ? ':' + faceLabel(tk.id) : (tk.id ? '#' + tk.id : '')}]`;
     case 'image': {
       const what = isSticker(tk) ? '表情包' : '图片';
@@ -544,7 +551,7 @@ async function prepareTokens(entry, deps = {}, segs = null) {
     tk.inner = parseSegments(q.segs);
   }
 
-  // @ → 昵称(机器人自己被 @ 固定渲染成「你(史官)」,不必查群名片)
+  // @ → 昵称(机器人自己被 @ 固定渲染成「你(史官)」,deps.botName 可换;不必查群名片)
   for (const tk of tokens) {
     if (tk.kind === 'at' && tk.qq !== botIdOf(deps)) tk.name = await nameOf(tk.qq, deps);
   }
@@ -641,6 +648,9 @@ async function selftest() {
   console.log(`  渲染: ${rendered}`);
   assert(rendered.includes('[引用 @小明: 这也太帅了[图片(没能识别)]]'), '引用摊平 + 引用里的图一并处理');
   assert(rendered.includes('@你(史官)') && rendered.includes('@sayori'), '@ 换成昵称');
+  // 换了人格的调用方(银河皇帝)可以改掉「史官」这个称呼,别让提示词里还留着旧身份
+  const renderedBelial = await buildQuestion({ text: 'x', segs: raw, group_id: 1 }, { ...deps, botName: '贝利亚' });
+  assert(renderedBelial.includes('@你(贝利亚)') && !renderedBelial.includes('@你(史官)'), 'botName 可换人格称呼(贝利亚)');
   assert(rendered.includes('[表情:流泪]'), '表情 id 换成名字');
   assert(rendered.includes('[表情包(没能识别)]'), '表情包(sub_type=1)按表情包渲染');
 

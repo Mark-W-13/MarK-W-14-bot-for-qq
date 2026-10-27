@@ -4,7 +4,7 @@ QQ 机器人「测试bot.fd」(QQ 3757588606)的自动回复系统,两个功能:
 
 1. **史记总结**:群里 **@机器人 且消息含「史记总结」** 时,拉取该群最近 100 条消息,用**史记体文言文**总结/回答(走 Claude,无头生成)。
 2. **卡牌查询**:**@机器人 + 「效果 」+卡名**(触发词「效果」后须带空格,防「效果怪兽」等误触发;如 `@机器人 效果 青眼白龙` 或 `@机器人 效果 青眼 白龙` 空格分隔多关键词 AND 查询)时,从**本地卡库**查询并输出**最匹配的一张**的卡牌信息(中文名/日文名/类型/星级/攻防/效果文本)。纯本地运行,不依赖 AI。卡库来自百鸽 ygocdb 全量数据(14260 张,2026-08 更新)。@消息可识别真 @ 或纯文本「@昵称」。
-3. **卡图查询**:**@机器人 + 「卡图 」+卡名**,检索逻辑与「效果」完全相同(多关键词空格分隔 AND,取最匹配一张),但**只发送该卡的卡图**(图片段,base64 直发)。卡图数据库来自 ygoprodeck 全量图片,按官方密码 id 存于 `agent/ygocard/cards_img/{id}.jpg`,由 `agent/ygocard/download_images.mjs` 下载(可重跑续传,失败清单 `cards_img/failed.log`)。
+3. **卡图查询**:**@机器人 + 「卡图 」+卡名**,检索逻辑与「效果」完全相同(多关键词空格分隔 AND,取最匹配一张),但**只发送该卡的卡图**(图片段,base64 直发)。卡图数据库来自 ygoprodeck 全量图片 + 百鸽镜像回退,按官方密码 id 存于 `agent/ygocard/cards_img/{id}.jpg`,由 `agent/ygocard/download_images.mjs` 下载(可重跑续传,失败清单 `cards_img/failed.log`)。**新密码段(1 亿段,如 100268xxx)只走回退源** —— 见下文「卡图错配事故」。
 4. **每日一卡**:群里 **@机器人 且消息含「每日一卡」** 时,从卡库随机抽一张卡回复完整信息,**先文字后卡图**; **同一 QQ 同一自然日内重复申请返回同一张卡,每日 0 点刷新换卡**(状态持久化于 `agent/daily_card.json`)。
 5. **框神语录**:持续追踪「框神」(QQ 3080580848,群昵称「回归光恶魔」)在**复旦邻里交流群 (793874011)** 的发言,建本地语录库(初建于 2026-08-28,3 个月 1486 条)。**@机器人 且消息含「框神语录」** 时,从**精筛后**的语录中随机抽一条回复。采集双通道:WS 实时监听(该群该用户所有发言,无需 @)+ 启动/重连时增量回填历史(遇库内已知消息即停,离线期间漏收的自动补上)。
 
@@ -25,7 +25,7 @@ QQ 机器人「测试bot.fd」(QQ 3757588606)的自动回复系统,两个功能:
 
     **@ 提及渲染(2026-09-20 修,踩得很深的坑)**:此前群聊上下文里的 @ **一律变成「@all」**——包括 @机器人自己。根因是**键类型不一致**:`get_group_msg_history` 给的 `user_id` 是 **number**,而消息段里 `at.data.qq` 是 **string**(线上实测:发言者 `user_id: 2186220790`,段里 `qq: "2186220790"`),`names` 表按 number 建、按原样查 → 永远查不中,于是全部落到兜底分支 `'@all'`。现在四类分得清:**@某人 → `@真实群昵称`**(表键统一 `String`)、**@全体成员 → `@全体成员`**(`qq: 'all'`,不再当成人,也不进 `targets`)、**@机器人自己 → `@你(史官)`**(与 aichat 口径一致,提问正文里仍会被剥掉)、**查不到名字 → `@成员<qq>`**(绝不写 `@all`)。被 @ 的人若**没在本批记录里发过言**,会额外批量问一次群成员接口(单批最多 12 人)把真昵称回填进名单,尽力而为、失败不影响正文。修的是群聊记录(`agent/monitor.mjs` 的 `segText`/`atText`/`fetchTranscript`),**AI 闲聊上下文与「史记总结」共用这条路**,两处一起好。自测:`node monitor.mjs --selftest-at`(钉住「谁在 @ 谁」,含 number/string 两种键、@全体、@自己、查不到名字等用例)。
 
-**卡库更新**:monitor 控制台按 `u` 手动更新;或启动参数 `node monitor.mjs --update-cards` 启动即更新。流程:下载 cards.zip → 校验(JSON 完整性+卡数阈值,md5 仅参考) → 解压 → 原子替换 → 内存重载 → **自动同步下载缺失卡图**(跳过已有,增量很快),失败不影响旧卡库。也可单独跑 `node agent/ygocard/download_images.mjs` 补卡图。
+**卡库更新**:monitor 控制台按 `u` 手动更新;或启动参数 `node monitor.mjs --update-cards` 启动即更新。流程:下载 cards.zip → 校验(JSON 完整性+卡数阈值,md5 仅参考) → 解压 → 原子替换 → 内存重载 → **自动同步下载缺失卡图**(跳过已有,增量很快),失败不影响旧卡库。也可单独跑 `node agent/ygocard/download_images.mjs` 补卡图;卡图错配时跑 `node agent/ygocard/download_images.mjs --repair` 修(见下文「卡图错配事故」)。
 
 8. **炉石传说系列(2026-09-20 新增)**:整个炉石功能**由分群模式开关控制**——群里 @机器人 说「**mode 炉石**」切到炉石(说「mode 游戏王」切回),**默认游戏王**(老行为不变)。状态存 `agent/modes.json`,**键是群号**(`{"793874011": "hs"}`),**每个群各记各的**,一次设置后一直沿用;opsweb 运维台有「游戏模式」卡片可直接点(与群里发指令等价、即时生效)。**只影响游戏王/炉石相关功能**——史记总结、AI 闲聊、搬屎、框神语录**都与模式无关,照旧**。「mode」也可以写成「模式」。
 
@@ -59,7 +59,40 @@ QQ 机器人「测试bot.fd」(QQ 3757588606)的自动回复系统,两个功能:
 
     自测:`node monitor.mjs --tieba-selftest`(离线跑:关键词排除边界 / 分群开关 / 概率语义 / **整条出话链路**——mock 掉网络,验证「渲染上下文 → 叫模型 → 按条连发」且发出去的段里没有任何 @)、`node agent/tieba/tieba.mjs --selftest`;`node agent/tieba/tieba.mjs --prompt` 可随时打印当前提示词。**不收录**地域黑、开盒人肉、涉政话术,也**禁止编造具体的性污蔑/违法指控**(那是造谣,实测不加约束模型会往那儿滑)。
 
+10. **银河皇帝模式(2026-10-26 新增,隐藏人格)**:群里 **@机器人 说「银河皇帝」**(「银河皇帝模式」也行,模式名本身就是关键词)→ 本群切成「银河皇帝贝利亚」,说「银河皇帝 关」切回、「银河皇帝状态」查状态。**默认全部群关闭**,分群状态存 `agent/belial/state.json`;运维台「银河皇帝模式」卡片只露一个「打开控制台…」按钮,弹窗里按群开关 + **折叠的表情包库**(查看 / 删除 / 上传,单张 ≤5MB,jpg/png/gif/webp 按文件头校验)。表情包在 `agent/belial/stickers/`(预置 12 张 400px 贝利亚梗图)。**人设按真实语料重写**(2026-10-26 抓了 10 个贝利亚梗视频 2647 条评论,其中 46 个贝利亚头像/名称用户的 54 条发言:中位数 7 字、76% 不带标点、「本皇帝」出现 0 次、「本大爷」3 次),并配了原剧/电影 + 贝利亚黄昏 15 句台词库。**不给固定回复表**:提示词只给「反应方向」,并把本群最近说过的几句话塞回去(别重复),让模型自己组织;同时**默认开 AI 思考**生成(`BELIAL_THINK=1`,`=0` 关,回复更快)。**表情包也交给模型**:不再按概率自动发,模型可以调 `list_stickers` / `send_sticker` 自己决定发不发、发哪张(一次最多 2 张);还给了 `web_search`(DeepSeek 官方 Search API)、`search_stickers`(360 图片搜索)、`download_sticker`(公网图片下载进库,SSRF/大小/格式三重校验)三个工具。**开着模式后模型会忘掉助手身份,只当贝利亚**:回复 **1~3 句、一句一条**(第一条 @ 触发者,后续不 @),表情包由模型安排、**独立成条**发。**故意不写进 `/help`**(用户要求):隐藏开关不摆给群友看。与贴吧模式同时开着时,**@ 的消息归银河皇帝、不 @ 的普通群聊仍归贴吧鱼**。自测 `node agent/monitor.mjs --belial-selftest`、`node agent/belial/belial.mjs --selftest`、`node agent/belial/deepsearch.mjs --selftest`、`node agent/belial/stickersearch.mjs --selftest`。
+
 > **开发中(默认关闭)**:搬屎功能(随机一搬 = 屎视频源库随机发封面截图;精选一搬 = 规则粗筛 + AI 精筛评论截图)代码在 `agent/shitpost/`,monitor 已接线但需 env `SHIT_ENABLED=1` 才启用,默认不上线。
+
+11. **游戏王环境饼图(2026-10-26 新增)**:游戏王模式下,群里 **@机器人 说「近期环境」/「环境 10月」/「环境 9.1-9.15」** 时,**只回一张带时间段标记的饼图** —— 不 @ 触发者、不带任何说明文字(用户明确要求)。数据来自**百度贴吧「上位卡组吧」**的赛事战报,按时间段抓取、整理**上位卡组**(冠军/亚军/四强/八强),按**主轴**统计占比;混轴卡组不重复计数,只有显著的混轴才用外圈弧段显示占比(弧度)。**时间段后加 pdf**(如「环境 10月 pdf」「近期环境 pdf」)→ 只上传一份 **PDF**:首页是饼图 + **全部主轴名称/数量表**(三栏),每行写成 **`总数（纯 X + 副轴1 数量 + 副轴2 数量 + 其他混轴 数量）`**(最多列 2 个副轴,其余并「其他混轴」;比本轴大的副轴已有自己的整块,不重复列);后面附录页是**三栏详细上位记录**(无分隔线、字号适中),同样不 @、不多余回复。
+
+    **触发与时间段**:触发词是「环境」/「近期环境」/「最新环境」/「当前环境」/「上位环境」/「环境饼图」/「环境分布」/「饼图」/「meta」,必须**整句开头**(前面可带「游戏王/OCG」);后面可跟时间段,不跟就是**近 7 天**。支持:`近三天` / `近一周` / `近半个月` / `近一个月` / `今天` / `昨天` / `本周` / `上周` / `本月` / `上月` / `今年` / `去年` / `10月` / `2026-09` / `2026年9月` / `9.1-9.15` / `2026-09-01~2026-09-15` / `10月1日到10月7日`。**时间段解析不了就不触发**(「环境怎么样」照旧走 AI 闲聊),最长回溯 210 天(超出会截断并在图里标注)。
+
+    **数据源与踩坑(2026-10-26 实测定论)**:从本机与服务器直连 `tieba.baidu.com` 的 `/f`、`/p` 全部 **403**(机房 IP 被拦),无头 Chrome 打开也是「百度安全验证」滑块页;但**带 sign 的贴吧客户端 JSON 接口** `c.tieba.baidu.com/c/f/frs/page` 正常返回,且 **`sort_type=1` 是按发帖时间倒序**,配合 `rn=100` 一页 100 条,可以按时间段一页页翻(第 1 页是贴吧的「推荐」小页,跳过)。sign = `MD5(ASCII 升序的 key=value 串 + "tiebaclient!!!")` 转大写。接口只读、不带 cookie、不碰用户隐私;请求间隔 280ms。
+
+    **缓存(用户要求:先查缓存,没有才爬)**:`agent/ygometa/cache/` 下分四层——`pages/`(列表页,按小时分桶,1 小时内重复请求不再联网)、`threads.json`(已抓帖子按 tid 存,**跨时间段复用**)、`periods/`(某时间段的统计结果)、`charts/`(该时间段的 PNG)。**同一时间段第二次问直接命中缓存**,不联网也不重画;近期范围缓存 2 小时、历史范围 30 天。缓存目录已 gitignore、`sync-server.ps1` 也不上传(运行时数据)。
+
+    **统计口径**:贴吧战报有两种写法,必须分开处理,否则会把**对手的卡组**算成上位——① 榜单型(「冠军：A,卡组:X / 亚军：...」)逐条取卡组;② 个人战报(「使用卡组:X ... 八强 对战升月」)只取作者自己的 X,正文「对战XX」是**对手**,不算。判定看正文有没有「榜单行」(行首名次、且不含对战/赢骰/轮次等记录词)。卡组名再做归一化(魔∀丽丝/码丽斯/玛丽丝→码丽丝、杀旋→杀手旋律、雷火剑→雷火沸动、光与暗/光暗→光与暗的仪式、**加辉瑞月/加瑞辉月/升月→盈彩月夜**(同一套卡组的不同译名,卡库官方名是「盈彩月夜」)……),认不出的玩家名/碎话直接丢,免得饼图里出现「鑫宇」「分了」这种块。
+
+    **混轴处理(2026-10-26 晚用户要求)**:卡组名拆成多个「轴」(烙印光与暗 → 烙印 + 光与暗的仪式;狱神艺术耀圣 → 狱神 + 奥艺 + 耀圣)。统计时**一个卡组只算 1 副**,归到它的**主轴**(名字里第一个认出的轴),不会因为混轴重复计数。组内再拆成**纯 / 副轴桶 / 其他混轴**,三者相加等于该主轴总数;每副只归一个桶,不重复。**副轴如果本身是更大的主轴**(总占比更大,已经有自己的整块),就不在小主轴里重复提它;只有更小的副轴才进括号。**只有显著的混轴才在外圈显示颜色**:某条混轴桶占本块 ≥40%,或者它本身是露出来的大主轴且在本块 ≥10% 时,才在该饼块外缘画一小段弧(弧度 = 桶占比);其余混轴不体现颜色。**不单独画外圈/内圈线**——饼体整块是主轴色,混轴弧段直接叠在边缘。主轴标签只写主轴;**副轴那个小色块单独引一条线**,标签写成「**+ 副轴名**」(浅色小字)。PDF 数量表写成 **`总数（纯 X + 副轴1 数量 + 副轴2 数量 + 其他混轴 数量）`**,最多列 2 个副轴,其余并「其他混轴」。为了好看,**只露 6~7 个主轴**(某个主轴占比特别大时自动减到 5/4/3 个),其余合并成「其他」;**不放图例**;样本数量放右上角。图下方写明「混轴显著时才显示外圈弧段(≥本块40%,或大主轴≥10%),样本不重复」。
+
+    **饼图**:`https://onelegocg.top/` 的饼图是**纯前端 SVG 渲染**(数据在 `/data/*.json`、画图逻辑在 `/dist/app.js`),**没有可调用的生成接口**,所以这里自己画、只借鉴观感。**2026-10-26 晚用户反馈第一版不好看、卡图先不要**,随后又按用户意见改成:**浅色暖底 + 大饼图居中 + 外引主轴标签(副轴小色块单独引线写「+ 副轴名」)+ 右上角样本数**;不放图例;只露 6~7 个主轴(占比集中时更少),其余合并成「其他」;每个主轴一种颜色,**不单独画外圈/内圈线**,只有显著混轴才在饼块外缘叠一小段别的卡组颜色;不插入任何卡图。渲染走 **Chrome headless `--screenshot`**(与完整裁定 PDF 同一条路,中文由系统字体处理),**1.5x 输出 2040px 宽**(2x 的图约 1.96MB,实测 OneBot 上传会失败;1.5x 约 1.23MB)。图里固定带**时间段标签**(如「2026-10-01 ~ 2026-10-26」)、**醒目的数据来源「百度贴吧 · 上位卡组吧」**(标题下方的胶囊 + 页脚各一处)、样本副数/赛事场数/主轴数、统计口径与生成时间;抓取触顶时加「数据可能不全」。
+
+    **自测与手动跑**:`node agent/monitor.mjs --ygometa-selftest`(离线:时间段 / 触发词 / 归一化 / 榜单 vs 个人战报,不联网);`node agent/ygometa/meta.mjs --selftest` 同一套;`node agent/ygometa/meta.mjs --trigger "环境 10月"` 只看解析;`--chart 2026-10-01 2026-10-26 [--out x.png] [--force]` 真抓真画;`--pdf 2026-10-01 2026-10-26 [--out x.pdf] [--force]` 生成带三栏记录的 PDF;`--top "上位 烙印 10月" [--out x.jpg]` 测上位检索;`node agent/monitor.mjs --ygometa-send <群号> "环境 10月 pdf"` 走完整分流把 PDF 发到指定群(测试群 `680774660`)。
+
+12. **上位卡组检索(2026-10-26 新增)**:关键词**只有「上位」**,不依赖「环境」,格式 `上位 卡组 [时间]`,如「上位 烙印」「上位 烙印 10月」「上位 光与暗 9.1-9.15」。**时间可省略,省略时按收到消息的当前日期找最近**。抓取上位信息时每条帖子存 `url`(原帖 `https://tieba.baidu.com/p/<tid>`),entry 里保留主轴/副轴和名次;检索时先查本地 `threads.json`,按 **entry.axes[0] === 查询主轴** 过滤,按距目标时间由近到远排序;**一次返回最近 5 场不同比赛的文字 + 原帖链接,但只抓 1 张构筑图**(图片标在对应条目上)。图片取自原帖 1 楼(贴吧客户端 `c/f/pb/page`,`tiebapic` 换 `imgsrc` 拿原图)。**抓图时先过文本/图注/尺寸**:有「图N: 冠军 烙印」这类图注时,只认图注里真的出现该卡组的图,图注只有场照/环境/店/八强上位而没有该卡组就整帖跳过;没有「图N」时看**图片紧邻的正文**,附近出现该卡组(如「使用卡组:混沌月光」)且不是饼图/场照,就优先那张;没图注又多图且正文没有「卡组/构筑/卡表」时不猜。**多图仍分不清时,用 DS 视觉接口直接读图片底部/角落的卡组名,匹配查询主轴才发;读不出或对不上就不发图**。场照/合影/海报/238×238 占位图/横幅降权或过滤。**没找到可信构筑图时只发 5 条文字(标注「未找到可信的构筑图」),不发错图**;图片失败就换**次近**来源,一次问询最多试 **2 个来源**。成功时返回两条:第一条 5 条 `日期 · 名次 · 卡组名` + 比赛标题 + 原帖链接,第二条构筑图片。图片接口/帖子图缓存 7 天;图片超过约 1.2MB 用 ffmpeg 压到 1200px JPEG,避免 OneBot 发图失败;`--top` 可单独测。
+
+    **同卡异名自检(2026-10-27 新增)**:`node agent/ygometa/meta.mjs --deck-alias-check` 会把 `threads.json` 里所有提取到的轴字段拿到**本地百鸽卡库**逐条搜,按「搜出来的第一张卡 id」分组;同一张卡的不同字段就是疑似同一套卡组。输出 `[已归一]` / `[待确认]`,并做已知别名回归(味美喵/黯蜜、魔镌/刻魔)。**官方简中名以百鸽 `sc_name` 为准**(不是 `cn_name`):所以 `味美喵` 归一到 **黯蜜**(`黯蜜★史拿奇`),不是反过来。**抓取更新完 threads.json 后会自动跑一次**,报告写到 `agent/ygometa/cache/alias_report.txt`,不参与每次查询、不反复跑;确认新别名后并进 `RULES`。当前已归一二组:**味美喵/黯密 → 黯蜜**、**魔镌 → 刻魔**。
+
+
+## 部署约定(2026-10-26)
+
+本仓库就是**服务器端代码**。以后改完服务器端代码,直接运行:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File sync-server.ps1
+```
+
+它会**备份线上现有代码 → 打包上传 → 远端语法检查 → 重启 `mc-agent` / `opsweb` → 验证**(opsweb 200、贝利亚表情包数量、monitor 横幅)。**只同步代码与静态数据**(`agent/*.mjs`、`agent/belial/stickers`、`qq_faces.json`、README/.gitignore),**不碰运行时状态**:`inbox.jsonl` / `processed.jsonl` / `features.json` / `modes.json` / `tone.json` / `tieba/state.json` / `belial/state.json` / 卡库 / 卡图 / 每日一卡 / 统计。服务器:`w-13@192.144.153.94:~/mc_agent`,备份在服务器 `~/backups/`。
 
 ## 系统组成
 
@@ -73,12 +106,18 @@ QQ 机器人「测试bot.fd」(QQ 3757588606)的自动回复系统,两个功能:
 | 炉石卡组入库 | `agent/hs/hs_meta_refresh.mjs` | 从文章页抠卡组代码入库(解码校验+去重);CLI `<URL…> [--dry]` |
 | 分群游戏模式 | `agent/modes.mjs` | `agent/modes.json`(群号→ygo/hs),monitor 与 opsweb 共用;CLI 无参看表、`<群号> [模式]` 读/写 |
 | 贴吧模式 | `agent/tieba/tieba.mjs` | 不用 @ 的全自动接话:分群开关与接话概率(`agent/tieba/state.json`)+ 贴吧鱼提示词与贴吧语料库 + 连发拆分;CLI `--selftest / --prompt`,或 `<群号> on\|off` 读/写开关 |
+| 银河皇帝模式 | `agent/belial/belial.mjs` | 银河皇帝贝利亚人格 + 分群开关(`agent/belial/state.json`)+ 表情包库(`agent/belial/stickers/`,查看/删除/上传);CLI `--selftest / --prompt / --stickers`,或 `<群号> on\|off` 读/写开关 |
+| 游戏王环境饼图 | `agent/ygometa/meta.mjs` | 贴吧「上位卡组吧」按时间段抓取赛事战报 → 主轴归组 + 显著混轴外圈弧段统计 → 缓存(`agent/ygometa/cache/`)+ 饼图/PDF;CLI `--selftest / --trigger / --chart / --pdf / --top / --deck-alias-check` |
+| 上位卡组检索 | `agent/ygometa/meta.mjs` | 本地 `threads.json` 按主轴/时间找最近来源 → 原帖 `pb/page` 抓构筑图(最多 2 个来源);CLI `--top` |
+| 饼图渲染 | `agent/ygometa/pie.mjs` | 浅色大饼图 + 外引卡组名 + 右上角样本数(无图例、无卡图)→ Chrome headless 截图 PNG |
 | 框神语录模块 | `agent/kuangshen/kuangshen.mjs` | 语录库(quotes.json)+ 历史回填 + 实时采集 + 精筛 + 随机抽取;CLI 自测 `node kuangshen.mjs [--backfill|--dump|--dump-raw]` |
 | AI 闲聊消息解析 | `agent/aichat/aichat.mjs` | @/引用/QQ 表情/图片 → 模型读得懂的正文(**图片默认直传,一轮出结果**;`describe` 模式为两轮识别 → 拼回正文);CLI 自测 `node aichat.mjs [--selftest|--image|--render]` |
 | AI 闲聊提示词 | `agent/aichat/tone.mjs` | 人设 + 三档位(板正/熟人群聊/放开)文案与 `tone.json` 读写;**唯一出处**,opsweb 只 import 它;CLI 自测 `node tone.mjs --selftest` |
 | AI 闲聊联网 | `agent/aichat/websearch.mjs` | `web_search` 工具定义 + 本地搜索执行(智谱 Web Search / Tavily / 博查 / Bing 兜底),结果带日期与链接;CLI 自测 `node websearch.mjs --selftest "查询词"` |
 | AI 闲聊自检 | `agent/monitor.mjs --aichat-selftest [--mock\|--live]` | 离线查配置与提示词 / `--mock` 不花钱验联网循环 / `--live` 真调模型 |
 | 贴吧模式自检 | `agent/monitor.mjs --tieba-selftest` | 离线验「哪些消息不接」的边界、分群开关、概率语义、**整条出话链路**(mock 掉网络,验证连发且不含 @);`node agent/tieba/tieba.mjs --selftest` 另测提示词与拆分 |
+| 队列护栏自检 | `agent/monitor.mjs --queue-selftest` | 离线验「死群认得出 / 认出后不再叫模型 / 连续失败 3 次放弃 / 402 不再重试 4 档」(见下文「无限重试事故」) |
+| 自带机器人过滤自检 | `agent/monitor.mjs --builtinbot-selftest` | 离线验「Q群管家/官方号段/markdown 段都认得出、真人 @ 不误伤、WS 与 inbox 两道入口都挡住」(2026-10-21) |
 | 一键启动 | `start.bat` | 检测/启动 SnowLuma + 打开 monitor 窗口 |
 | 一键停止 | `stop.bat` | 停止 monitor(可选停 SnowLuma) |
 | 运维台入口 | `webui.bat` | 开 SSH 隧道 + 浏览器打开线上运维 WebUI(8090;本机 Windows 用) |
@@ -125,6 +164,7 @@ http://127.0.0.1:8090
 | 账号 | QQ 昵称与 UIN、OneBot 两个端口是否在听 |
 | **AI 闲聊 · 各用户次数** | 横向条形图、次数降序,标签是「名字（QQ号）」。口径:**以回复实际发给了哪个 @用户为准**(冷却跳过与失败不计入次数,失败单独标出);数据由 monitor 写在 `agent/aichat_stats.json`(不入库),页面每 5 秒随之刷新。历史可用 `node monitor.mjs --backfill-aichat-stats [YYYY-MM-DD]` 回填(默认自 2026-09-13,即 AI 闲聊上线日) |
 | **贴吧模式(按群)** | 卡片上只显示「已开几个群」+ 一个「选择群…」按钮,**点开是弹窗**(用户 2026-09-28 要求界面简洁、平时不显示):弹窗里每个群一个开关,最上面一条是「全部群」;**还有一条「接话概率」滑杆 + 可以直接填 0~1 的数字框**(0 = 完全不自动接话,1 = 每句都接)。群开关与概率都走 `/api/tieba` **直接写 `agent/tieba/state.json`**(不走 tmux 按键、不重启:monitor 每次接话前现读该文件),松手/填完**下一句群聊就按新概率生效**。同弹窗里还显示上下文条数与连发上限 |
+| **银河皇帝模式(按群)** | 卡片上只显示「已开几个群 / 表情包几张」+ 一个「打开控制台…」按钮;弹窗里按群开关,**表情包库默认折叠**,展开后可查看(点图放大)、删除、上传(单张 ≤5MB,jpg/png/gif/webp,按文件头校验)。状态走 `/api/belial` **直接写 `agent/belial/state.json`**,表情包读写 `agent/belial/stickers/`;monitor 每次回复前现读,点完立即生效。群里 @它 说「银河皇帝 / 银河皇帝 关」等价 |
 | 卡库 | 卡牌数 / 卡图数 / 更新时间,一键更新卡库(二次确认,后台跑,进度看日志页) |
 | 主机 | 内存 / 磁盘 / 负载 / 开机时长 |
 | QQ 消息日志 | **SnowLuma 侧的收发记录**:谁在哪个群说了什么、bot 发了什么(默认滤掉调试噪声,可勾选看原始日志) |
@@ -142,12 +182,108 @@ http://127.0.0.1:8090
 2. **等 WebUI 就绪**(轮询端口 + 试连,最多 ~25 秒)
 3. **打开浏览器** `http://127.0.0.1:8090` —— 首次要输令牌(服务器 `~/mc_agent/agent/.env` 的 `OPSWEB_TOKEN`,浏览器可记住)
 
-能干什么:看状态 / 切搬屎·框神语录·AI 闲聊开关 / **切 AI 闲聊提示词档位、看联网源与搜索次数** / **按群开关贴吧模式(弹窗)** / 重启服务 / 更新卡库 / 看 QQ 截图 / 看日志。
+能干什么:看状态 / 切搬屎·框神语录·AI 闲聊开关 / **切 AI 闲聊提示词档位、看联网源与搜索次数** / **按群开关贴吧模式(弹窗)** / **按群开关银河皇帝模式、管理贝利亚表情包库(弹窗 + 折叠)** / 重启服务 / 更新卡库 / 看 QQ 截图 / 看日志。
 
 **关隧道**:关掉那个最小化窗口,或跑 `webui.bat /stop`。
 
 > 免密登录靠本机 `~/.ssh/id_ed25519` 的公钥已装到服务器 `w-13` 的 `authorized_keys`(2026-09-12 装好)。换机器或公钥失效时,脚本会提示找不到私钥,隧道窗口里则直接报 `Permission denied`。
-> SnowLuma 自己的 WebUI(5099,QQ 账号状态/配置)本脚本不开,要用手动:`ssh -N -L 5099:127.0.0.1:5099 w-13@192.144.153.94`。
+> SnowLuma 自己的 WebUI(5099,QQ 账号状态/配置)本脚本不开,要用手动:`ssh -N -L 5099:127.0.0.1:5099 w-13@192.144.153.94`。**注意它和运维台(8090)是两套东西、两套凭据**:运维台用 `agent/.env` 的 `OPSWEB_TOKEN`(见上一节);SnowLuma 那套是**只验口令、不要用户名**,口令存在服务器 `~/snowluma-run/.webui-pw`(`~/snowluma-run/slui.py setpw` 轮换,轮换后旧口令立即失效)。2026-10-09 就是拿运维台的令牌去登 5099,白折腾了一轮。
+
+## 掉线判定与自愈(服务器端,2026-10-09 实战)
+
+> 那天 01:42 QQ 崩溃过一次,机器人**静默掉线 8 小时 51 分**(01:42:24 断、10:33:40 恢复),五个 unit 全程 `active`,没人发现。以下是那次的判据与手法,下次照做。
+
+### ① 判在线只看 OneBot 会话,别信 unit 状态
+
+`systemctl --user is-active` 五个全绿也可能完全不通 —— `qq.service` 是 `Restart=always`,崩溃的 QQ 会被拉回来,但**登录态拉不回来**。三样都要真:
+
+```bash
+# 1) OneBot 两个端口在听(掉线时根本没监听)
+ss -ltn | grep -E ':(3000|3001)\b'
+# 2) hook 是否挂在 QQ 上、且已登录(期望 loggedIn:true)
+curl -s -H "Authorization: Bearer <5099 的口令换来的 token>" \
+     http://127.0.0.1:5099/api/processes
+# 3) 真正回一次话(最强证据)
+curl -s -H "Authorization: Bearer $API_TOKEN" http://127.0.0.1:3000/get_login_info
+```
+
+运维台网页更快:看「服务」卡片的 `onebot.ws` / `onebot.http`。那天页面显示 `onebot:{ws:false,http:false}`、`account:null`,而五个服务全是绿的。
+
+### ② 登录态卡住的自愈:点一下「登录」就行,**不用扫码**
+
+那天 QQ 崩溃重启后,hook 重新注入是**成功**的(`[Hook] pipe connected: PID=...`),但客户端停在弹窗上:
+
+```
+【安全提醒】身份验证失败,请你重新登录。(s20)     [确定]
+```
+
+它既不使用已保存的凭据、也不渲染二维码,`prelogin-log_*.qqxlog` 每小时照写、而 `qq-log_*.qqxlog` 停在崩溃那一刻 —— 所以**从日志看不出异常**。
+
+自愈就两步(全程在 Xvfb 上合成鼠标事件):
+
+1. 点弹窗的「确定」→ 回到登录页
+2. 点登录页的大号蓝色「登录」按钮 → **客户端用已保存的登录态直接登录成功**
+
+成功信号(2026-10-09 实录):
+
+```
+10:33:37 [Hook] login detected: PID=333432 UIN=3757588606
+10:33:38 [OneBot] session started → listening 127.0.0.1:3000/ 与 3001/
+10:33:40 groups loaded: 7 群 / 729 成员 warmup 完成
+10:33:40 monitor: WS 已连接,等待 @消息 → 补漏完成,补收 0 条
+```
+
+服务器上**没有** `xdotool` / `xwininfo` / `wmctrl`,但 `python-xlib`、`mss`、`PIL`、`ffmpeg` 都有(2026-10-09 确认),所以自备小脚本读屏+点击。排障脚本放在本机 `downloads/`(该目录不入库),用前 `scp` 到服务器 `/tmp`:
+
+```bash
+DISPLAY=:99 python3 /tmp/screen_diag.py   # 整屏统计 + 字符画(没视觉也能读屏)
+DISPLAY=:99 python3 /tmp/xwin.py :99      # X 窗口树:位置/尺寸/map_state(判断窗口是否真活着)
+DISPLAY=:99 python3 /tmp/layout.py        # 窗口内元素几何 → 文字行/按钮的屏幕坐标
+DISPLAY=:99 python3 /tmp/click.py <x> <y> # 按坐标合成点击,并回读画面是否变化
+DISPLAY=:99 python3 /tmp/qr_live.py once  # 检测二维码定位符(1:1:3:1:1)
+```
+
+判断"是不是二维码"不要靠猜:二维码的**明暗跳变/像素 ≈ 0.3 以上**,而纯白面板只有 0.0x、文字行约 0.03;`peek.py <x1> <y1> <x2> <y2>` 会同时给这两个数。
+
+### ③ "看不到二维码"先别查网络
+
+那天一度怀疑取码接口不通,实测服务器到 `ssl.ptlogin2.qq.com/ptqrshow` **返回 200**、DNS 正常 —— 客户端**根本没画二维码**(整窗跳变 0.000),问题在客户端卡在报错弹窗。顺序应该是:**先确认客户端有没有卡在提示页,再查网络**。
+
+### ④ 事后的两个小结论
+
+- 掉线期间群里 @ 它的消息**收不到也不积压**(WS 断着,`inbox.jsonl` 没有堆积);monitor 只补收断线后 2 分钟窗口内错过的 @消息(那次补收 0 条)。
+- `Restart=always` 只保进程、不保登录态。要早点知道,得自己判 `onebot.ws` 而不是看 unit。
+
+## 无限重试事故:被踢出群的一条消息烧光 token(2026-10-20)
+
+> 现象:群里**没人 @ 它**,但面板上每 15 秒就刷一次 `deepseek-flash 生成中 ...` → `发送失败 ... 你已被移出该群` → `稍后重试(不标记为已处理)`,DeepSeek 余额一路掉到 402 还在空转。持续约 **3 天 19 小时**。
+
+**根因链(四个条件必须同时成立,少一个都不会烧)**:
+
+1. **毒条目**:10-16 17:40:29 Q群管家 在群 `556920058`(次世代唐人街)@ 了它(`seq=3463161`),而机器人**已被踢出该群** —— `send_group_msg` 一直返回 `result=110 err=发送失败,你已被移出该群`。注意 `get_group_list` **仍列着这个群**(那是缓存),要判真假得问 `get_group_member_info`(返回 `AUTHORITY_FAIL`)。
+2. **兜底那句又炸了一次**:`processAiChat` 的 `catch` 里先发「史官一时语塞,稍后再问。」,这句**同样发不出去** → 第二次抛出 → 跳过后面的 `appendFileSync(PROCESSED)` → 这条消息**永远不算处理过**。
+3. **队列把失败当临时失败**:`processQueue` 以前不打次数、不做退避,`POLL_MS=15000` 原样重来,于是每 15 秒重试一次,**无限次**。
+4. **模型调用在发送之前**:每轮重试都是「先花一次 token 叫模型,再发现根本发不出去」;外加 `aiChat` 的 4xx 退让阶梯把 `402 余额不足` 也当「参数不认」重试 4 档 → **一轮失败打 4 个请求**(实测 2135 个 402 对应 6403 行重试)。
+
+**规模与证据**:缓冲区实测 2149 轮 / 9 小时(稳定 15 秒一轮),从 10-16 17:40 到 10-20 13:04 约 **2.2 万轮**,每轮输入 ≈ 1300 字系统提示 + 10 条群聊上下文(≈1.2k tokens)。`inbox.jsonl` 里该群 1287 条、`processed.jsonl` 里 1286 条 —— 差的那一条就是它。
+
+**为什么没人发现**:① 这条的 `seq` 最大,排在其它群待处理条目之后,所以别的群照常回复,面板看着「能干活」;② 出事的那个群只是**彻底失联**,不会报错给谁看;③ 队列日志全是刷屏,不细看以为是正常输出。
+
+**这次补的护栏(都在 `agent/monitor.mjs`,自测 `--queue-selftest`)**:
+
+| 位置 | 改动 |
+|---|---|
+| `sendReply` / `sendGroupText` | 认出「你已被移出该群」这类措辞 → 记进 `deadGroups` 并抛 `DeadGroupError`(普通超时/未知错误不受影响,照样重试) |
+| `processEntry` 开头 | 本群已标记不可发送 → **连模型都不叫**,直接标记已处理 |
+| `processAiChat` | 兜底提示语发送失败**不再往外抛**(贴吧模式那条 @ 路同样),这条消息必定进 `processed` |
+| `processQueue` | 同一条连续失败 `ENTRY_MAX_FAILS`(默认 3,env 可调)次 → 放弃并标记,**不再让一条毒消息挡住整队**;死群直接放弃 |
+| `aiChat` | `401/402/403/404` 不再走退让阶梯(402 直接打「余额不足:去充值或换 key」),一次失败不再放大成 4 次请求 |
+| `tiebaShouldReply` | 死群不接话(同样不叫模型) |
+| systemd `mc-agent.service` | `until node monitor.mjs` → `while true; do node monitor.mjs; sleep 5; done`。**`until` 只在非 0 退出时才循环**,所以按一下 `q`(正常退出)就把整个 tmux 会话关掉、而 oneshot unit 依旧显示 `active (exited)` —— 机器人静默下线,2026-10-20 排查时真踩到了 |
+
+**收尾动作**:该条目已补进 `processed.jsonl`(`*_bak-20261020` 有备份)。**群 556920058 需要人工把 bot 拉回去**,否则这个群的 @ 全废(其它的群不受影响)。想确认某个群还在不在:`get_group_member_info`,`AUTHORITY_FAIL` = 不在。
+
+**上游补的一刀(2026-10-21)**:这条毒条目的**来源**是「Q群管家 @ 它 → 它回复(回复必带 @ 触发者)→ 管家回 @ → 它又回」的 5 连循环(见 `inbox.jsonl` 里 10-16 09:40 那 4 秒)。用户要求「被入群机器人 @ 不回复」,现在直接按发送者认 QQ 自带机器人(群管家/QQ小冰/`2854xxxxxx` 官方号段/带 `markdown`·`inline_keyboard` 段),**在 WS 入口就不进 inbox**,`processEntry` 再挡一道兜旧条目 —— 详见「注意事项」最后一条,自测 `--builtinbot-selftest`。
 
 ## 完整工作流
 
@@ -202,6 +338,9 @@ mc_agent/
     │   ├── data/              # cards.zhCN.json(9.6MB)/ hs_meta.json(不入库)
     │   └── cards_img/         # 炉石卡图按需缓存(不入库)
     ├── kuangshen/         # 框神语录:采集 / 回填
+    ├── ygometa/           # 游戏王环境饼图:贴吧抓取 / 缓存 / 统计 / 画图
+    │   ├── meta.mjs           # 时间段 / 触发词 / 贴吧接口 / 战报解析 / 主轴归组 + 显著混轴 / 图表 + PDF + 上位检索 / 缓存(自测 --selftest)
+    │   └── pie.mjs            # 浅色大饼图 + 外引卡组名 + 右上角样本数(无图例/无卡图)+ Chrome headless 截图
     ├── shitpost/          # 搬屎:随机一搬 / 精选一搬
     └── ygocard/           # 卡牌:效果查询 / 卡图 / 卡库 / 裁定 / 卡表
 ```
@@ -217,23 +356,27 @@ mc_agent/
   ```
   缺失时 monitor 启动会报错退出;`start.bat` 的登录检测也从该文件读取。
 - **`.mcp.json`**(被 `.gitignore` 排除):Claude Code MCP 配置,参考 `.mcp.example.json` 创建。
-- 环境变量可覆盖:WS_URL / API / WS_TOKEN / API_TOKEN / TRIGGER_KEYWORD / CARD_TRIGGER / CARD_IMG_TRIGGER / RULING_TRIGGER / RULING_FULL_TRIGGER / DAILY_KEYWORD / BOT_ID / DRY_RUN。裁定相关:`RULINGS_CACHE_TTL_MS`(缓存时长,默认 24h)。
+- 环境变量可覆盖:WS_URL / API / WS_TOKEN / API_TOKEN / TRIGGER_KEYWORD / CARD_TRIGGER / CARD_IMG_TRIGGER / RULING_TRIGGER / RULING_FULL_TRIGGER / DAILY_KEYWORD / BOT_ID / `BOT_IGNORE_IDS`(追加要无视的 QQ 官方机器人 uin,逗号分隔)/ DRY_RUN。裁定相关:`RULINGS_CACHE_TTL_MS`(缓存时长,默认 24h)。
 - **框神语录**(`agent/kuangshen/quotes.json` 不入库):`KUANGSHEN_TRIGGER`(触发词,默认「框神语录」)/ `KUANGSHEN_GROUP`(群号,默认 793874011)/ `KUANGSHEN_TARGET`(目标 QQ,默认 3080580848)/ `KUANGSHEN_MAX_PAGES`(回填翻页上限,200 条/页)。`node agent/kuangshen/kuangshen.mjs --backfill` 可手动补全历史。
 - **卡库**:`agent/ygocard/cards.json` 不入库(约 14MB,可重建)。monitor 窗口按 `u`、运维 WebUI 的「更新卡库」、或 `node monitor.mjs --update-cards` 联网更新。卡库源(百鸽)在海外,国内机器连它握手常要 9~16 秒,而 Node `fetch` 默认连接超时只有 10 秒 —— 所以更新走「重试 + 放宽超时」:出问题时可用 `CARDS_FETCH_TIMEOUT_MS`(默认 120000)与 `CARDS_FETCH_TRIES`(默认 3)调。
 - **贴吧模式(2026-09-28)**:开关是**分群参数**(`agent/tieba/state.json`,运维台弹窗里按群点,或群里 @ 它发「贴吧模式 开 / 关」;`'*'` = 全部群),**默认全部关闭**;`TIEBA_ENABLED` 只作首启初值,建好文件后以文件为准。**接话概率在运维台弹窗的滑杆上调**(也接受直接填 0~1),存在同一份 state.json 里、每次接话前现读,所以**改概率不用重启**;`TIEBA_PROB` / `TIEBA_AT_PROB` 只是首启初值(默认 0.7 / 1)。其余口径(改完**要重启 monitor**):`TIEBA_CTX`(上下文窗口条数,默认 30)/ `TIEBA_CTX_FETCH`(每次接话向 OneBot 拉多少条历史来凑窗口,默认 60)/ `TIEBA_MAX_REPLY`(一次最多连发几条,默认 3)/ `TIEBA_COUNT_WEIGHTS`(各条数的权重,默认 `45,35,20` = 一条 45% / 两条 35% / 三条 20%,自动归一化)/ `TIEBA_MAX_CHARS`(单条字数上限,默认 60)/ `TIEBA_MIN_CHARS`(**默认 0 = 不按字数拦**;设 4 就是以前那套「4 字以下算碎话不接」)/ `TIEBA_TEMPERATURE`(采样温度,默认 0.95)/ `TIEBA_NEW_GAP_MS`(连发间隔,默认 900)/ `TIEBA_IMAGES`(消息里的图是否直传,默认 1;设 0 则只留 `[图片]` 占位不下载)。**没有冷却与限频**(用户明确要求,别自作主张加):唯一的刹车是同一群同时只跑一条,嫌吵就调 `TIEBA_PROB` 或关掉那个群。自测 `node monitor.mjs --tieba-selftest`(离线,不花钱)。
+- **银河皇帝模式(2026-10-26)**:分群开关 `agent/belial/state.json`(**每次现读**,运维台弹窗/群里「银河皇帝 开 / 关」等价;`all` 是全部群,`except` 记「全部开着时单独关掉的群」);表情包库 `agent/belial/stickers/`(种子 12 张入库,运维台上传/模型下载的 `up_*` 不入库)。可调 env(改完**要重启 monitor**):`BELIAL_MAX_CHARS`(**单条**字数上限,默认 50)/ `BELIAL_MAX_REPLY`(一次最多几条,默认 3)/ `BELIAL_THINK`(默认 1 = 开 AI 思考生成;`0` 关,回复更快)/ `BELIAL_MAX_TOKENS`(默认开思考 1600 / 关思考 600)/ `BELIAL_TEMPERATURE`(默认 0.95)/ `BELIAL_REPLY_GAP_MS`(多条之间间隔,默认 700)/ `BELIAL_MAX_STICKERS`(一次最多几张表情包,默认 2)/ `BELIAL_MAX_SEARCHES`(DS 官方搜索次数/回复,默认 2)/ `BELIAL_MAX_IMAGE_SEARCHES`(图片搜索次数/回复,默认 2)/ `BELIAL_MAX_DOWNLOADS`(下载次数/回复,默认 1)/ `BELIAL_SEARCH_COUNT`(每次搜几条,默认 5)/ `BELIAL_SEARCH_TIMEOUT_MS`(DS 搜索超时,默认 20000)/ `BELIAL_DOWNLOAD_TIMEOUT_MS`(下图超时,默认 20000)/ `BELIAL_MAX_TOOL_ROUNDS`(工具循环上限,默认 6)/ `BELIAL_STICKER_MAX_BYTES`(单张上限,默认 5MB)/ `BELIAL_STATE_PATH`、`BELIAL_STICKER_DIR`(覆盖路径,一般不用)。**表情包不再按概率发**,由模型调 `send_sticker` 自主决定;`web_search` 走 **DeepSeek 官方 Search API**(`POST https://api.deepseek.com/v1/tools/search`,按 5 元/1000 次成功请求计费),`search_stickers` 走 360 图片接口,`download_sticker` 只允许公网 http/https、拒绝内网/本机地址(SSRF 护栏)、≤5MB、按文件头只认 jpg/png/gif/webp。**台词库只当偶尔的「大招」**;提示词只给反应方向 + 本群最近说过的话,由模型自己组织。**开着时忽略 AI 闲聊的提示词档位,并让模型忘记助手身份、只当贝利亚**;**AI 闲聊总开关关着或没配聊天 key 时,群里会拒绝激活并说明原因**。自测 `node agent/monitor.mjs --belial-selftest`、`node agent/belial/belial.mjs --selftest`、`node agent/belial/deepsearch.mjs --selftest`、`node agent/belial/stickersearch.mjs --selftest`。
+- **游戏王环境饼图(2026-10-26)**:触发词/时间段写死在 `agent/ygometa/meta.mjs`(不需要配置);可调 env(改完**要重启 monitor**):`YGOMETA_CACHE_DIR`(缓存目录,默认 `agent/ygometa/cache`)/ `YGOMETA_FORUM`(贴吧吧名,默认「上位卡组」)/ `YGOMETA_PAGE_RN`(每页条数,默认 100,最大 100)/ `YGOMETA_MAX_PAGES`(最多翻几页,默认 40;触顶时图里标「数据可能不全」)/ `YGOMETA_PAGE_DELAY_MS`(翻页间隔,默认 280)/ `YGOMETA_MAX_RANGE_DAYS`(最长回溯天数,默认 210)/ `YGOMETA_RECENT_TTL_MS`(近期范围缓存时长,默认 2h)/ `YGOMETA_PAST_TTL_MS`(历史范围缓存时长,默认 30 天)/ `CHROME_PATH`(无头浏览器,服务器已是 `/usr/bin/google-chrome`)。**缓存不入库、不同步**:换机器后第一次问会重新爬。自测 `node agent/monitor.mjs --ygometa-selftest`;测试群实发 `node agent/monitor.mjs --ygometa-send 680774660 "环境 10月"`。
 - **功能开关热控**(`agent/features.json` 不入库):三档副功能总开关(搬屎/框神语录/AI 闲聊),控制台即时切换免重启,原子写持久化。**monitor 控制台按键**:`1`/`2`/`3` = 切搬屎/框神语录/AI 闲聊总开关,`h` = 重画面板,`u` = 更新卡库,`q` = 退出,`Q` = 退出+停 SnowLuma。**服务器上也可用运维 WebUI 切**(见上文,它切的就是同一套按键,所以两条路径的状态天然一致)。首次运行时以 env 初值(`SHIT_ENABLED`/`KUANGSHEN_ENABLED`/`AI_CHAT_ENABLED`)建文件,**之后以文件为准,改 env 不再生效**(删文件即重置回 env 初值);**运行中直接改 `features.json` 文件不生效**,要走按键或 WebUI。AI 闲聊还有一个例外:**没配聊天 key(`DEEPSEEK_API_KEY` 或 `AI_CHAT_API_KEY`)时启动即强制关闭**,配了 key 再开才有效。
 - **AI 闲聊后端(2026-09-21 只剩一套)**:OpenAI 兼容 `/chat/completions`。`DEEPSEEK_API_KEY`(或 `AI_CHAT_API_KEY`)、`AI_CHAT_API_URL`(默认 `https://api.deepseek.com/chat/completions`)、`AI_CHAT_MODEL`(默认 `deepseek-flash`;注意「关思考」是按模型名判断的 —— 只有名字里带 deepseek 才自动塞 `reasoning_effort`)/ `AI_CHAT_REASONING`(deepseek 系**默认关思考**:实测 `reasoning_effort='low'` 会把 max_tokens 全烧在思考上、**正文返回空**,想开思考设 `1`)/ `AI_CHAT_MAX_TOKENS`(上限,默认 800)/ `AI_CHAT_CTX`(附带上下文条数,默认 10,0=不带)/ `AI_CHAT_TIMEOUT_MS`(默认 30000)/ `AI_CHAT_COOLDOWN_MS`(每人冷却,**默认 15000;设 `0` = 彻底关掉冷却**,2026-09-21 用户选了 0 —— 关掉后没有节流:同一个人连点几下就会真调几次模型、联网时真搜几次;想恢复改成毫秒数即可,不用动代码,但改的是启动期常量,**必须重启 monitor 才生效**)/ `AI_CHAT_MAX_CHARS`(回复截断字数,默认 400)/ `AI_CHAT_ENABLED`(首启初值)。**`AI_CHAT_PROVIDER` 与 `GLM_*` 已废弃**(旧的「智谱聊天后端」2026-09-21 删掉了;`ZHIPU_API_KEY` 仍要留着,它现在只服务两件事:**联网搜索**的默认源,以及 `describe` 识图那条老路)。**参数退让**:碰到 4xx 时按「去掉联网工具 → 联网+带思考 → 带上思考 → 去掉图片」依次退让重试,**超时/网络错不重试**(重来一轮只会让群友多等一倍)。
 - **AI 闲聊提示词档位(2026-09-21)**:`AI_CHAT_TONE`(`strict` 板正 / `loose` 熟人群聊 / `wild` 放开)**只在首次建 `agent/aichat/tone.json` 时作初值**,之后以文件为准 —— 平时不用改 env,直接在**运维台「AI 闲聊 · 提示词档位」卡片**上点(即时生效,monitor 每次回复前重读该文件)。档位文字与说明的唯一出处是 `agent/aichat/tone.mjs`。
 - **AI 闲聊联网搜索(2026-09-21 改成工具调用)**:`AI_CHAT_WEB_SEARCH`(默认开;`0` 关掉)/ `AI_CHAT_MAX_SEARCHES`(单次回复最多搜几次,默认 2,到顶摘掉工具)/ `SEARCH_PROVIDER`(`zhipu` | `tavily` | `bocha` | `bing`;不填则「配了哪家 key 用哪家」,全没有时退到 `bing`)/ `SEARCH_ENGINE`(智谱引擎,默认 `search_std`,要更好质量可设 `search_pro`)/ key:`ZHIPU_API_KEY`(默认源,复用现有的)、`TAVILY_API_KEY`、`BOCHA_API_KEY`;`bing` 零 key 兜底(质量差,**只当应急**)/ `SEARCH_COUNT`(取几条,默认 6;闲聊路径内部还会压到 ≤5)/ `SEARCH_MAX_CHARS`(单条摘要上限,默认 1200)/ `SEARCH_TOTAL_CHARS`(喂回模型的总上限,默认 6000)/ `SEARCH_TIMEOUT_MS`(单家源超时,默认 15000)。自测:`node agent/aichat/websearch.mjs --selftest "查询词"`(会真搜一次)。
 - **AI 闲聊自检**:`node monitor.mjs --aichat-selftest`(离线:查后端地址/档位/提示词/联网工具/记账,**不花钱**;没配聊天 key 也能跑)/ `--mock`(**不花钱、不用 key** 验整条联网循环:拦截聊天请求造假响应,喂一个 `web_search` tool_call 进去,验证「要搜 → 真搜 → 结果回填 → 摘掉工具收尾」以及 messages 里 assistant/tool 两条有没有拼对)/ `--live` 真调一次模型(需聊天 key),验证端到端。
 - **AI 闲聊·图片**:`AI_CHAT_IMAGE_MODE`(`direct` 直传一轮,默认 | `describe` 两轮识别)/ `AI_CHAT_IMG_SEND_SIDE`(直传时长边上限,默认 1600;实测图片 token 按像素面积分档、≥230 万封顶 ≈995,所以这个值不必调大)/ `AI_CHAT_MAX_IMAGES`(单条消息最多几张,默认 3)。**仅 `describe` 老路生效**:`GLM_VISION_MODEL`(默认 `glm-4v-flash` —— 那条路仍走智谱的**视觉模型**,只有它用 `ZHIPU_API_KEY`;聊天模型与它无关)/ `AI_CHAT_IMG_MAX_SIDE`(宽度限幅,默认 1024)/ `AI_CHAT_IMG_CHUNK_H`(长截图切块高度,默认 800)/ `AI_CHAT_IMG_CHUNKS`(单张最多切几块,默认 3)/ `AI_CHAT_IMG_UP_TRIGGER`(小图判定阈值,默认 800)/ `AI_CHAT_IMG_UP_FACTOR`(小图放大倍数,默认 4)/ `AI_CHAT_IMG_UP_SIDE`(放大后长边封顶,默认 2400)/ `AI_CHAT_IMG_TEXT_MAX`(单张描述+抄字上限,默认 1500 字)/ `AI_CHAT_VISION_TIMEOUT_MS`(默认 30000)。两条路共用:`AI_CHAT_IMG_TIMEOUT_MS`(图片下载超时,默认 15000)/ `FFMPEG_BIN`、`FFPROBE_BIN`(默认 `ffmpeg` / `ffprobe`;没有 ffmpeg 时直传退化成「jpg/png 原样传,大图与 gif/webp 放弃」)/ `QQ_FACE_CATALOG`(表情表路径,默认 `agent/aichat/qq_faces.json`,也可直接指向 SnowLuma 的 `data/sys-face-catalog.json`)。
-- **卡图库**:`agent/ygocard/cards_img/` 不入库(约 2GB,14218 张,可重建)。`node agent/ygocard/download_images.mjs` 全量下载/续传(跳过已存在,失败清单 `cards_img/failed.log` 重跑自动重试)。
+- **卡图库**:`agent/ygocard/cards_img/` 不入库(约 2GB,14218 张,可重建)。`node agent/ygocard/download_images.mjs` 全量下载/续传(跳过已存在,失败清单 `cards_img/failed.log` 重跑自动重试)。另有三个开关:**`--repair`**(重下「按 cid 排序的最后 200 张」,并先删后下、不跳过已有 —— 专门用来修历史错图,窗口大小可跟数字 `--repair 500`)/ **`--audit`**(不联网体检:卡图覆盖数 + 「新密码段有图但来源可疑」的错图清单 + 无密码 id 的卡)/ 无参数(全量续传)。
+- **卡图错配事故(2026-09-28,已修)**:用户报「卡库更新对了、卡图不对」——`超越神明的仆人-青眼究极龙`(密码 100268004)查出来的是 `Toon Page-Flip`。实测根因:**ygoprodeck 图库认不出 1 亿段的新密码,却不返回 404,而是返回另一张卡的图**(100268xxx 段整段被撞成 Toon / Chaos 系列:100268001→Toon Black Luster Soldier、100268002→Toon Harpie Lady、100268003→Toon Bookmark、100268005→Toon Terror、100268010→Eternal Chaos……),而它的 API 同样查不到这些密码(`cardinfo.php?id=100268004` 直接 400 或返回别的卡)——所以老逻辑「官方源 404 才回退」永远拦不住这种**「HTTP 200 但图是错的」**。修法:**`id >= 1e8` 一律跳过官方源、只信百鸽回退源**(宁可暂时没图也不发错图;实测这 42 张 1 亿段新卡回退源 42/42 全有图),并把实测错配的 id 写进 `OFFICIAL_BROKEN` 兜底;`--audit` 会报「有图但没有回退标记」的可疑项。线上修一次:`node agent/ygocard/download_images.mjs --repair`(2026-09-28 实测重下最后 113 张、12 秒)。顺手加的护栏:小于 1KB 的 jpg 一律当残图重下/不发(`ygocard.mjs` 发图前也会查大小)。
 
 ## 注意事项
 
 - 修改 `agent/.env` / SnowLuma 配置后需重启才生效;功能开关走控制台面板或 `features.json`,即时生效无需重启
-- QQ 掉线时:用 `stop.bat`(选 Y)停后端 → 重新打开 QQNT 登录 → `start.bat`
+- QQ 掉线时:用 `stop.bat`(选 Y)停后端 → 重新打开 QQNT 登录 → `start.bat`。**线上(服务器)掉线是另一套流程**,见上文「掉线判定与自愈」—— 先判 `onebot.ws` 而不是 unit 状态;登录态卡在「身份验证失败」弹窗时,点一下「登录」就能用已存凭据自愈,**不用扫码**
 - 机器人只响应**群聊中 @它**的消息(私聊与其他消息不处理);无触发词的 @ 消息交给 **AI 闲聊**兜底接话(可用面板 `3` 键关掉,关掉后恢复为忽略)。**例外是贴吧模式(2026-09-28)**:那个群开着它时,机器人**不用 @ 也会自己接话**(按 70% 概率、可连发几条、口吻是嘴臭的吧友),开关按群控、默认全关 —— 见上文第 9 条
+- **QQ 自带机器人(群管家 / 入群欢迎 / 官方 bot)的 @ 一律不回复(2026-10-21)**:Q群管家(2854196310)、QQ小冰(2854196306)、`2854xxxxxx` 官方号段,以及带 `markdown` / `inline_keyboard` 段(只有官方机器人有权限发)的消息,**连 inbox 都不进** —— 不排队、不叫模型、不回话;inbox 里已经躺着的旧条目也会在 `processEntry` 开头被标记已处理。要追加别的官方机器人 uin 设 env `BOT_IGNORE_IDS`(逗号分隔,改完重启 monitor)。自测 `node monitor.mjs --builtinbot-selftest`
 - **@+「史记总结」** → 史记体总结(触发词可用环境变量 `TRIGGER_KEYWORD` 覆盖);**@+「效果 」+卡名** → 本地卡牌查询(触发词可用 `CARD_TRIGGER` 覆盖,必须后跟空白);**@+「裁定 」+卡名** → 官方裁定(触发词可用 `RULING_TRIGGER` 覆盖,必须后跟空白);**@+「框神语录」** → 抽一条框神语录(触发词可用 `KUANGSHEN_TRIGGER` 覆盖)
 - 卡牌查询支持中/日/英文名与别名(简中官方名、MD 译名等),多关键词空格分隔 AND 匹配
-- 回复均 at 触发者
+- 回复均 at 触发者;2026-10-26 起 at 段后补一个空格段(否则 QQ 有时只显示普通文本、不解析成真 mention)。银河皇帝模式第一条文字仍然 @ 触发者,后续补话/表情包不 @

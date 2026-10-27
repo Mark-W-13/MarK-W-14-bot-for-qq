@@ -33,6 +33,14 @@ import {
   PROB_DEFAULT as TIEBA_PROB, PROB_AT_DEFAULT as TIEBA_AT_PROB, CTX as TIEBA_CTX, MAX_REPLY as TIEBA_MAX_REPLY,
   MAX_CHARS as TIEBA_MAX_CHARS, NEW_GAP_MS as TIEBA_GAP_MS, MIN_CHARS as TIEBA_MIN_CHARS,
 } from './tieba/tieba.mjs';
+// 银河皇帝模式(2026-10-26):状态、提示词、表情包库都在 belial/belial.mjs。本文件只画界面、
+// 写状态文件、收发上传的图片 —— monitor 每次回复前现读 state.json / 表情包目录,点完立即生效。
+import {
+  allOn as belialAll, isOn as belialOn, setOn as belialSetOn, statePath as belialStatePath,
+  listStickers as belialStickers, addSticker as belialAddSticker, deleteSticker as belialDeleteSticker,
+  stickerPath as belialStickerPath, stickerMime as belialStickerMime, stickerDir as belialStickerDir,
+  MAX_STICKER_BYTES as BELIAL_MAX_STICKER, FEATURE_CN as BELIAL_CN, KEYWORD as BELIAL_KEYWORD,
+} from './belial/belial.mjs';
 // ⚠ 这一行只是把 env.mjs **加载**进来 —— 它**被 import 的那一刻**就自己把 agent/.env 读进
 //   process.env 了(env.mjs 文件末尾有 loadEnvFile())。所以本文件**不要再自己调一次** loadEnvFile():
 //   那时 .env 的键已经在 process.env 里,再调会因为「已存在」而全部跳过、返回空数组,
@@ -251,6 +259,22 @@ async function groupsWithTieba() {
   return { all: st.all, groups: rows, opened: rows.filter(r => r.tieba).length, file: tiebaStatePath(), updatedAt: st.updatedAt };
 }
 
+// ---------- 银河皇帝模式(2026-10-26) ----------
+// 与贴吧模式同一套群列表与开关交互:状态读 belial/state.json(monitor 用的同一个文件),
+// 所以这里显示的就是线上正在生效的状态。表情包库另算(读 stickers/ 目录)。
+async function groupsWithBelial() {
+  const st = belialAll();
+  const nameOf = new Map();
+  const j = await onebot('get_group_list');
+  for (const g of (j?.data || [])) if (g?.group_id) nameOf.set(String(g.group_id), g.group_name || '');
+  for (const gid of st.groups) if (gid !== '*' && !nameOf.has(gid)) nameOf.set(gid, '');
+  const rows = [...nameOf.entries()]
+    .map(([groupId, name]) => ({ groupId, name, belial: belialOn(groupId) }))
+    .sort((a, b) => Number(b.belial) - Number(a.belial)
+      || String(a.name || a.groupId).localeCompare(String(b.name || b.groupId), 'zh'));
+  return { all: st.all, groups: rows, opened: rows.filter(r => r.belial).length, file: belialStatePath(), updatedAt: st.updatedAt };
+}
+
 function hostStats() {
   const num = (s, re) => { const m = String(s).match(re); return m ? Number(m[1]) : 0; };
   let load = '', memTotal = 0, memAvail = 0, uptimeS = 0;
@@ -373,6 +397,21 @@ async function buildStatus() {
         probRange: { min: 0, max: 1, step: 0.05 },
         ctx: TIEBA_CTX, maxReply: TIEBA_MAX_REPLY,
         maxChars: TIEBA_MAX_CHARS, gapMs: TIEBA_GAP_MS, minChars: TIEBA_MIN_CHARS };
+    })(),
+    // 银河皇帝模式(2026-10-26):分群开关 + 表情包库(查看/删除/上传都在弹窗里)
+    belial: await (async () => {
+      const b = await groupsWithBelial().catch(() => ({ all: false, groups: [], opened: 0, file: belialStatePath(), updatedAt: 0 }));
+      return {
+        ...b,
+        stickers: belialStickers(),
+        stickerDir: belialStickerDir(),
+        maxStickerBytes: BELIAL_MAX_STICKER,
+        keyword: BELIAL_KEYWORD,
+        cn: BELIAL_CN,
+        // 开关能点,但「AI 闲聊总开关关了 / 没配聊天 key」时开了也不会回 —— 界面上要说清
+        aiOn: !!feat.ai,
+        hasKey: !!(process.env.DEEPSEEK_API_KEY || process.env.AI_CHAT_API_KEY),
+      };
     })(),
     account: info?.data ? { uin: String(info.data.user_id), nickname: info.data.nickname } : null,
     cards: { mtime: cardsMtime, count: cards ? Object.keys(cards).length : 0, images: countImages() },
@@ -532,6 +571,23 @@ button.mini{min-height:28px;padding:4px 10px;font-size:12px;border-radius:7px}
 .tbprob input[type=range]{flex:1;min-width:90px;accent-color:var(--acc);height:24px;margin:0}
 .tbprob input[type=number]{width:64px;font:inherit;padding:4px 6px;border:1px solid var(--line);border-radius:7px;text-align:center}
 .tbprob .tbpc{font-size:12px;color:var(--mut);flex:0 0 auto}
+/* 银河皇帝模式(2026-10-26):主页面只露一个按钮;弹窗里是分群开关 + 折叠的表情包库 */
+#blmodal{position:fixed;inset:0;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center;padding:16px;z-index:40}
+#blmodal.show{display:flex}
+#blmodal .mbox{background:var(--card);border-radius:14px;padding:16px;width:100%;max-width:660px;max-height:86vh;overflow:auto;box-shadow:0 8px 30px rgba(0,0,0,.2)}
+#blmodal h3{font-size:15px;margin:0 0 8px;display:flex;align-items:center;gap:8px}
+.blrow{display:flex;align-items:center;gap:10px;padding:7px 0;border-bottom:1px solid var(--line)}
+.blrow:last-child{border-bottom:0}
+.blrow .tk{flex:1;min-width:0}
+.blrow .tsub{font-size:11px;color:var(--mut)}
+.blrow.all{border-bottom:1px solid var(--line);margin-bottom:4px}
+.blgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(96px,1fr));gap:8px}
+.blitem{position:relative;border:1px solid var(--line);border-radius:9px;overflow:hidden;background:#fafafa}
+.blitem img{display:block;width:100%;aspect-ratio:1/1;object-fit:contain;background:#fff;cursor:zoom-in}
+.blitem .bn{font-size:10px;color:var(--mut);padding:3px 5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.blitem .bx{position:absolute;top:3px;right:3px;width:20px;height:20px;line-height:18px;text-align:center;border-radius:50%;background:rgba(0,0,0,.55);color:#fff;font-size:14px;cursor:pointer;border:0;padding:0;min-height:0}
+.blitem .bx:hover{background:var(--bad)}
+.blupload{display:flex;align-items:center;gap:8px;margin-bottom:8px;flex-wrap:wrap}
 </style></head><body>
 
 <div id="login"><div class="box">
@@ -561,6 +617,13 @@ button.mini{min-height:28px;padding:4px 10px;font-size:12px;border-radius:7px}
       <span class="mut" style="margin-left:8px" id="tiebanote"></span></div>
     <div class="mut" style="margin-top:8px;font-size:11px">开了之后<strong>不用 @ 也会接话</strong>(脏话全开、短句、可连发、不 @ 人),而且 <strong>@ 它也归它管</strong>:那个群的兜底闲聊会被同一套人格覆盖(不答疑、不帮忙、只骂人)。
       <br>⚠ 默认全部关闭:只对这里点开的群生效;群友发「贴吧模式 开 / 关」也能切。</div></div>
+
+  <div class="card"><h2>银河皇帝模式 <span class="mut" style="font-weight:400">(按群)</span></h2>
+    <div id="belial"></div>
+    <div style="margin-top:10px"><button onclick="openBelial()">打开控制台…</button>
+      <span class="mut" style="margin-left:8px" id="belialnote"></span></div>
+    <div class="mut" style="margin-top:8px;font-size:11px">群友 <strong>@我 说「银河皇帝」</strong>(「银河皇帝模式」也行)就切成本群人格「银河皇帝贝利亚」(再发「银河皇帝 关」切回);
+      只改被 @ 时的口吻,不碰游戏功能。点开控制台可按群开关、<strong>查看/删除/上传表情包</strong>。</div></div>
 
   <div class="card"><h2>服务</h2><div id="svcs"></div></div>
 
@@ -615,6 +678,31 @@ button.mini{min-height:28px;padding:4px 10px;font-size:12px;border-radius:7px}
   <div id="tbody"></div>
   <div class="mut" style="margin-top:10px;font-size:11px">开关是<strong>每群各记各的</strong>,点了立刻生效(monitor 每次用到时现读状态文件,不用重启)。
     概率/上下文/连发条数等口径在 agent/.env(TIEBA_PROB / TIEBA_CTX / TIEBA_MAX_REPLY …),改完要重启 monitor。</div>
+</div></div>
+
+<!-- 银河皇帝模式:主页面只露一个按钮,点开才显示分群开关;表情包库默认折叠 -->
+<div id="blmodal"><div class="mbox">
+  <h3>银河皇帝模式 <button class="mini" style="margin-left:auto" onclick="closeBelial()">关闭</button></h3>
+  <div class="mut" id="blhint"></div>
+  <div id="blbody"></div>
+  <div style="margin-top:14px;border-top:1px solid var(--line);padding-top:10px">
+    <div style="display:flex;align-items:center;gap:8px">
+      <strong style="font-size:13px">表情包库</strong>
+      <span class="mut" id="blstickernote"></span>
+      <button class="mini" style="margin-left:auto" id="blstickerbtn" onclick="toggleStickers()">展开</button>
+    </div>
+    <div id="blstickerbox" style="display:none;margin-top:10px">
+      <div class="blupload">
+        <button class="mini pri" onclick="document.getElementById('blfile').click()">上传表情包</button>
+        <input type="file" id="blfile" accept="image/png,image/jpeg,image/gif,image/webp" multiple style="display:none"
+          onchange="uploadStickers(this.files);this.value=''">
+        <span class="mut" id="bluploadnote"></span>
+      </div>
+      <div class="blgrid" id="blgrid"></div>
+    </div>
+  </div>
+  <div class="mut" style="margin-top:10px;font-size:11px">开关是<strong>每群各记各的</strong>,点了立刻生效(monitor 每次回复前现读状态文件,不用重启)。<br>
+    群里的等价指令:@我 说「银河皇帝」召唤,说「银河皇帝 关」收起;这个模式不在 /help 里。</div>
 </div></div>
 
 <script>
@@ -681,6 +769,106 @@ function renderTieba(force){
     '<div class="sw'+(t.all?' on':'')+'" onclick="setTieba(\\'*\\','+(t.all?'false':'true')+')"><i></i></div></div>'+
     (t.groups.length?t.groups.map(tbRow).join(''):'<div class="mut">读不到群列表(OneBot 可能没起来)</div>');
 }
+// 银河皇帝模式(2026-10-26):主页面只露一个「打开控制台…」按钮;弹窗里是分群开关 + 折叠的表情包库。
+// 状态来自 /api/status 的 belial(读的就是 monitor 正在用的 state.json),所以显示与生效永远一致。
+var blData={groups:[],all:false,opened:0,stickers:[]}, blOpen=false, blStickersOpen=false, blStickerSig='';
+function openBelial(){blOpen=true;renderBelial(true);document.getElementById('blmodal').className='show'}
+function closeBelial(){blOpen=false;document.getElementById('blmodal').className=''}
+function setBelial(groupId,on){act('belial',{groupId:groupId,on:on})}
+function blRow(r){
+  return '<div class="blrow"><span class="tk" title="'+h(r.groupId)+'">'+h(r.name||('群 '+r.groupId))+
+    '<div class="tsub">'+h(r.groupId)+(r.belial?' · 已开启':'')+'</div></span>'+
+    '<div class="sw'+(r.belial?' on':'')+'" onclick="setBelial(\\''+r.groupId+'\\','+(r.belial?'false':'true')+')"><i></i></div></div>';
+}
+function renderBelial(force){
+  var b=blData||{groups:[]};
+  var anyOn=!!(b.all||b.opened);
+  var onText=b.all?'全部群开启':(b.opened?('已开 '+b.opened+' 个群'):'全部关闭');
+  var note=document.getElementById('belialnote');
+  if(note)note.textContent='';
+  var sum=document.getElementById('belial');
+  if(sum){
+    sum.innerHTML='<div class="row"><span class="dot '+(anyOn?'ok':'')+'"></span><span class="k">'+onText+
+      '<div class="sub">表情包 '+((b.stickers||[]).length)+' 张</div></span></div>';
+  }
+  if(!force&&!blOpen)return;
+  var hint=document.getElementById('blhint');
+  if(hint){
+    var warn='';
+    if(b.aiOn===false)warn=' ⚠ AI 闲聊总开关关着,开了也不会回';
+    else if(b.hasKey===false)warn=' ⚠ 没配聊天 key,开了也不会回';
+    hint.textContent='共 '+((b.groups||[]).length)+' 个群;表情包 '+((b.stickers||[]).length)+' 张;群里 @我 说「'+
+      (b.keyword||'银河皇帝')+'」召唤,说「银河皇帝 关」收起'+warn;
+  }
+  var box=document.getElementById('blbody');
+  if(!box)return;
+  box.innerHTML='<div class="blrow all"><span class="tk">全部群<div class="tsub">一次把下面所有群都打开/关掉</div></span>'+
+    '<div class="sw'+(b.all?' on':'')+'" onclick="setBelial(\\'*\\','+(b.all?'false':'true')+')"><i></i></div></div>'+
+    ((b.groups&&b.groups.length)?b.groups.map(blRow).join(''):'<div class="mut">读不到群列表(OneBot 可能没起来)</div>');
+  renderStickers();
+}
+function fmtBytes(n){n=Number(n)||0;return n>=1048576?((n/1048576).toFixed(1)+'MB'):(Math.max(1,Math.round(n/1024))+'KB')}
+function toggleStickers(){blStickersOpen=!blStickersOpen;renderStickers()}
+function renderStickers(){
+  var b=blData||{},list=b.stickers||[];
+  var note=document.getElementById('blstickernote');
+  if(note)note.textContent='('+list.length+' 张)';
+  var btn=document.getElementById('blstickerbtn');
+  if(btn)btn.textContent=blStickersOpen?'收起':'展开';
+  var box=document.getElementById('blstickerbox');
+  if(!box)return;
+  box.style.display=blStickersOpen?'':'none';
+  var up=document.getElementById('bluploadnote');
+  if(up)up.textContent='单张 ≤ '+fmtBytes(b.maxStickerBytes||5242880)+',支持 jpg / png / gif / webp';
+  var grid=document.getElementById('blgrid');
+  if(!grid)return;
+  var sig=list.map(function(s){return s.name+':'+s.size+':'+Math.round(s.mtime||0)}).join('|');
+  if(sig===blStickerSig&&grid.getAttribute('data-sig')===sig)return;
+  blStickerSig=sig;grid.setAttribute('data-sig',sig);
+  grid.innerHTML=list.length?list.map(function(s){
+    // 带 mtime 做 cache-buster:表情包被替换/缩放后,浏览器不会还拿旧图
+    var url='/api/belial/sticker?name='+encodeURIComponent(s.name)+'&v='+Math.round(s.mtime||0);
+    return '<div class="blitem"><img src="'+url+'" loading="lazy" title="'+h(s.name)+' · '+fmtBytes(s.size)+
+      '" onclick="window.open(this.src,\\'_blank\\')">'+
+      '<div class="bn" title="'+h(s.name)+'">'+h(s.name)+'</div>'+
+      '<button class="bx" title="删除" onclick="delSticker(\\''+encodeURIComponent(s.name)+'\\')">×</button></div>';
+  }).join(''):'<div class="mut">还没有表情包。点「上传表情包」加几张(建议正方形、边长 300~800px)。</div>';
+}
+function delSticker(name){
+  var n=decodeURIComponent(name||'');
+  if(!confirm('删除表情包「'+n+'」?'))return;
+  fetch('/api/belial/stickers/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:n})})
+   .then(function(r){return r.json()}).then(function(j){toast(j.message||(j.ok?'已删除':'删除失败'));return tick()})
+   .catch(function(e){toast('删除失败:'+e.message)});
+}
+function uploadStickers(files){
+  var arr=Array.prototype.slice.call(files||[]);
+  if(!arr.length)return;
+  var i=0,okN=0,failN=0,max=(blData&&blData.maxStickerBytes)||5*1024*1024;
+  var note=document.getElementById('bluploadnote');
+  function next(){
+    if(i>=arr.length){
+      if(note)note.textContent='上传完成:成功 '+okN+' 张'+(failN?('，失败 '+failN+' 张'):'');
+      tick();return;
+    }
+    var f=arr[i++];
+    if(f.type&&!/^image\\//.test(f.type)){failN++;toast(f.name+' 不是图片');return next()}
+    if(f.size>max){failN++;toast(f.name+' 超过 '+fmtBytes(max));return next()}
+    if(note)note.textContent='正在上传 '+i+'/'+arr.length+' ...';
+    var fr=new FileReader();
+    fr.onload=function(){
+      var b64=String(fr.result||'').split(',')[1]||'';
+      fetch('/api/belial/stickers',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:f.name,data:b64})})
+       .then(function(r){return r.json()})
+       .then(function(j){if(j.ok){okN++;if(note)note.textContent='已上传「'+j.name+'」'}else{failN++;toast(j.message||'上传失败')}})
+       .catch(function(e){failN++;toast('上传失败:'+e.message)})
+       .then(next);
+    };
+    fr.onerror=function(){failN++;toast(f.name+' 读取失败');next()};
+    fr.readAsDataURL(f);
+  }
+  next();
+}
 // 分群游戏模式:每群两个小按钮(游戏王/炉石),当前那个高亮;点了就走 /api/mode 直接写 modes.json。
 // 不用开关样式的原因:这是「二选一」而不是开关,而且要一眼看出这群现在按哪个游戏走。
 function setMode(groupId,mode){act('mode',{groupId:groupId,mode:mode})}
@@ -723,6 +911,9 @@ function tick(){
 
     tbData=s.tieba||{groups:[],all:false,opened:0};
     renderTieba(false);
+
+    blData=s.belial||{groups:[],all:false,opened:0,stickers:[]};
+    renderBelial(false);
 
     renderTones(s.tone);
     renderNets(s.search);
@@ -1011,6 +1202,68 @@ const server = createServer(async (req, res) => {
       }
       if (!messages.length) return json(res, 400, { message: '没给要改的东西(groupId/on 或 prob/probAt)' });
       return json(res, 200, { ok: true, message: messages.join(';'), tieba: await groupsWithTieba().catch(() => null) });
+    }
+
+    // 银河皇帝模式(2026-10-26):① 分群开关 ② 表情包库(列表/看图/上传/删除)
+    // 开关直接写 belial/state.json —— monitor 每次回复前现读,点一下立即生效,不用重启。
+    if (path === '/api/belial' && req.method === 'POST') {
+      const { groupId, on } = await readBody(req);
+      if (typeof on !== 'boolean') return json(res, 400, { message: '缺少 on(布尔值)' });
+      const g = String(groupId ?? '*').trim() || '*';
+      if (g !== '*' && !/^\d{4,12}$/.test(g)) return json(res, 400, { message: '群号不合法' });
+      const r = belialSetOn(g, on);
+      if (!r.ok) return json(res, 400, { message: r.message || '设置失败' });
+      const where = g === '*' ? '全部群' : ((await groupsWithBelial().catch(() => ({ groups: [] })))
+        .groups.find(x => x.groupId === g)?.name || `群 ${g}`);
+      return json(res, 200, {
+        ok: true,
+        message: `${where}的${BELIAL_CN}已${on ? '开启' : '关闭'}`,
+        belial: await groupsWithBelial().catch(() => null),
+      });
+    }
+    if (path === '/api/belial/stickers' && req.method === 'GET') {
+      return json(res, 200, { ok: true, stickers: belialStickers(), maxBytes: BELIAL_MAX_STICKER });
+    }
+    if (path === '/api/belial/stickers' && req.method === 'POST') {
+      // 上传走 JSON(base64):前端 FileReader 读成 dataURL,这里拆掉前缀再按文件头校验。
+      // 12MB 的请求体上限足够 5MB 的原图(base64 约 6.7MB),再大就拒绝。
+      const body = await readBody(req, 12 * 1024 * 1024);
+      const data = String(body.data || '');
+      if (!data) return json(res, 400, { message: '没有收到文件内容' });
+      let buf;
+      try { buf = Buffer.from(data.replace(/^data:[^;]+;base64,/, ''), 'base64'); }
+      catch { return json(res, 400, { message: '文件内容不是合法的 base64' }); }
+      const r = belialAddSticker(buf, String(body.name || ''));
+      return json(res, r.ok ? 200 : 400, {
+        ...r,
+        message: r.ok ? `已上传「${r.name}」` : (r.message || '上传失败'),
+        stickers: belialStickers(),
+      });
+    }
+    if (path === '/api/belial/stickers/delete' && req.method === 'POST') {
+      const { name } = await readBody(req);
+      const r = belialDeleteSticker(String(name || ''));
+      return json(res, r.ok ? 200 : 400, {
+        ...r,
+        message: r.ok ? `已删除「${r.name}」` : (r.message || '删除失败'),
+        stickers: belialStickers(),
+      });
+    }
+    if (path === '/api/belial/sticker' && req.method === 'GET') {
+      // 给运维台 <img> 用。只认 stickers/ 下的图片文件,路径穿越在 belialStickerPath 里挡掉了。
+      const name = url.searchParams.get('name') || '';
+      const p = belialStickerPath(name);
+      if (!p) return json(res, 404, { message: '没有这张表情包' });
+      const mime = belialStickerMime(name);
+      let buf;
+      try { buf = readFileSync(p); } catch { return json(res, 500, { message: '读取表情包失败' }); }
+      res.writeHead(200, {
+        'Content-Type': mime || 'application/octet-stream',
+        'Content-Length': buf.length,
+        'Cache-Control': 'private, max-age=3600',
+        'X-Content-Type-Options': 'nosniff',
+      });
+      return res.end(buf);
     }
 
     if (path === '/api/mode' && req.method === 'POST') {      const { groupId, mode } = await readBody(req);

@@ -48,6 +48,14 @@ agent/modes.json
 # 贴吧模式的分群开关(运行时状态:运维台/群里随时切,首启以 TIEBA_ENABLED 为初值)
 agent/tieba/state.json
 
+# 银河皇帝模式的分群开关与运维台上传的表情包(种子表情包入库,上传的不入库)
+agent/belial/state.json
+agent/belial/stickers/up_*
+
+# 游戏王环境饼图(2026-10-26):贴吧抓取缓存 / 统计结果 / 生成的 PNG / 代表卡索引
+# 全部可重建;缓存目录里的 pages/threads 会随使用变大,不入库
+agent/ygometa/cache/
+
 # 用户投喂的屎素材 + 搬屎运行时数据(渲染临时文件 / 待反馈 / 源库 LRU 记忆)
 屎/
 agent/shitpost/tmp/

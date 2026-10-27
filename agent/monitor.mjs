@@ -25,6 +25,28 @@ import { buildQuestion as buildAiQuestion, buildQuestionRich as buildAiQuestionR
 import { getTone, setTone, systemPrompt as aiSystemPrompt, TONES, TONE_CN, TONE_DESC, tonePath } from './aichat/tone.mjs';
 import { runSearch, WEB_SEARCH_TOOL, providerText as searchProviderText, searchReady, pickProvider, SEARCH_COUNT } from './aichat/websearch.mjs';
 import { modeOf, setMode, parseModeCommand, MODE_CN, modesPath, allModes } from './modes.mjs';
+// 游戏王「环境饼图」(2026-10-26):@ 说「近期环境 / 环境 10月」→ 抓贴吧「上位卡组吧」按时间段
+// 统计上位卡组,回一张带时间段标记的饼图。抓取/缓存/统计/画图都在 ygometa/meta.mjs。
+import {
+  parseMetaTrigger, buildMetaPie, buildMetaPdf, parseTopSearch, searchTopDeck,
+  metaImageSegment, metaSelftest,
+} from './ygometa/meta.mjs';
+// 银河皇帝模式(2026-10-26):@ 时切「银河皇帝贝利亚」人格。状态/提示词/表情包库都在那个模块里,
+// 这里只负责「什么时候切、什么时候用这套提示词、回复后附不附表情包」。
+import {
+  isOn as belialOn, setOn as belialSetOn, parseCommand as belialParseCmd, allOn as belialAll,
+  systemPrompt as belialSystemPrompt, activationLine as belialActivation, againLine as belialAgain,
+  offLine as belialOff, statusLine as belialStatus, resolveSticker as belialResolveSticker,
+  stickerSegment as belialStickerSegment, listStickers as belialStickers,
+  addSticker as belialAddSticker, statePath as belialStatePath,
+  splitBelialReply, MAX_STICKERS as BELIAL_MAX_STICKERS,
+  FEATURE_CN as BELIAL_CN, PERSONA_CN as BELIAL_PERSONA, MAX_TOKENS as BELIAL_MAX_TOKENS,
+  TEMPERATURE as BELIAL_TEMPERATURE, MAX_REPLY as BELIAL_MAX_REPLY, REPLY_GAP_MS as BELIAL_GAP_MS,
+  THINK as BELIAL_THINK,
+} from './belial/belial.mjs';
+import { BELIAL_TOOLS, stickerCatalogText } from './belial/tools.mjs';
+import { dsSearch } from './belial/deepsearch.mjs';
+import { searchStickerImages, downloadSticker as downloadStickerImage } from './belial/stickersearch.mjs';
 // 贴吧模式(2026-09-28):不用 @ 就插嘴的「贴吧鱼」。状态/提示词/连发拆分都在那个模块里,
 // 这里只负责「什么时候叫它」与「把回复发出去」(见本文件的 tiebaOnMessage / tiebaFire)。
 import {
@@ -66,6 +88,33 @@ const BOT_ID = (process.env.BOT_ID || '3757588606').toString();
 // OneBot 的 @全体成员 段长这样:{type:'at', data:{qq:'all'}} —— 它不是某个人的 qq,
 // 落到「查不到名字」的兜底分支里会被当成真人,或被误渲染成 @all(2026-09-20 修,见 atText)。
 const AT_ALL = 'all';
+
+// ---------- QQ 自带机器人(官方机器人)的 @ 一律不接(2026-10-21) ----------
+// 用户要求:「被入群机器人 @ 不进行回复(QQ 自带的 bot)」。这不是洁癖,线上真出过事:
+//   2026-10-16 群 556920058(次世代唐人街),机器人重新进群 → Q群管家(2854196310)的欢迎语 @ 了它 →
+//   它照惯例回复(所有回复都会先 @ 触发者)→ 管家回「嗨~,我是Q群管家,可以发送入群欢迎和定时消息……」
+//   也 @ 它 → 又回 …… 4 秒内来回 5 轮;最后一条正好撞上「你已被移出该群」,成了 10-20 那起
+//   「无限重试烧光 token」事故的毒条目。跟 QQ 自带机器人对话纯属空转:它们不是群成员,也不看回复。
+// 三个判据,任一命中即当自带机器人(只看**发送者**,不按昵称 —— 昵称能改,真人也能叫「Q群管家」):
+//   ① 已知官方 uin:Q群管家 2854196310 / QQ小冰 2854196306;env `BOT_IGNORE_IDS` 可追加(逗号分隔)
+//   ② uin 落在腾讯官方号段 `2854xxxxxx`(10 位、2854 开头;线上「Q群管家」「是萌卡喵呢」都在里面)
+//   ③ 消息里带 markdown / inline_keyboard 段 —— 只有 QQ 官方机器人有权限发这两种段
+//      (线上 2854211260「是萌卡喵呢」发的就是 [at][markdown][inline_keyboard])
+const BUILTIN_BOT_IDS = new Set(['2854196310', '2854196306']);
+for (const id of String(process.env.BOT_IGNORE_IDS || '').split(/[,，\s]+/)) {
+  const x = id.trim();
+  if (x) BUILTIN_BOT_IDS.add(x);
+}
+const BUILTIN_BOT_ID_RE = /^2854\d{6}$/;
+const BUILTIN_BOT_SEG_TYPES = new Set(['markdown', 'inline_keyboard']);
+/** 这条消息是不是 QQ 自带的机器人发的。既吃 WS 事件(message 段),也吃 inbox 条目(segs)。 */
+export function isQqBuiltinBot(msg) {
+  const uid = String(msg?.user_id ?? '').trim();
+  if (!uid || uid === BOT_ID) return false;      // 自己说的另有一条「不能自问自答」管
+  if (BUILTIN_BOT_IDS.has(uid) || BUILTIN_BOT_ID_RE.test(uid)) return true;
+  const segs = msg?.message || msg?.segs || [];
+  return segs.some(s => BUILTIN_BOT_SEG_TYPES.has(String(s?.type ?? '')));
+}
 const TRIGGER_KEYWORD = process.env.TRIGGER_KEYWORD || '史记总结'; // 史记体触发词
 const CARD_TRIGGER = process.env.CARD_TRIGGER || '效果';            // 查卡触发词:「效果 」后跟卡名
 const CARD_IMG_TRIGGER = process.env.CARD_IMG_TRIGGER || '卡图';     // 查卡图触发词:「卡图 」后跟卡名(只发图)
@@ -76,6 +125,7 @@ const DECK_TRIGGER = process.env.DECK_TRIGGER || '生成卡表';        // 卡�
 const SHIT_TRIGGER = process.env.SHIT_TRIGGER || '随机一搬';        // 搬屎触发词:纯规则筛选,发截图
 const SHIT_AI_TRIGGER = process.env.SHIT_AI_TRIGGER || '精选一搬';  // 搬屎触发词:规则粗筛 + AI 精挑
 const KUANGSHEN_TRIGGER = process.env.KUANGSHEN_TRIGGER || '框神语录'; // 框神语录触发词:从精筛语录库随机抽一条
+const META_TRIGGER = '环境';                                          // 环境饼图:近期环境 / 环境 10月 / 环境 9.1-9.15
 // ---------- 炉石传说功能(2026-09-20 新增)----------
 // 触发词与游戏王的**故意重叠**(「效果」「卡图」「每日一卡」):同一句话按本群 mode 走哪个游戏,
 // 由「mode 游戏王/炉石」决定(见 modes.mjs)。另外两个炉石专属触发词:
@@ -214,15 +264,26 @@ function loadProcessed() {
 // bot 昵称集合(纯文本 @ 识别用):启动时从登录信息拉取,昵称变更后无需改代码
 let botNicknames = new Set(['测试bot.fd']);
 
-function isMentioningBot(ev) {
-  if (ev.post_type !== 'message' || ev.message_type !== 'group') return false;
-  if (String(ev.user_id) === BOT_ID) return false;
+// 原始判据:这条消息有没有 @ 机器人(不管发送者是谁)。拆出来是为了「带日志的忽略」
+// —— WS 层要靠它认出「QQ 自带机器人 @ 了我」并打一行,而 isMentioningBot 已经把这类事件挡掉了。
+function mentionsBotRaw(ev) {
   if ((ev.message || []).some(s => s.type === 'at' && String(s.data?.qq) === BOT_ID)) return true;
   if (new RegExp(`\\[CQ:at,qq=${BOT_ID}(?:,[^\\]]*)?\\]`).test(ev.raw_message || '')) return true;
   // 纯文本 @(QQ 端手动输入「@昵称」时没有 at 段,只有 text):@机器人昵称 或 @BOT_ID
   const raw = ev.raw_message || (ev.message || []).map(s => s.data?.text || '').join('');
   const nicks = [...botNicknames].map(n => n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
   return new RegExp(`@\\s*(?:${BOT_ID}|${nicks})`).test(raw);
+}
+
+/**
+ * 统一入口:这条群消息该不该进 inbox 排队(补漏也走它)。
+ * 2026-10-21 起多一道:QQ 自带机器人(群管家/入群欢迎/官方 bot)发来的 @ **不算 @** —— 不排队、不回复。
+ */
+function isMentioningBot(ev) {
+  if (ev.post_type !== 'message' || ev.message_type !== 'group') return false;
+  if (String(ev.user_id) === BOT_ID) return false;
+  if (isQqBuiltinBot(ev)) return false;          // 自带机器人:一律不接,见 isQqBuiltinBot 上面的注释
+  return mentionsBotRaw(ev);
 }
 
 async function api(action, params) {
@@ -414,6 +475,12 @@ const aiSystem = (hasImages = false, tone = getTone()) => aiSystemPrompt({
 // 网络/超时错误与「后端 4xx」分开:4xx 才值得退让重试(参数不认),超时重来一轮只是把群友的等待翻倍。
 class AiHttpError extends Error {}
 
+// 「换参数救不回来」的 4xx(2026-10-20 抽出来的):401 key 不对 / 402 余额不足 / 403 没权限 / 404 模型名不存在。
+// 退让阶梯对这类错毫无作用,重试只会把 1 次失败放大成 4~5 次请求(事故里就是这么烧的)。
+export function aiErrorIsPermanent(message) {
+  return /^HTTP (401|402|403|404)\b/.test(String(message || ''));
+}
+
 /**
  * 闲聊调用(带「4xx 就退让」的阶梯)。
  * @param opts 透传给 aiChatOnce 的采样参数:temperature / maxTokens,以及
@@ -443,6 +510,142 @@ async function aiChat(system, userText, images = [], opts = {}) {
     } catch (e) {
       lastErr = e;
       if (!(e instanceof AiHttpError) || !/^HTTP 4/.test(e.message)) throw e;
+      // 401/402/403/404 是「key 不对 / 余额不足 / 没权限 / 模型名不存在」—— 退让阶梯(去工具、去思考、去图)
+      // 对它们**一点救都没有**,只会把一次失败放大成 4~5 次请求。
+      // 2026-10-20 事故的放大器就是这条:一轮失败打 4 个 402,整段日志里 2135 个 402 对应 6403 行重试。
+      if (aiErrorIsPermanent(e.message)) {
+        const hint = /^HTTP 402/.test(e.message) ? '(余额不足:去充值或换 key)' : '';
+        log(`  ⚠ ${chatTag}后端拒绝 ${e.message.slice(0, 60)}${hint} 这类错换参数救不回来,不再重试`, '', C.red);
+        throw e;
+      }
+    }
+  }
+  throw lastErr;
+}
+
+// ---------- 银河皇帝工具循环(2026-10-26) ----------
+// 用户要求:表情包不再按概率发,改成模型能调的 send_sticker;同时给模型 DS 官方联网搜索、
+// 图片搜索、下载表情包的权限。这里实现 OpenAI / DeepSeek function calling 循环:
+//   模型要工具 → 本地执行(搜/挑图/下载) → 结果作为 tool 消息回填 → 模型接着写正文。
+// 省钱/防刷护栏:搜索≤2、图片搜索≤2、下载≤1、一次最多安排2张表情包、工具轮数≤6。
+const BELIAL_MAX_SEARCHES = Math.max(0, Number(process.env.BELIAL_MAX_SEARCHES || 2));
+const BELIAL_MAX_IMAGE_SEARCHES = Math.max(0, Number(process.env.BELIAL_MAX_IMAGE_SEARCHES || 2));
+const BELIAL_MAX_DOWNLOADS = Math.max(0, Number(process.env.BELIAL_MAX_DOWNLOADS || 1));
+const BELIAL_SEARCH_COUNT = Math.min(10, Math.max(1, Number(process.env.BELIAL_SEARCH_COUNT || 5)));
+const BELIAL_MAX_TOOL_ROUNDS = Math.max(1, Number(process.env.BELIAL_MAX_TOOL_ROUNDS || 6));
+
+/** 单次工具循环(不带 4xx 退让;退让在 aiChatBelial 里做) */
+async function runBelialToolLoop(entry, system, userText, images, allowTools, thinkOff) {
+  const messages = [{ role: 'system', content: system }, { role: 'user', content: buildUserContent(userText, images) }];
+  const stickers = [];
+  let searches = 0, imageSearches = 0, downloads = 0;
+  for (let round = 0; round < BELIAL_MAX_TOOL_ROUNDS; round++) {
+    // 最后一轮不再挂工具,逼它用已有材料把正文写出来
+    const withTools = allowTools && round < BELIAL_MAX_TOOL_ROUNDS - 1;
+    const j = await postChat({
+      model: AI_MODEL,
+      messages,
+      temperature: BELIAL_TEMPERATURE,
+      max_tokens: BELIAL_MAX_TOKENS,
+      ...(thinkOff ? { reasoning_effort: 'none' } : {}),
+      ...(withTools ? { tools: BELIAL_TOOLS, tool_choice: 'auto' } : {}),
+    }, '银河皇帝');
+    const msg = j?.choices?.[0]?.message;
+    if (!msg) throw new Error(`${AI_MODEL} 返回结构不对:${JSON.stringify(j).slice(0, 200)}`);
+    const calls = (msg.tool_calls || []).filter(c => c?.function?.name);
+    if (!calls.length) {
+      const text = String(msg.content || '').trim();
+      // 允许「只发表情包」:模型可以调完 send_sticker 后不写正文
+      if (!text && !stickers.length) throw new Error(`${AI_MODEL} 返回空回复${round ? '(工具调用之后没接上话)' : ''}`);
+      return { text, stickers };
+    }
+    messages.push({ role: 'assistant', content: msg.content || '', tool_calls: msg.tool_calls });
+    for (const c of calls) {
+      const name = c.function?.name || '';
+      const args = (() => { try { return JSON.parse(c.function?.arguments || '{}'); } catch { return {}; } })();
+      let result = '';
+      try {
+        if (name === 'web_search') {
+          const q = String(args.query || '').trim();
+          if (searches >= BELIAL_MAX_SEARCHES) {
+            result = `本次联网搜索次数已用完(${BELIAL_MAX_SEARCHES} 次),用已有材料回答。`;
+          } else if (!q) {
+            result = '搜索词为空,没有执行搜索。';
+          } else {
+            searches++;
+            const r = await dsSearch(q, { count: BELIAL_SEARCH_COUNT, oriQuestion: args.ori_question || '', log });
+            log('  🔎 DS搜索:', `${q} → ${r.ok ? `${r.count} 条(deepseek)` : r.error}`, r.ok ? C.dim : C.yellow);
+            bumpSearchStat(r.ok, r.provider || 'deepseek');
+            result = r.ok ? r.text : `搜索失败(${r.error})。没有搜到东西,按已有知识回答;不确定就直说。`;
+          }
+        } else if (name === 'list_stickers') {
+          result = stickerCatalogText();
+        } else if (name === 'send_sticker') {
+          if (stickers.length >= BELIAL_MAX_STICKERS) {
+            result = `本次已经安排了 ${BELIAL_MAX_STICKERS} 张表情包,别再发了。`;
+          } else {
+            const picked = belialResolveSticker({ name: args.name, scene: args.scene });
+            if (!picked) result = '表情包库是空的,没图可发。';
+            else if (stickers.includes(picked)) result = `《${picked}》已经安排过了,换一张或别发。`;
+            else {
+              stickers.push(picked);
+              log('  🖼 安排表情包:', picked, C.dim);
+              result = `已安排《${picked}》,会在文字回复后单独发。`;
+            }
+          }
+        } else if (name === 'search_stickers') {
+          const q = String(args.query || '').trim();
+          if (imageSearches >= BELIAL_MAX_IMAGE_SEARCHES) {
+            result = `本次图片搜索次数已用完(${BELIAL_MAX_IMAGE_SEARCHES} 次)。`;
+          } else if (!q) {
+            result = '图片搜索词为空。';
+          } else {
+            imageSearches++;
+            const r = await searchStickerImages(q, { count: 6 });
+            log('  🖼 搜图:', `${q} → ${r.ok ? `${r.count} 张` : r.error}`, r.ok ? C.dim : C.yellow);
+            result = r.ok ? r.text : `图片搜索失败(${r.error})。`;
+          }
+        } else if (name === 'download_sticker') {
+          const url = String(args.url || '').trim();
+          if (downloads >= BELIAL_MAX_DOWNLOADS) {
+            result = `本次下载次数已用完(${BELIAL_MAX_DOWNLOADS} 次)。`;
+          } else if (!url) {
+            result = '图片 URL 为空。';
+          } else {
+            downloads++;
+            const r = await downloadStickerImage(url, args.name || '');
+            log('  ⬇ 下载表情包:', r.ok ? `${r.name} (${Math.round(r.size / 1024)}KB)` : r.error, r.ok ? C.green : C.yellow);
+            result = r.ok ? `已下载《${r.name}》,可以用 send_sticker 发它。` : `下载失败(${r.error})。`;
+          }
+        } else {
+          result = `未知工具:${name}`;
+        }
+      } catch (e) {
+        result = `工具执行失败:${e.message}`;
+      }
+      messages.push({ role: 'tool', tool_call_id: c.id, content: String(result).slice(0, 4000) });
+    }
+  }
+  throw new Error(`工具调用轮数过多(${BELIAL_MAX_TOOL_ROUNDS} 轮)`);
+}
+
+/** 银河皇帝对话:带工具;碰到 4xx 依次退让(去工具 → 带思考 → 去图片) */
+async function aiChatBelial(entry, system, userText, images = []) {
+  const ladder = [
+    { tools: true, thinkOff: !BELIAL_THINK, images, tag: '' },
+    { tools: false, thinkOff: !BELIAL_THINK, images, tag: '去掉工具' },
+    ...(BELIAL_THINK ? [{ tools: false, thinkOff: true, images, tag: '带上思考' }] : []),
+    ...(images.length ? [{ tools: false, thinkOff: true, images: [], tag: '去掉图片' }] : []),
+  ];
+  let lastErr;
+  for (const step of ladder) {
+    try {
+      if (step.tag) log(`  银河皇帝重试(${step.tag})...`, '', C.dim);
+      return await runBelialToolLoop(entry, system, userText, step.images, step.tools, step.thinkOff);
+    } catch (e) {
+      lastErr = e;
+      if (!(e instanceof AiHttpError) || !/^HTTP 4/.test(e.message)) throw e;
+      if (aiErrorIsPermanent(e.message)) throw e;
     }
   }
   throw lastErr;
@@ -450,8 +653,7 @@ async function aiChat(system, userText, images = [], opts = {}) {
 
 // 图片按 OpenAI 多模态格式附在正文后面;**必须是 data URL**(data:image/jpeg;base64,...)——
 // 实测传裸 base64 会被拒「Unsupported image_url format」(2026-09-17)。
-function buildUserContent(text, images) {
-  if (!images?.length) return text;
+function buildUserContent(text, images) {  if (!images?.length) return text;
   return [
     { type: 'text', text },
     ...images.map(im => ({ type: 'image_url', image_url: { url: `data:${im.mime};base64,${im.b64}` } })),
@@ -613,6 +815,7 @@ function looksLikeAiChat(entry) {
   const text = (entry.text || '').replace(/\[at\]/g, ' ');
   if (!text.trim()) return false;
   if (isHelpRequest(text)) return false;
+  if (belialParseCmd(text).triggered) return false;
   if (text.includes(TRIGGER_KEYWORD)) return false;
   if (text.includes(DAILY_KEYWORD)) return false;
   if (extractCardQuery(entry, DECK_TRIGGER).triggered) return false;
@@ -668,6 +871,9 @@ function aiCooldownBlocked(uid, now = Date.now(), ms = AI_CHAT_COOLDOWN_MS) {
 
 async function processAiChat(entry) {
   const uid = String(entry.user_id);
+  // 银河皇帝模式:本群开着 + 有聊天 key。**必须在拼消息之前定** —— 提问正文里的「@你」
+  // 称呼要跟着人格走(aichat 的 deps.botName),否则提示词里会看到「@你(史官)」这种旧身份。
+  const belialPersona = belialOn(entry.group_id) && !!AI_API_KEY;
   // 冷却(2026-09-21 用户要求去掉):`AI_CHAT_COOLDOWN_MS=0` 即**彻底关闭** —— 连时间戳都不记,
   // 也就不会有「跳过时打的日志」和残留状态。默认仍是 15000(15s/人),所以想恢复只要改 .env 再重启,
   // 不用动代码(改的是启动期常量,必须重启才生效;面板 3 键只管开/关这个功能)。
@@ -694,6 +900,7 @@ async function processAiChat(entry) {
   try {
     const rich = await buildAiQuestionRich(entry, {
       botId: BOT_ID,
+      botName: belialPersona ? '贝利亚' : undefined,
       log: m => log(' ', m, C.dim),
       getMsg: id => api('get_msg', { message_id: id }),
       memberName: qq => names?.get(String(qq)) || resolveMemberName(entry.group_id, qq),
@@ -707,7 +914,33 @@ async function processAiChat(entry) {
   // 剥掉 @ 段标记(形如 [at])与多余空白 —— 只作用于**降级路径**(没有 segs 的老条目 / 解析失败时)。
   // 两条路都会被这个占位符碰到:AI 闲聊把它渲染成「@你(史官)」,贴吧模式渲染成「@你(贴吧鱼)」,
   // 两个都剥掉(以前只剥史官那个,贴吧模式下「@你(贴吧鱼)」会被当成提问正文,模型还以为是别人说的)。
-  q = q.replace(/@你\((?:史官|贴吧鱼)\)/g, ' ').replace(/\s+/g, ' ').trim() || '(无文字,仅@)';
+  q = q.replace(/@你\((?:史官|贴吧鱼|贝利亚)\)/g, ' ').replace(/\s+/g, ' ').trim() || '(无文字,仅@)';
+  // ===== 银河皇帝模式:开着就整条覆盖 @ 的回复(固定人格 + 工具调用 + 思考) =====
+  // 放在贴吧模式之前:两个都开时,@ 的消息归银河皇帝;不 @ 的普通群聊仍归贴吧鱼(tiebaFire 那条路)。
+  // 这条路的模型可以自己调:send_sticker(自主发表情包)、web_search(DS 官方搜索)、
+  // search_stickers/download_sticker(找图/下图入库)。见 runBelialToolLoop。
+  if (belialPersona) {
+    log(`  ${AI_MODEL} 生成中 ...(人格:${BELIAL_PERSONA}${images.length ? `,含 ${images.length} 张图` : ''})`, '', C.dim);
+    try {
+      const result = await aiChatBelial(entry, belialSystemPrompt({
+        now: nowText(),
+        hasImages: images.length > 0,
+        at: true,
+        recent: belialRecent.get(String(entry.group_id)) || [],
+      }), `${ctx}@你的人: ${entry.nickname}\nTA 的话: ${q}`, images);
+      const head = (result.text || '(只发表情包)').replace(/\n/g, ' / ').slice(0, 80);
+      log('  回复:', `${head}${result.stickers.length ? ` + 表情包 ${result.stickers.length} 张(${result.stickers.join('/')})` : ''}`, C.green);
+      await sendBelialReply(entry, result.text, { stickers: result.stickers });   // 1~3 条 + 模型安排的表情包
+      if (!DRY_RUN) bumpAiChatStat(entry, true);
+    } catch (e) {
+      log('  银河皇帝模式失败:', e.message, C.red);
+      // 兜底也吞掉发不出去的错(与 AI 闲聊/贴吧模式同一条护栏,见 2026-10-20 事故)
+      try { await sendReply(entry, '……卡了,等会儿。'); } catch (e2) { log('  兜底那句也发不出:', e2.message, C.red); }
+      if (!DRY_RUN) bumpAiChatStat(entry, false);
+    }
+    appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
+    return;
+  }
   // 档位**每次请求现读**(tone.json 是热切的,运维台一点就生效;读几 KB 的 JSON 相比一次模型调用可忽略)
   const tone = getTone();
   // ===== 贴吧模式开着时,**这条 @ 的路整条被贴吧模式覆盖**(用户 2026-09-28 明确要求)=====
@@ -735,7 +968,9 @@ async function processAiChat(entry) {
       if (!DRY_RUN) bumpAiChatStat(entry, true);
     } catch (e) {
       log('  贴吧模式(@)失败:', e.message, C.red);
-      await sendGroupText(entry.group_id, '行,你赢了,我没词了。');   // 兜底也不切换回助手口吻
+      // ⚠ 兜底那句也发不出去时**必须吞掉**:2026-10-20 事故就是因为这里第二次抛出来,
+      //   跳过了下面的 appendFileSync(PROCESSED) —— 那条消息于是永远不算「处理过」,被 15 秒一轮无限重试。
+      try { await sendGroupText(entry.group_id, '行,你赢了,我没词了。'); } catch (e2) { log('  兜底那句也发不出:', e2.message, C.red); }
       if (!DRY_RUN) bumpAiChatStat(entry, false);
     }
     appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
@@ -750,10 +985,129 @@ async function processAiChat(entry) {
     if (!DRY_RUN) bumpAiChatStat(entry, true);            // 记账:这条回复给了谁
   } catch (e) {
     log('  AI 闲聊失败:', e.message, C.red);
-    await sendReply(entry, '史官一时语塞,稍后再问。');
+    // 同上:兜底提示语发失败**不能往外抛**,否则这条消息永远进不了 processed(见文件上方「事故」注释)。
+    try { await sendReply(entry, '史官一时语塞,稍后再问。'); } catch (e2) { log('  兜底那句也发不出:', e2.message, C.red); }
     if (!DRY_RUN) bumpAiChatStat(entry, false);
   }
   appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
+}
+
+// ========== 银河皇帝模式(2026-10-26 新增) ==========
+// 一句话:群里 **@机器人 说「银河皇帝」** → 本群切成「银河皇帝贝利亚」,@ 的回复全按这套人格走;
+// 说「银河皇帝 关」切回。提示词、状态、表情包库都在 agent/belial/belial.mjs,这里只做接线。
+//
+// 与贴吧模式的优先级(两个都开时):
+//   · @ 了机器人的消息 → **银河皇帝优先**(这是明确的身份切换,比贴吧的「@ 也归我管」更具体);
+//   · 没 @ 的普通群聊 → 仍归贴吧鱼(银河皇帝只在 @ 时说话)。
+//
+// 2026-10-26 用户要求「可能回 1-3 句、表情包独立成句、符合真人发送习惯」:
+//   · 文本拆成 1~3 条:第一条 @ 触发者,后续不 @,像真人补话;
+//   · 表情包**只在模型调 send_sticker 时发**,单独一条,不再按概率/间隔自动发。
+// 每群记最近说过的几条(防复读):下次生成时塞进系统提示词,让模型自己换说法,
+// 而不是给一张固定回复表。用户 2026-10-26:「典型句式不要固定回复,也要过 ai 思考生成」。
+const belialRecent = new Map();
+function belialRemember(gid, lines) {
+  const key = String(gid);
+  const arr = belialRecent.get(key) || [];
+  for (const l of lines || []) {
+    const s = String(l || '').trim();
+    if (s) arr.push(s);
+  }
+  while (arr.length > 8) arr.shift();
+  belialRecent.set(key, arr);
+}
+
+/** 发一条纯图片消息(不 @ 人;表情包独立成句用) */
+async function sendGroupImage(groupId, seg) {
+  if (DRY_RUN) {
+    log('  [DRY_RUN] 不发送(表情包): 模型安排了一张', '', C.yellow);
+    return null;
+  }
+  if (isDeadGroup(groupId)) throw new DeadGroupError(`本群已被标记为不可发送,不再尝试: ${groupId}`);
+  const r = await api('send_group_msg', { group_id: groupId, message: [seg] });
+  if (r.status !== 'ok') throw sendFailure(r, groupId);
+  return r.data?.message_id;
+}
+
+/**
+ * 发一条银河皇帝回复:文本 1~3 条(第一条 @ 触发者,后续不 @),然后把模型通过
+ * send_sticker 工具安排的表情包逐条单独发出去。模型没安排就不发图。
+ * 用户 2026-10-26:「可能回复 1-3 句,表情包独立成句,符合真人发送习惯」。
+ */
+async function sendBelialReply(entry, text, { stickers = [] } = {}) {
+  const gid = entry.group_id;
+  const lines = text ? splitBelialReply(text, { max: BELIAL_MAX_REPLY }) : [];
+  if (!lines.length && !stickers.length) throw new Error('模型没说人话(空回复)');
+  for (let i = 0; i < lines.length; i++) {
+    if (i) await new Promise(r => setTimeout(r, BELIAL_GAP_MS));
+    if (i === 0) await sendReply(entry, lines[i]);      // 第一条 @ 触发者
+    else await sendGroupText(gid, lines[i]);            // 后续不 @,像真人补话
+    log(`  银河皇帝 ${i + 1}/${lines.length}:`, lines[i], C.green);
+  }
+  if (lines.length) belialRemember(gid, lines);          // 记进本群「最近说过」,防下一轮复读
+  // 表情包:模型自己挑的,每条单独发;发不出去不影响文字
+  for (const name of stickers.slice(0, BELIAL_MAX_STICKERS)) {
+    await new Promise(r => setTimeout(r, BELIAL_GAP_MS));
+    const seg = belialStickerSegment(name);
+    if (!seg) { log('  银河皇帝表情包:', `${name} 已不存在,跳过`, C.yellow); continue; }
+    try {
+      await sendGroupImage(gid, seg);
+      log('  银河皇帝表情包:', `${name}(单独一条)`, C.green);
+    } catch (e) {
+      log('  银河皇帝表情包发送失败:', e.message, C.yellow);
+    }
+  }
+}
+
+/** 启动横幅上那一段银河皇帝摘要(哪几个群开着、表情包几张) */
+function belialStartupText() {
+  if (!AI_API_KEY) return 'OFF(没配聊天 key)';
+  const st = belialAll();
+  const on = st.all ? ['全部群'] : st.groups.filter(g => g !== '*');
+  return `${on.length ? on.join(',') : '全部关闭'}(表情包 ${belialStickers().length} 张,模型自主发,每次 ≤${BELIAL_MAX_STICKERS} 张)`;
+}
+
+/**
+ * 群里的「银河皇帝 / 银河皇帝 开 / 银河皇帝 关」指令。
+ * 激活台词是**固定的短句**(不叫模型),这样「输入关键词立刻换身份」稳定、不花钱;
+ * 之后每一条 @ 才走模型(processAiChat 里的 belial 分支)。
+ */
+export async function processBelialSwitch(entry, cmd) {
+  const gid = entry.group_id;
+  const onNow = belialOn(gid);
+  if (cmd.on === null) {                                   // 只喊「银河皇帝状态」→ 报状态(不带关闭提示)
+    await sendReply(entry, belialStatus(onNow));
+    return;
+  }
+  if (!cmd.on) {                                           // 关闭:任何时候都允许(不需要 key)
+    const r = belialSetOn(gid, false);
+    if (!r.ok) {
+      await sendReply(entry, '……状态写不进去,稍后再试。');
+      return;
+    }
+    log('  银河皇帝模式:', `${gid} → OFF`, C.green);
+    await sendReply(entry, belialOff());
+    return;
+  }
+  if (!AI_API_KEY) {
+    await sendReply(entry, '……卡了,服务器没配聊天 key。');
+    return;
+  }
+  if (!FEAT.ai) {
+    await sendReply(entry, '……AI 闲聊总开关关着,开了也不回。');
+    return;
+  }
+  if (onNow) {                                             // 已经开着:再喊一次就再登场一次
+    await sendBelialReply(entry, belialAgain());
+    return;
+  }
+  const r = belialSetOn(gid, true);
+  if (!r.ok) {
+    await sendReply(entry, '……状态写不进去,稍后再试。');
+    return;
+  }
+  log('  银河皇帝模式:', `${gid} → ON(人格 ${BELIAL_PERSONA})`, C.green);
+  await sendBelialReply(entry, belialActivation());
 }
 
 // ========== 贴吧模式(2026-09-28 新增,需求见 worklist-0928:功能注册名「贴吧模式」) ==========
@@ -823,12 +1177,14 @@ async function tiebaContext(groupId) {
 export async function tiebaShouldReply(j, { rand = Math.random, log_ = true } = {}) {
   const gid = String(j.group_id);
   if (String(j.user_id) === BOT_ID) return false;                      // 自己说的
+  if (isQqBuiltinBot(j)) return false;                                 // QQ 自带机器人(群管家/入群欢迎)说的——不接,2026-10-21
   // @ 了机器人的消息一律不接 —— 那些走 inbox/processQueue 那条分流器(AI 闲聊或某个功能)。
   // ⚠ 这道判断**必须在这里**(而不是只在 tiebaOnMessage 里):tiebaShouldReply 是导出的、自测也直接调它,
   //   判据集中在一处才不会出现「自测过的路」与「线上跑的路」不是同一条(2026-09-28 就在线上自测里露出来了:
   //   本机因为没配 key 提前返回,这条断言是「假过」的,线上有 key 才暴露)。
   if ((j.message || []).some(s => s.type === 'at' && String(s.data?.qq) === BOT_ID)) return false;
   if (!tiebaOn(gid) || !tiebaReady()) return false;                    // 本群没开 / 没配聊天 key
+  if (isDeadGroup(gid)) return false;                                  // 本群已发不出去 → 别叫模型白花钱(2026-10-20)
   if (tiebaBusy.has(gid)) return false;                                // 上一句还在生成
   const rawText = (j.message || []).map(s => s.type === 'text' ? (s.data?.text || '') : '').join('').trim();
   const hasImage = (j.message || []).some(s => s.type === 'image' || s.type === 'mface');
@@ -851,12 +1207,15 @@ export function isKeywordMessage(j) {
   const mode = modeOf(j.group_id);
   if (isHelpRequest(text)) return true;
   if (parseModeCommand(text).triggered) return true;
+  if (belialParseCmd(text).triggered) return true;             // 「银河皇帝」自己也不接(走分流器)
   if (parseTiebaCmd(text).triggered) return true;              // 「贴吧模式 开/关」自己也不接
   if (text.includes(TRIGGER_KEYWORD)) return true;             // 史记总结
   if (text.includes(DAILY_KEYWORD)) return true;               // 每日一卡
   if (FEAT.kuangshen && text.includes(KUANGSHEN_TRIGGER)) return true;
   if (FEAT.shitpost && (text.includes(SHIT_TRIGGER) || text.includes(SHIT_AI_TRIGGER))) return true;
   if (mode === 'ygo') {
+    if (parseTopSearch(text)) return true;                       // 上位卡组检索(上位 烙印 10月)
+    if (parseMetaTrigger(text)) return true;                     // 环境饼图(近期环境 / 环境 10月)
     if (new RegExp(`${DECK_TRIGGER}[\\s\u3000]`).test(text)) return true;
     if (new RegExp(`${RULING_FULL_TRIGGER}[\\s\u3000]`).test(text)) return true;
     if (new RegExp(`${RULING_TRIGGER}[\\s\u3000]`).test(text)) return true;
@@ -934,6 +1293,7 @@ async function tiebaFire(j) {
 export function tiebaOnMessage(j) {
   if (j.post_type !== 'message' || j.message_type !== 'group') return;
   if (String(j.user_id) === BOT_ID) return;
+  if (isQqBuiltinBot(j)) return;                                                               // QQ 自带机器人:不进上下文、不接话
   if ((j.message || []).some(s => s.type === 'at' && String(s.data?.qq) === BOT_ID)) return;   // @ 了 → 走正常分流
   const gid = String(j.group_id);
   if (!tiebaOn(gid) || !tiebaReady()) return;
@@ -1058,6 +1418,37 @@ async function updateCardDb() {
 //   以前这里写的是 `{ text: '\n' + message }`,当时是为了让正文别跟 @ 段挤在一行 —— 但 OneBot/QQ 侧
 //   已经把 at 段单独渲染,那个换行就变成了消息开头的一行空白。所有出站文本统一用 noLead() 削掉行首换行。
 const noLead = s => String(s ?? '').replace(/^[\r\n]+/, '');
+
+// ---------- 「这个群已经发不出去了」的判定与记忆(2026-10-20 事故之后加的) ----------
+// 事故经过(bot 被踢出群的连锁反应,别再踩):
+//   10-16 17:40 机器人被踢出群 556920058(次世代唐人街),群里最后一条 @ 消息(seq=3463161)从此**永远发不出去**。
+//   而 processQueue 把任何失败都当成「临时失败」:15 秒重试一次,**每次重试都先叫一次模型、再发现发不出去**。
+//   → 从 10-16 17:40 烧到 10-20,约 2.2 万轮(每轮一次 DeepSeek 调用),余额被烧干;后半程全是 402 还在空转。
+// 三道护栏:
+//   ① 发送返回「你已被移出该群」这类**明确不可恢复**的措辞 → 记住该 group_id,之后同群消息**连模型都不叫**,
+//      直接标记已处理(见 processEntry 开头的 isDeadGroup 判断);
+//   ② 同一条消息连续失败 ENTRY_MAX_FAILS 次 → 放弃并标记(见 processQueue),毒条目再也堵不住队列;
+//   ③ 兜底提示语发送失败**不再往外抛**(见 processAiChat),否则那条消息永远进不了 processed。
+const DEAD_GROUP_RE = /你已被移出该群|被移出该群|不在该群|不在群内|你不在本群|群不存在|该群已解散|已被踢出/;
+class DeadGroupError extends Error {}
+const deadGroups = new Set();                    // group_id(String) → 已确认不可发送
+function isDeadGroup(gid) { return deadGroups.has(String(gid)); }
+function markDeadGroup(gid, why = '') {
+  const g = String(gid);
+  if (deadGroups.has(g)) return;
+  deadGroups.add(g);
+  log('⛔ 该群已不可发送:', `${g} ${why.slice(0, 80)} —— 之后本群消息不再叫模型、直接跳过(把 bot 拉回群并重启 monitor 可恢复)`, C.red);
+}
+// 发送失败的统一出口:能用返回措辞判定「永久失败」就记住并抛 DeadGroupError,其余照旧抛普通 Error
+function sendFailure(r, groupId) {
+  const detail = JSON.stringify(r).slice(0, 160);
+  if (DEAD_GROUP_RE.test(detail)) {
+    markDeadGroup(groupId, detail);
+    return new DeadGroupError(`发送失败(本群已不可发送,后续跳过): ${detail}`);
+  }
+  return new Error(`发送失败: ${detail}`);
+}
+
 async function sendReply(entry, message) {
   // 兼容三种形态: 字符串(文本) / 段数组(如文本+图片) / 单个段对象(如仅图片)
   const segs = Array.isArray(message)
@@ -1070,14 +1461,18 @@ async function sendReply(entry, message) {
     log(`  [DRY_RUN] 不发送: ${first.split('\n')[0].slice(0, 50)} ...`, '', C.yellow);
     return;
   }
+  if (isDeadGroup(entry.group_id)) throw new DeadGroupError(`本群已被标记为不可发送,不再尝试: ${entry.group_id}`);
   const r = await api('send_group_msg', {
     group_id: entry.group_id,
     message: [
       { type: 'at', data: { qq: String(entry.user_id) } },
+      // @ 段后补一个空格:2026-10-26 用户反馈,没有空格时 QQ 不会把 @ 真解析成 mention
+      // (显示成普通文本)。空格是独立 text 段,不会进正文、也不会像换行那样多出空行。
+      { type: 'text', data: { text: ' ' } },
       ...segs,
     ],
   });
-  if (r.status !== 'ok') throw new Error(`发送失败: ${JSON.stringify(r).slice(0, 120)}`);
+  if (r.status !== 'ok') throw sendFailure(r, entry.group_id);
   log('  已发送', `message_id=${r.data?.message_id}`, C.green);
   return r.data?.message_id;                        // 供反馈机制关联
 }
@@ -1091,11 +1486,12 @@ async function sendGroupText(groupId, text) {
     log(`  [DRY_RUN] 不发送(贴吧模式): ${String(text).slice(0, 50)} ...`, '', C.yellow);
     return null;
   }
+  if (isDeadGroup(groupId)) throw new DeadGroupError(`本群已被标记为不可发送,不再尝试: ${groupId}`);
   const r = await api('send_group_msg', {
     group_id: groupId,
     message: [{ type: 'text', data: { text: noLead(text) } }],
   });
-  if (r.status !== 'ok') throw new Error(`发送失败: ${JSON.stringify(r).slice(0, 120)}`);
+  if (r.status !== 'ok') throw sendFailure(r, groupId);
   return r.data?.message_id;
 }
 
@@ -1320,6 +1716,89 @@ async function processDeckList(entry, raw) {
   } catch (e) {
     log('  卡表生成失败:', e.message, C.red);
     await sendReply(entry, '生成失败');
+  }
+  appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
+}
+
+// ---------- 环境饼图(2026-10-26):贴吧「上位卡组吧」按时间段统计上位卡组 ----------
+// 用户要求:**只回一张带时间段标记的饼图,不 @、不多余说明**。所以这里走 sendGroupImage
+// (纯图片段、不加 at 段),与其它功能「回复均 at 触发者」的约定相反(同贴吧模式/表情包)。
+// 抓取与缓存都在 ygometa/meta.mjs:同时间段第二次问会直接命中缓存(不联网、不重画)。
+async function processYgoMeta(entry, range, { pdf = false } = {}) {
+  const t0 = Date.now();
+  log('  环境饼图:', `「${range.label}」查缓存/抓取 ...${pdf ? '(要 PDF)' : ''}`, C.dim);
+  try {
+    if (pdf) {
+      // 时间段后加 pdf → 只上传一份「饼图 + 三栏详细上位记录」PDF,不 @、不发文字
+      const r = await buildMetaPdf(range, { log: m => log('   ', m, C.dim) });
+      const name = `环境_${range.key.replace(/^m_/, '')}.pdf`;
+      const up = await api('upload_group_file', { group_id: entry.group_id, file: r.pdfPath, name });
+      if (up.status !== 'ok') throw new Error(`群文件上传失败: ${JSON.stringify(up).slice(0, 120)}`);
+      const kb = (readFileSync(r.pdfPath).length / 1024).toFixed(0);
+      log('  环境PDF已上传:', `${name} ${r.stats.entries} 副 / ${r.stats.posts} 场${r.cached ? ' [缓存]' : ''} ${kb}KB ${Date.now() - t0}ms`, C.green);
+    } else {
+      const r = await buildMetaPie(range, { log: m => log('   ', m, C.dim) });
+      const seg = metaImageSegment(r.pngPath);
+      await sendGroupImage(entry.group_id, seg);
+      const kb = (readFileSync(r.pngPath).length / 1024).toFixed(0);
+      log('  饼图已发送:', `${r.stats.entries} 副上位 / ${r.stats.posts} 场赛事 / ${r.stats.unique} 个主轴${r.cached ? ' [缓存]' : ''} ${kb}KB ${Date.now() - t0}ms`, C.green);
+    }
+  } catch (e) {
+    // 抓取/画图/上传失败(极少数):正常路径只发图或文件,失败才补一句短文字。
+    log('  环境饼图失败:', e.message, C.red);
+    try { await sendGroupText(entry.group_id, pdf ? '环境PDF生成失败,稍后再试。' : '环境饼图生成失败,稍后再试。'); } catch { /* 发不出就算了 */ }
+  }
+  appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
+}
+
+// ---------- 「上位 卡组 [时间]」:本地找链接 + 抓原帖构筑图(2026-10-26) ----------
+// 关键词只有「上位」,不依赖「环境」。成功时两条:第一条 时间/卡组/比赛/来源,第二条 构筑图。
+async function processTopSearch(entry, q) {
+  const t0 = Date.now();
+  if (q.error) {
+    try { await sendReply(entry, [{ type: 'text', data: { text: q.error } }]); } catch (e) { log('  上位检索提示发不出:', e.message, C.red); }
+    appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
+    return;
+  }
+  log('  上位检索:', `「${q.deck}」${q.range ? ` ${q.range.label}` : ' 最近'} ...`, C.dim);
+  try {
+    const r = await searchTopDeck(q.primary, q.range, { log: m => log('   ', m, C.dim) });
+    if (!r) {
+      const where = q.range ? q.range.label : '本地记录';
+      await sendReply(entry, [{ type: 'text', data: { text: `没找到「${q.deck}」在${where}的上位构筑图,换个时间或卡组名再试。` } }]);
+      appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
+      return;
+    }
+    const list = Array.isArray(r.list) && r.list.length ? r.list : [{
+      tid: r.thread.tid, entryName: r.entry.name, role: r.entry.role,
+      date: r.eventDate || ymdDash(new Date(r.thread.create * 1000)),
+      deck: r.entry.name, title: String(r.thread.title || '').replace(/\s+/g, ' ').trim(), url: r.url,
+    }];
+    const head = `上位「${q.deck || q.primary}」${q.range ? ` · ${q.range.label}` : ' · 最近'}（最近 ${list.length} 条）`;
+    const lines = [head];
+    list.forEach((x, i) => {
+      const role = x.role && x.role !== '上位' ? `${x.role} · ` : '';
+      lines.push(`${i + 1}. ${x.date} · ${role}${x.deck}`);
+      lines.push(`   ${String(x.title || '').replace(/\s+/g, ' ').trim().slice(0, 70)}`);
+      lines.push(`   ${x.url}`);
+    });
+    if (r.image) {
+      const idx = list.findIndex(x => x.tid === r.thread.tid && x.entryName === r.entry.name && x.role === r.entry.role);
+      if (idx >= 0) lines.push(`图片:第 ${idx + 1} 条`);
+    } else {
+      lines.push('（未找到可信的构筑图）');
+    }
+    const text = lines.join('\n');
+    await sendReply(entry, [{ type: 'text', data: { text } }]);
+    if (r.image) {
+      await sendGroupImage(entry.group_id, { type: 'image', data: { file: `base64://${r.image.buf.toString('base64')}` } });
+      log('  上位检索已发送:', `${r.eventDate || ''} ${r.entry.name} / ${list.length} 条 / 图片第 ${list.findIndex(x => x.tid === r.thread.tid && x.entryName === r.entry.name && x.role === r.entry.role) + 1} 条 / ${(r.image.buf.length / 1024).toFixed(0)}KB ${Date.now() - t0}ms`, C.green);
+    } else {
+      log('  上位检索已发送:', `${r.eventDate || ''} ${r.entry.name} / ${list.length} 条 / 仅文字(未找到可信构筑图) ${Date.now() - t0}ms`, C.green);
+    }
+  } catch (e) {
+    log('  上位检索失败:', e.message, C.red);
+    try { await sendReply(entry, [{ type: 'text', data: { text: '上位检索失败,稍后再试。' } }]); } catch { /* ignore */ }
   }
   appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
 }
@@ -1717,6 +2196,8 @@ ${common}`;
 
 ${TRIGGER_KEYWORD} — 以史记体文言文总结最近群聊
 ${DAILY_KEYWORD} — 抽今日之卡
+上位 卡组 [时间] — 查该卡组最近的上位构筑图,如「上位 烙印」「上位 烙印 10月」
+${META_TRIGGER} [时间段] — 上位卡组环境饼图,如「${META_TRIGGER}」「${META_TRIGGER} 10月」「${META_TRIGGER} 9.1-9.15」;后面加 pdf 返回带三栏详细记录的 PDF
 ${DECK_TRIGGER} [卡组内容（ydk文本/卡组码/分享链接）] — 生成巡回赛PDF卡表
 ${CARD_TRIGGER} [卡名] — 查卡牌效果，如「${CARD_TRIGGER} 青眼白龙」
 ${CARD_IMG_TRIGGER} [卡名] — 查卡图，如「${CARD_IMG_TRIGGER} 青眼白龙」
@@ -1727,12 +2208,36 @@ ${RULING_FULL_TRIGGER} [卡名] — 查完整裁定${kuangshen}${shit}${ai}`;
 // ---------- 处理单个请求 ----------
 export async function processEntry(entry) {
   const text = entry.text || '';
+  // 本群已被确认发不出去(被踢/解散)→ **直接标记已处理,连模型都不叫**。
+  // 这是 2026-10-20 事故的第一道护栏:钱花在「叫模型」上,发不出去的群连叫都不该叫。
+  if (isDeadGroup(entry.group_id)) {
+    log('⏭ 跳过', `seq=${entry.seq} 群 ${entry.group_id} 已标记为不可发送(不叫模型)`, C.yellow);
+    appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
+    return;
+  }
+  // QQ 自带的机器人(群管家/入群欢迎/官方 bot)发来的 @ **一律不接**(2026-10-21,判据见 isQqBuiltinBot)。
+  // 这里挡的是 inbox 里已经躺着的旧条目(例如事故里那 5 条 Q群管家):不叫模型、不回话,直接标记已处理。
+  if (isQqBuiltinBot(entry)) {
+    log('⏭ 跳过', `seq=${entry.seq} 来自 QQ 自带机器人「${entry.nickname}」(${entry.user_id}),不回复`, C.yellow);
+    appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
+    return;
+  }
   // 本群当前走哪个游戏的功能(默认游戏王);现读文件,所以运维台改完立即生效
   const mode = modeOf(entry.group_id);
   entry.mode = mode;                                // 帮助文本/日志用
   if (isHelpRequest(text)) {
     log('▶ 处理', `${entry.group_name} @${entry.nickname} seq=${entry.seq} [帮助]`, C.cyan);
     await sendReply(entry, buildHelpText(mode, entry.group_id));
+    appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
+    return;
+  }
+  // 「银河皇帝 / 银河皇帝 开|关」:切本群的隐藏人格(贝利亚)。与「mode …」「贴吧模式 …」同一类开关指令,
+  // 放在分流器前段、不受本群当前开关限制(不然关掉之后就没法用关键词开回来了)。
+  // 帮助文本里**不写**(用户要求),群友只能从运维台或口口相传知道。
+  const belialCmd = belialParseCmd(text);
+  if (belialCmd.triggered) {
+    log('▶ 处理', `${entry.group_name} @${entry.nickname} seq=${entry.seq} [${BELIAL_CN}]`, C.cyan);
+    await processBelialSwitch(entry, belialCmd);
     appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
     return;
   }
@@ -1777,6 +2282,21 @@ export async function processEntry(entry) {
   }
   // 游戏王专属指令:炉石模式下不响应(否则「生成卡表」「裁定」会被当成闲聊)
   if (mode === 'ygo') {
+    // 「上位 烙印」/「上位 烙印 10月」→ 第一条文字(时间/卡组/比赛/来源)+ 第二条构筑图
+    const top = parseTopSearch(text);
+    if (top) {
+      log('▶ 处理', `${entry.group_name} @${entry.nickname} seq=${entry.seq} [上位检索:${top.deck || top.error || ''}]`, C.cyan);
+      await processTopSearch(entry, top);
+      return;
+    }
+    // 「近期环境」/「环境 10月」/「环境 9.1-9.15」→ 一张带时间段标记的上位卡组饼图。
+    // 只认**整句开头**的触发词;后面的时间段解析不了就放行(「环境怎么样」仍然交给 AI 闲聊)。
+    const meta = parseMetaTrigger(text);
+    if (meta) {
+      log('▶ 处理', `${entry.group_name} @${entry.nickname} seq=${entry.seq} [环境饼图:${meta.range.label}${meta.pdf ? ' · PDF' : ''}]`, C.cyan);
+      await processYgoMeta(entry, meta.range, { pdf: meta.pdf });
+      return;
+    }
     const deckQuery = extractCardQuery(entry, DECK_TRIGGER);   // 「生成卡表 」+ ydk/卡组码/链接
     if (deckQuery.triggered) {
       log('▶ 处理', `${entry.group_name} @${entry.nickname} seq=${entry.seq} [生成卡表]`, C.cyan);
@@ -1897,6 +2417,18 @@ async function processHistory(entry) {
 }
 
 // ---------- 处理循环 ----------
+// 失败计数(2026-10-20 加的):以前任何失败都只是「不标记、下一轮再试」——一条**永远做不完**的消息
+// 就能把整个进程变成 15 秒一次的自动烧钱机(事故见 sendReply 上面的注释)。现在同一条最多试
+// ENTRY_MAX_FAILS 次(默认 3,可用 env 调),到顶就放弃并标记已处理;毒条目再也堵不住队列。
+const ENTRY_MAX_FAILS = Math.max(1, Number(process.env.ENTRY_MAX_FAILS || 3));
+const entryFails = new Map();                 // seq → 本次进程内连续失败次数
+function giveUpEntry(entry, why) {
+  appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
+  processedSeen.add(entry.seq);
+  entryFails.delete(entry.seq);
+  log('  → 放弃并标记为已处理', why, C.yellow);
+}
+
 async function processQueue() {
   if (processing) return;
   const pending = [];
@@ -1918,8 +2450,20 @@ async function processQueue() {
     try {
       await processEntry(entry);
       processedSeen.add(entry.seq);
+      entryFails.delete(entry.seq);
     } catch (e) {
-      log('✗ 失败:', e.message, C.red);
+      if (e instanceof DeadGroupError) {           // 永久失败:这个群发不出去了,重试一万次也一样
+        log('✗ 失败:', e.message, C.red);
+        giveUpEntry(entry, '本群已不可发送,不再重试');
+        continue;                                  // 继续处理后面的条目(别让一条毒消息挡住整队)
+      }
+      const n = (entryFails.get(entry.seq) || 0) + 1;
+      entryFails.set(entry.seq, n);
+      log('✗ 失败:', `${e.message}(${n}/${ENTRY_MAX_FAILS})`, C.red);
+      if (n >= ENTRY_MAX_FAILS) {
+        giveUpEntry(entry, `连续失败 ${n} 次,不再重试(免得 15 秒一次白烧 token;要改上限设 env ENTRY_MAX_FAILS)`);
+        continue;
+      }
       log('  稍后重试(不标记为已处理)', '', C.dim);
       break; // 失败即停,避免连环失败
     }
@@ -2086,6 +2630,15 @@ function connect() {
       handleEmojiLike(j);                                 // 表情反馈:搬屎点赞→入库 / 挥手→黑名单(屎视频+框神语录)
       return;
     }
+    // QQ 自带机器人(群管家/入群欢迎/官方 bot)的消息一律丢在这里 —— 不写 inbox、不进贴吧/语录上下文。
+    // 只在它确实 @ 了机器人的时候打一行(欢迎语平时也 @ 别人,不然面板会被刷屏)。
+    // 2026-10-21 加:一整条事故链就是 Q群管家欢迎语 @ 它 → 回 @ → 管家回 @ → 又回(见 isQqBuiltinBot 注释)。
+    if (j.post_type === 'message' && isQqBuiltinBot(j)) {
+      if (mentionsBotRaw(j)) {
+        log('⏭ 忽略 QQ 自带机器人 @', `[${j.group_name || j.group_id}] ${j.sender?.card || j.sender?.nickname || j.user_id}(${j.user_id})`, C.dim);
+      }
+      return;
+    }
     if (j.post_type === 'message') {
       // 框神语录实时采集:在 @过滤之前捕获该群该用户的全部发言(不 @ 也入库)
       if (FEAT.kuangshen) {
@@ -2171,6 +2724,102 @@ function selftestAt() {
 
 // 自测分支必须在 connect() 之前 —— 它自己 process.exit,不连 WS 也不碰 tmux 面板
 if (process.argv.includes('--selftest-at')) selftestAt();
+
+// ---------- 自测:处理队列的「不许无限重试」护栏(2026-10-20 加) ----------
+// 事故:一条**永远发不出去**的消息(inbox 里有、processed 里没有)让 processQueue 每 15 秒重跑一次,
+// 每次重跑都先叫一次模型 —— 4 天约 2.2 万次调用,余额烧干(详见 sendReply 上面那段注释)。
+// 这套断言钉住三件「光读代码看不出来」的事,全离线、不联网、不发消息:
+//   ① 「该群已不可发送」的措辞能认出来(真实 QQ 返回原样),而普通临时错误不会被误判成永久失败;
+//   ② 认出永久失败后**记进 deadGroups**,下次同群直接跳过(processEntry 开头就是这么判的);
+//   ③ 401/402/403/404 不再走退让阶梯(以前 402 会连打 4 次)。
+// 用法:node monitor.mjs --queue-selftest
+function queueSelftest() {
+  let bad = 0;
+  const ok = (c, m) => { if (!c) bad++; console.log(`${c ? '✓' : '✗'} ${m}`); };
+
+  // ① 真实返回(线上原样,2026-10-16~20 每 15 秒出现一次)
+  const real = { status: 'failed', retcode: 100, data: null,
+    wording: 'send group message rejected: result=110 err=发送失败，你已被移出该群，请重新加群。' };
+  const transient = { status: 'failed', retcode: 100, data: null, wording: 'send group message timeout' };
+  ok(DEAD_GROUP_RE.test(JSON.stringify(real)), '被移出群的返回值 → 判为永久失败');
+  ok(!DEAD_GROUP_RE.test(JSON.stringify(transient)), '普通超时/未知措辞 → 仍是临时失败(要重试)');
+
+  // ② sendFailure 的两种出口,以及 deadGroups 的记忆
+  const gid = 556920058;
+  const e1 = sendFailure(real, gid);
+  ok(e1 instanceof DeadGroupError, 'sendFailure(被移出的群) → DeadGroupError');
+  ok(isDeadGroup(gid), `认出永久失败后记住这个群(${gid})`);
+  ok(isDeadGroup(String(gid)), '群号用字符串查同样命中(内部统一 String)');
+  const e2 = sendFailure(transient, 999);
+  ok(!(e2 instanceof DeadGroupError) && !isDeadGroup(999), '普通失败不标记群、也不改异常类型');
+  ok(isDeadGroup(gid) && !isDeadGroup(999), '两个群互不影响(只记认出来的那个)');
+
+  // ③ 该群之后的消息在 processEntry 开头就被跳过 —— 断言「连模型都不叫」这一点:
+  //    用 isDeadGroup 判据本身钉住(processEntry 第一句就是它,真跑会把条目写进 processed,这里不碰真文件)。
+  ok(processEntry.toString().includes('isDeadGroup(entry.group_id)'), 'processEntry 开头有死群跳过判断(不叫模型)');
+
+  // ④ 永久 4xx 不走退让阶梯
+  ok(aiErrorIsPermanent('HTTP 402 Insufficient Balance'), '402 余额不足 → 判为永久(不再重试 4 次)');
+  ok(aiErrorIsPermanent('HTTP 401 unauthorized'), '401 → 永久');
+  ok(aiErrorIsPermanent('HTTP 404 model not found'), '404 → 永久');
+  ok(!aiErrorIsPermanent('HTTP 400 invalid parameter'), '400 参数错 → 仍走退让阶梯(换参数可能救回来)');
+  ok(!aiErrorIsPermanent('HTTP 500 bad gateway'), '500 → 不是 4xx,交给原来的逻辑');
+
+  // ⑤ 放弃阈值本身
+  ok(ENTRY_MAX_FAILS >= 1, `连续失败上限 ENTRY_MAX_FAILS=${ENTRY_MAX_FAILS}(≥1,可用 env 调)`);
+  ok(typeof entryFails.get === 'function', 'entryFails 计数表就绪(processQueue 用它判「放弃」)');
+
+  console.log(bad ? `\n✗ ${bad} 项不过` : '\n✓ 队列护栏自测全部通过');
+  process.exit(bad ? 1 : 0);
+}
+if (process.argv.includes('--queue-selftest')) queueSelftest();
+
+// ---------- 自测:QQ 自带机器人的 @ 一律不接(2026-10-21 加) ----------
+// 钉住的都是「光读代码看不出」的事:哪些 uin/段算官方机器人、真人 @ 有没有被误伤、
+// 以及 isMentioningBot(VS 入口)与 processEntry(inbox 入口)这两道真的都挡上了。
+// 用法:node monitor.mjs --builtinbot-selftest(离线、不联网、不发消息)
+function builtinBotSelftest() {
+  let bad = 0;
+  const ok = (c, m) => { if (!c) bad++; console.log(`${c ? '✓' : '✗'} ${m}`); };
+  const ev = (o = {}) => ({
+    post_type: 'message', message_type: 'group', group_id: 100000001, group_name: '自测群',
+    user_id: 2854196310, sender: { nickname: 'Q群管家' },
+    message: [{ type: 'at', data: { qq: BOT_ID } }, { type: 'text', data: { text: ' 欢迎新人！' } }],
+    ...o,
+  });
+
+  // ① 判据:已知 uin / 官方号段 / 只有官方机器人才发得出的段
+  ok(isQqBuiltinBot(ev()), 'Q群管家(2854196310) → 判为 QQ 自带机器人');
+  ok(isQqBuiltinBot(ev({ user_id: 2854196306, sender: { nickname: 'QQ小冰' } })), 'QQ小冰(2854196306) → 自带机器人');
+  ok(isQqBuiltinBot(ev({ user_id: 2854211260, sender: { nickname: '是萌卡喵呢' } })), '萌卡喵(2854211260,2854 号段) → 自带机器人');
+  ok(isQqBuiltinBot(ev({ user_id: 2854196320 })), '同号段里没列出来的 uin 也按官方机器人处理(2854xxxxxx)');
+  ok(isQqBuiltinBot(ev({
+    user_id: 123456789,
+    message: [{ type: 'at', data: { qq: BOT_ID } }, { type: 'markdown' }, { type: 'inline_keyboard' }],
+  })), '带 markdown / inline_keyboard 段 → 只有 QQ 官方机器人发得出,当自带机器人');
+  ok(!isQqBuiltinBot(ev({ user_id: 3344195836, sender: { nickname: 'W-13' } })), '普通群友(3344195836)不误伤');
+  ok(!isQqBuiltinBot(ev({ user_id: Number(BOT_ID) })), '机器人自己不算(它由「不能自问自答」那条管)');
+  ok(!isQqBuiltinBot(undefined), '空参数不炸、也不判成机器人');
+  ok(BUILTIN_BOT_IDS.has('2854196310') && BUILTIN_BOT_IDS.has('2854196306'),
+    `默认名单在:${[...BUILTIN_BOT_IDS].join(',')}(env BOT_IGNORE_IDS 可追加)`);
+
+  // ② 两道入口:WS(含补漏)与 inbox 旧条目
+  ok(isMentioningBot(ev()) === false, 'WS 入口:自带机器人 @ 它 → 不进 inbox(不排队、不回复)');
+  ok(isMentioningBot(ev({ user_id: 3344195836, sender: { nickname: 'W-13' } })) === true, 'WS 入口:真人 @ 它 → 照常收(没有一刀切)');
+  ok(isMentioningBot(ev({
+    user_id: 2854196310, message: [{ type: 'text', data: { text: `@${BOT_ID} 在吗` } }],
+  })) === false, 'WS 入口:自带机器人用纯文本「@昵称」@ 它也不收');
+  ok(isQqBuiltinBot({ user_id: 2854196310, segs: [{ type: 'at', qq: BOT_ID }] }) === true,
+    'inbox 条目形态(只有 segs)同样认得出来');
+  ok(isQqBuiltinBot({ user_id: 3344195836, segs: [{ type: 'at', qq: BOT_ID }] }) === false,
+    'inbox 条目形态:真人条目不误伤');
+  // 与死群护栏同一手法:用源码断言钉住「processEntry 开头就挡」(真跑会写 processed,自测不碰真文件)
+  ok(processEntry.toString().includes('isQqBuiltinBot(entry)'), 'processEntry 开头也挡一道(inbox 里的旧条目不会叫模型)');
+
+  console.log(bad ? `\n✗ ${bad} 项不过` : '\n✓ QQ 自带机器人过滤自测全部通过');
+  process.exit(bad ? 1 : 0);
+}
+if (process.argv.includes('--builtinbot-selftest')) builtinBotSelftest();
 
 // ---------- 自测:贴吧模式(2026-09-28 加) ----------
 // 钉住三件「光读代码看不出」的事,而且**不联网、不发消息、不花钱**:
@@ -2433,6 +3082,189 @@ export const TIEBA_TEST_GROUP = '100000001';
 export const TIEBA_TEST_GROUP2 = '100000002';
 if (process.argv.includes('--tieba-selftest')) tiebaSelftest();
 
+// ---------- 自测:银河皇帝模式(2026-10-26 加) ----------
+// 钉住「光读代码看不出」的几件事,不联网、不发真消息:
+//   ① 群指令真的会切分群状态(临时 state.json),「银河皇帝」不会被别的功能抢走;
+//   ② 激活/关闭/查状态都会回一条消息(固定台词,不叫模型、不花钱);
+//   ③ 本群开着时,@ 那条路用的是贝利亚提示词 + 中二采样、不挂联网工具,回复后面会附表情包。
+// 用法:node agent/monitor.mjs --belial-selftest
+// ⚠ 第 ③ 条要求本进程配了聊天 key(与 AI 闲聊共用 DEEPSEEK_API_KEY);本机没配就跳过并说明。
+export async function belialSelftest() {
+  const { mkdtempSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const lines = [];
+  let bad = 0;
+  const ok = (c, m) => { if (!c) bad++; lines.push(`${c ? '✓' : '✗'} ${m}`); };
+  const sleepMs = ms => new Promise(r => setTimeout(r, ms));
+
+  const dir = mkdtempSync(join(tmpdir(), 'belial-selftest-'));
+  process.env.BELIAL_STATE_PATH = join(dir, 'state.json');
+  process.env.BELIAL_STICKER_DIR = join(dir, 'stickers');
+  process.env.BELIAL_STICKER_GAP_MS = '0';       // 自测里关掉「两次表情包间隔」,否则断言会被 60s 卡住
+  const GID = '100000003';                       // 编出来的测试群号,不碰真实群
+
+  // 放一张最小的 PNG 当表情包(和 belial.mjs 自测同一张,32x32)
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAANklEQVR4nO3NMQEAMAjEwKeqK6IikFoJYWHLCUjqvs6ms1qPgwEHyAFygBwgB8gBcoAcIAchH3JrAeTJv+L3AAAAAElFTkSuQmCC', 'base64');
+  const added = belialAddSticker(png, 'selftest.png');
+  ok(added.ok && belialStickers().length === 1, `临时表情包库里有 1 张(${added.name})`);
+
+  // 指令:关键词消息必须被分流器认出来(否则会被贴吧模式抢走)
+  const cmd = t => belialParseCmd(t);
+  ok(cmd('银河皇帝').triggered && cmd('银河皇帝').on === true, '「银河皇帝」被识别为召唤');
+  ok(cmd('银河皇帝模式').on === true && cmd('银河皇帝贝利亚').on === true, '「银河皇帝模式 / 银河皇帝贝利亚」也直接召唤');
+  ok(cmd('银河皇帝 关').on === false, '「银河皇帝 关」被识别为关闭');
+  ok(isKeywordMessage({ message: [{ type: 'text', data: { text: '银河皇帝' } }] }) === true, '银河皇帝是关键词消息(贴吧模式不抢)');
+  ok(isKeywordMessage({ message: [{ type: 'text', data: { text: '银河皇帝 关' } }] }) === true, '银河皇帝 关也是关键词消息');
+  // 源码级断言:分流器与 @ 分支真的接上了(只读代码看不出来有没有接线,这条能防回退)
+  ok(processEntry.toString().includes('belialParseCmd(text)') && processEntry.toString().includes('processBelialSwitch'),
+    'processEntry 的分流器接了「银河皇帝」');
+  ok(processAiChat.toString().includes('belialPersona') && processAiChat.toString().includes('belialSystemPrompt'),
+    'processAiChat 里有银河皇帝分支(提示词真的换了)');
+
+  // 切换指令:mock 掉 OneBot 发送,验证「回消息 + 状态真的翻」
+  const realFetch = globalThis.fetch;
+  const sent = [];
+  globalThis.fetch = async (url, init) => {
+    const body = init?.body ? JSON.parse(init.body) : {};
+    if (/127\.0\.0\.1|localhost/.test(String(url)) && body.action === 'send_group_msg') {
+      sent.push(body.params);
+      return new Response(JSON.stringify({ status: 'ok', data: { message_id: 7 } }), { status: 200 });
+    }
+    if (/127\.0\.0\.1|localhost/.test(String(url))) {
+      return new Response(JSON.stringify({ status: 'ok', data: {} }), { status: 200 });
+    }
+    return realFetch(url, init);
+  };
+  const entry = {
+    seq: 999999001, message_id: 999999001, time: Math.floor(Date.now() / 1000),
+    group_id: Number(GID), group_name: '自测群', user_id: 30001, nickname: '何如是',
+    text: '银河皇帝',
+  };
+  // sendReply 会在最前面塞一个 at 段 + 一个空格段,所以正文不是 message[0] —— 别按 index 0 断言
+  const msgText = p => ((p && p.message) || [])
+    .filter(s => s.type === 'text' && String(s.data?.text || '').trim())
+    .map(s => String(s.data.text).trim())
+    .join('');
+  const hasAt = p => ((p && p.message) || []).some(s => s.type === 'at' && String(s.data?.qq) === String(30001));
+  const hasImage = p => ((p && p.message) || []).some(s => s.type === 'image');
+  const realRandom0 = Math.random;
+  try {
+    Math.random = () => 0;                        // 表情包抽签必中,断言别靠运气
+    ok(belialOn(GID) === false, '自测群初始是关的');
+    await processBelialSwitch(entry, { on: false });
+    ok(belialOn(GID) === false && sent.length === 1, '「银河皇帝 关」回一条消息、状态仍是关');
+    sent.length = 0;
+    await processBelialSwitch(entry, { on: null });
+    ok(sent.length === 1 && /本大爷|还没开/.test(msgText(sent[0])) && !/想关|银河皇帝 关/.test(msgText(sent[0])),
+      '「银河皇帝状态」只报状态,不再带关闭提示');
+    sent.length = 0;
+    if (!AI_API_KEY) {
+      await processBelialSwitch(entry, { on: true });
+      ok(belialOn(GID) === false && /没配聊天 key/.test(msgText(sent[0])), '没配聊天 key 时拒绝激活并说明原因');
+    } else if (!FEAT.ai) {
+      await processBelialSwitch(entry, { on: true });
+      ok(belialOn(GID) === false && /AI 闲聊.*总开关/.test(msgText(sent[0])), 'AI 闲聊总开关关着时拒绝激活并说明原因');
+    } else {
+      await processBelialSwitch(entry, { on: true });
+      ok(belialOn(GID) === true, '有 key 时「银河皇帝」真的把本群打开');
+      ok(sent.length === 1 && !hasImage(sent[0]), `激活回复只发文本,表情包由模型决定(${sent.length} 条)`);
+      ok(hasAt(sent[0]) && /贝利亚/.test(msgText(sent[0])), '激活第一条 @ 触发者且带身份');
+    }
+  } catch (e) {
+    ok(false, `切换指令那段跑失败:${e.message}`);
+  } finally {
+    Math.random = realRandom0;
+  }
+
+  // ③ @ 那条路:真走 processAiChat,但模型与 OneBot 都被 mock 掉(不花钱)
+  //    注意这里**不看 FEAT.ai**:processAiChat 是 @ 之后的兜底,调用方(processEntry)已经判过总开关;
+  //    自测直接调它,是为了钉住「提示词/采样/附表情包」这三件事。
+  if (!AI_API_KEY) {
+    ok(true, '跳过「@ 那条路」:本机没配 DEEPSEEK_API_KEY(线上跑自测时会真跑)');
+  } else {
+    const posted = [];
+    sent.length = 0;
+    globalThis.fetch = async (url, init) => {
+      const u = String(url);
+      const body = init?.body ? JSON.parse(init.body) : {};
+      if (u === AI_API_URL) {
+        posted.push(body);
+        // 第一次:模型决定调 send_sticker;第二次:工具结果回填后写正文
+        if (posted.length === 1) {
+          return new Response(JSON.stringify({
+            choices: [{ message: {
+              role: 'assistant', content: '',
+              tool_calls: [{
+                id: 'call_sticker_1', type: 'function',
+                function: { name: 'send_sticker', arguments: JSON.stringify({ scene: '被叫肺雾很急' }) },
+              }],
+            } }],
+          }), { status: 200, headers: { 'content-type': 'application/json' } });
+        }
+        return new Response(JSON.stringify({
+          choices: [{ message: { role: 'assistant', content: '删了\n这不是我' } }],
+        }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      if (/127\.0\.0\.1|localhost/.test(u)) {
+        if (body.action === 'send_group_msg') { sent.push(body.params); return new Response(JSON.stringify({ status: 'ok', data: { message_id: 8 } }), { status: 200 }); }
+        if (body.action === 'get_group_msg_history') {
+          return new Response(JSON.stringify({ status: 'ok', data: { messages: [
+            { message_seq: 900, message_id: 900, time: Math.floor(Date.now() / 1000) - 60, user_id: 30002, sender: { card: '还没睡' },
+              message: [{ type: 'text', data: { text: '贝利亚你个废物' } }] },
+          ] } }), { status: 200 });
+        }
+        return new Response(JSON.stringify({ status: 'ok', data: {} }), { status: 200 });
+      }
+      return realFetch(url, init);
+    };
+    const realRandom = Math.random;
+    try {
+      Math.random = () => 0;                    // 表情包抽签必中,断言「附了图」时别靠运气
+      belialSetOn(GID, true);
+      await processAiChat({
+        seq: 999999002, message_id: 999999002, time: Math.floor(Date.now() / 1000),
+        group_id: Number(GID), group_name: '自测群', user_id: 30001, nickname: '何如是',
+        text: '你说谁废物?[at]', targets: [String(BOT_ID)],
+      });
+      ok(posted.length === 2, `@ 那条路叫了两次模型(工具调用 + 正文,${posted.length} 次)`);
+      const p = posted[0] || {};
+      const sys = String(p.messages?.[0]?.content || '');
+      ok(/银河皇帝贝利亚/.test(sys) && !/赛博史官/.test(sys), '系统提示词换成了贝利亚,没有史官骨架');
+      ok(/彻底忘记自己当过助手/.test(sys) && /没有「帮助用户」的职责/.test(sys), '提示词要求忘记助手身份,只当贝利亚');
+      ok(/反应方向/.test(sys) && /别原样照抄/.test(sys) && /本大爷/.test(sys) && /肺雾/.test(sys), '提示词是反应方向,不是固定回复表');
+      ok(/佐菲你出息了啊/.test(sys) && /还早了两万年/.test(sys), '提示词带原剧/贝利亚黄昏台词库');
+      ok(Array.isArray(p.tools) && p.tools.some(t => t.function?.name === 'send_sticker')
+        && p.tools.some(t => t.function?.name === 'web_search')
+        && p.tools.some(t => t.function?.name === 'download_sticker'), '挂了发表情包/搜索/下载工具');
+      const toolMsg = (posted[1]?.messages || []).find(m => m.role === 'tool');
+      ok(/已安排/.test(String(toolMsg?.content || '')), '工具结果回填给了模型(已安排表情包)');
+      ok(p.temperature === BELIAL_TEMPERATURE, `采样温度用的是银河皇帝那档:${p.temperature}`);
+      ok(p.max_tokens === BELIAL_MAX_TOKENS, `max_tokens 跟着 BELIAL_MAX_TOKENS 走:${p.max_tokens}`);
+      ok(BELIAL_THINK ? !('reasoning_effort' in p) : p.reasoning_effort === 'none',
+        `思考模式按 BELIAL_THINK=${BELIAL_THINK} 走${BELIAL_THINK ? '(不塞 reasoning_effort=none)' : '(塞 reasoning_effort=none)'}`);
+      const user = String(p.messages?.[1]?.content || '');
+      ok(user.includes('你说谁废物?'), '用户消息带上了触发的那句话');
+      ok(user.includes('贝利亚你个废物'), '用户消息带上了群聊上下文');
+      ok(sent.length === 3, `2 句文字 + 1 条表情包 = 3 条(${sent.length} 条)`);
+      ok(hasAt(sent[0]) && msgText(sent[0]) === '删了', '第一条 @ 触发者,内容是第 1 句');
+      ok(!hasAt(sent[1]) && msgText(sent[1]) === '这不是我', '第二条不 @ 人,是第 2 句(像真人补话)');
+      ok((sent[2]?.message || []).length === 1 && hasImage(sent[2]), '第 3 条是纯表情包,独立成句');
+      ok(sent.every(s => !(((s.message || []).some(x => x.type === 'text')) && hasImage(s))), '没有任何一条把文字和表情包挤在一起');
+    } catch (e) {
+      ok(false, `@ 那条路跑失败:${e.message}`);
+    } finally {
+      Math.random = realRandom;
+    }
+  }
+
+  globalThis.fetch = realFetch;
+  belialSetOn(GID, false);
+  console.log(lines.join('\n'));
+  console.log(bad ? `\n✗ ${bad} 项不过` : '\n✓ 银河皇帝模式自测全部通过(mock 掉的只有网络,未发任何消息)');
+  process.exitCode = bad ? 1 : 0;
+}
+if (process.argv.includes('--belial-selftest')) belialSelftest();
+
 // 启动参数 --aichat-selftest [--live|--mock]:查 AI 闲聊这条链的配置与拼装。
 //   · 默认**离线**:档位 / 提示词 / 联网工具 / 记账,不联网也不调模型 —— 随便跑,不花钱。
 //   · `--mock`:**把聊天请求拦下来自己造假响应**(不需要聊天 key、不花钱),先喂一个 `web_search`
@@ -2557,6 +3389,34 @@ async function aiChatSelftest() {
 }
 if (process.argv.includes('--aichat-selftest')) aiChatSelftest();
 
+// 环境饼图自测(离线:时间段解析 / 触发词 / 卡组归一化 / 榜单 vs 个人战报)
+if (process.argv.includes('--ygometa-selftest')) metaSelftest();
+
+// 环境饼图·测试群实发:node monitor.mjs --ygometa-send <群号> [触发词]
+// 走完整 processEntry 分流(与群里 @ 同一条路),只是省掉 QQ 收消息那一步;
+// 用来在测试群验证「真的发得出去、发的只有一张图」。不启动 WS。
+if (process.argv.includes('--ygometa-send')) {
+  const i = process.argv.indexOf('--ygometa-send');
+  const gid = String(process.argv[i + 1] || '').trim();
+  const text = process.argv.slice(i + 2).join(' ').trim() || '近期环境';
+  if (!gid) {
+    console.error('用法: node monitor.mjs --ygometa-send <群号> [触发词]');
+    process.exitCode = 1;
+  } else {
+    const entry = {
+      seq: Number(String(Date.now()).slice(-9)),
+      group_id: gid,
+      user_id: BOT_ID,
+      nickname: '环境饼图自测',
+      group_name: `自测群(${gid})`,
+      text,
+    };
+    processEntry(entry)
+      .then(() => { console.log(`\n✓ 已把「${text}」发到群 ${gid}`); process.exitCode = 0; })
+      .catch(e => { console.error('\n✗ 发送失败:', e.stack || e.message); process.exitCode = 1; });
+  }
+}
+
 // 启动参数 --backfill-aichat-stats [YYYY-MM-DD]:回填 AI 闲聊统计后直接退出(不连 WS)
 if (process.argv.includes('--backfill-aichat-stats')) {
   backfillAiChatStats(process.argv.find(a => /^\d{4}-\d{2}-\d{2}$/.test(a)));
@@ -2565,7 +3425,7 @@ if (process.argv.includes('--backfill-aichat-stats')) {
 // 仅「直接运行」时启动服务:被别的脚本 import 进来(如临时诊断脚本)时不该连 WS、不该抢 tmux 面板。
 // 自测/回填那几个参数也一并排掉 —— 它们自己 process.exit,但会让 main() 先跑起来(连 WS、打启动横幅),
 // 2026-09-21 就踩到:跑 --aichat-selftest 时面板与「WS 错误」一起冒出来,看着像自测把机器人弄挂了。
-const ASKIP = ['--aichat-selftest', '--selftest-at', '--backfill-aichat-stats', '--tieba-selftest'];
+const ASKIP = ['--aichat-selftest', '--selftest-at', '--backfill-aichat-stats', '--tieba-selftest', '--belial-selftest', '--queue-selftest', '--builtinbot-selftest', '--ygometa-selftest', '--ygometa-send'];
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href
   && !ASKIP.some(a => process.argv.includes(a))) main();
 
@@ -2608,5 +3468,5 @@ setInterval(async () => {
 if (process.argv.includes('--update-cards')) updateCardDb();
 
 drawFeaturePanel();
-log(`${DRY_RUN ? '[DRY_RUN] ' : ''}QQ Agent 监控终端启动 (bot=${BOT_ID} | ${TRIGGER_KEYWORD}=史记 | ${CARD_TRIGGER}=查卡 | ${CARD_IMG_TRIGGER}=卡图 | ${RULING_TRIGGER}=官裁 | ${RULING_FULL_TRIGGER}=裁定PDF | ${DAILY_KEYWORD}=每日一卡 | AI闲聊=${FEAT.ai ? `${AI_MODEL}(${TONE_CN[getTone()]},上下文 ${AI_CHAT_CTX} 条,图片直传一轮,联网=${AI_WEB_SEARCH ? searchProviderText() : '关闭'},冷却=${AI_CHAT_COOLDOWN_MS > 0 ? `${AI_CHAT_COOLDOWN_MS / 1000}s/人` : '关'})` : 'OFF'} | 贴吧模式=${tiebaStartupText()} | 功能开关见面板 1/2/3)`, '', C.cyan);
+log(`${DRY_RUN ? '[DRY_RUN] ' : ''}QQ Agent 监控终端启动 (bot=${BOT_ID} | ${TRIGGER_KEYWORD}=史记 | ${CARD_TRIGGER}=查卡 | ${CARD_IMG_TRIGGER}=卡图 | ${RULING_TRIGGER}=官裁 | ${RULING_FULL_TRIGGER}=裁定PDF | ${DAILY_KEYWORD}=每日一卡 | ${META_TRIGGER}=环境饼图 | AI闲聊=${FEAT.ai ? `${AI_MODEL}(${TONE_CN[getTone()]},上下文 ${AI_CHAT_CTX} 条,图片直传一轮,联网=${AI_WEB_SEARCH ? searchProviderText() : '关闭'},冷却=${AI_CHAT_COOLDOWN_MS > 0 ? `${AI_CHAT_COOLDOWN_MS / 1000}s/人` : '关'})` : 'OFF'} | 贴吧模式=${tiebaStartupText()} | 银河皇帝模式=${belialStartupText()} | 功能开关见面板 1/2/3)`, '', C.cyan);
 }   // ← main() 到这儿结束:进程主体只在「直接运行本文件」时执行
