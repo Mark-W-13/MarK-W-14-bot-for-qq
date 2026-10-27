@@ -13,6 +13,7 @@
 }
 
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 html { color-scheme: light; }
 body {
   margin: 0;
@@ -204,6 +205,20 @@ input[type="date"]:focus, #deck:focus {
   box-shadow: var(--shadow);
   padding: 24px;
 }
+.default-panel { margin-top: 26px; }
+.default-figure {
+  margin: 0; border: 1px solid var(--line); border-radius: 14px;
+  overflow: hidden; background: #fff;
+}
+.default-figure img {
+  display: block; width: 100%; height: auto;
+  background: var(--paper);
+}
+.default-figure figcaption {
+  padding: 10px 14px; border-top: 1px solid #eee8da;
+  color: var(--muted); font-size: 11px;
+}
+.default-panel h2 { margin: 4px 0 0; font-size: 22px; letter-spacing: -.03em; }
 .panel-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 18px; flex-wrap: wrap; margin-bottom: 18px; }
 .panel-head h2 { margin: 4px 0 0; font-size: 22px; letter-spacing: -.03em; }
 .sub { margin: 4px 0 0; color: var(--muted); font-size: 12.5px; }

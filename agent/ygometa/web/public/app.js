@@ -147,6 +147,7 @@ async function query({ scroll = true } = {}) {
   $('submit').classList.add('busy');
   $('error').hidden = true;
   $('loading').hidden = false;
+  $('default-preview').hidden = true;
   $('results').hidden = true;
   $('loading-text').textContent = days > 45
     ? `正在抓取 ${days} 天的记录并生成饼图，第一次会久一点 ...`
@@ -177,6 +178,7 @@ function showError(msg) {
   $('error').textContent = msg;
   $('error').hidden = false;
   $('results').hidden = true;
+  $('default-preview').hidden = false;
 }
 
 async function loadDecks() {

@@ -83,7 +83,7 @@ QQ 机器人「测试bot.fd」(QQ 3757588606)的自动回复系统,两个功能:
 
     **同卡异名自检(2026-10-27 新增)**:`node agent/ygometa/meta.mjs --deck-alias-check` 会把 `threads.json` 里所有提取到的轴字段拿到**本地百鸽卡库**逐条搜,按「搜出来的第一张卡 id」分组;同一张卡的不同字段就是疑似同一套卡组。输出 `[已归一]` / `[待确认]`,并做已知别名回归(味美喵/黯蜜、魔镌/刻魔)。**官方简中名以百鸽 `sc_name` 为准**(不是 `cn_name`):所以 `味美喵` 归一到 **黯蜜**(`黯蜜★史拿奇`),不是反过来。**抓取更新完 threads.json 后会自动跑一次**,报告写到 `agent/ygometa/cache/alias_report.txt`,不参与每次查询、不反复跑;确认新别名后并进 `RULES`。当前已归一二组:**味美喵/黯密 → 黯蜜**、**魔镌 → 刻魔**。
 
-13. **网页版环境/上位查询(2026-10-27 新增)**:`http://192.144.153.94/`(服务器 80 端口 nginx 已开放,反代到 `127.0.0.1:8080`;`onelegocg.top` 当前指向别的站,不要用)。页面可选**起止日期**(近7天/本月/上月/今年/自定义),旁边输入**卡组 tag**(带补全)查该卡组上位;结果上半部分是**PDF 去掉附录**的饼图 + 全主轴数量表,下半部分是**扩充到 20 条**的上位记录(日期/名次/卡组/比赛/原帖链接)。数据/抓取完全复用 `agent/ygometa/meta.mjs`;新时间段会自动爬、之后走缓存;服务**串行处理**查询、不抓网页端图片,常驻内存约 60MB。代码在 `agent/ygometa/web/`(零依赖 Node HTTP + 单页 HTML/CSS/JS,无前端框架);systemd 用户服务 `ygoweb.service`,日志 `journalctl --user -u ygoweb`。改完代码先 `sync-server.ps1` 再 `systemctl --user restart ygoweb`。
+13. **网页版环境/上位查询(2026-10-27 新增)**:`http://192.144.153.94/`(服务器 80 端口 nginx 已开放,反代到 `127.0.0.1:8080`;`onelegocg.top` 当前指向别的站,不要用)。页面可选**起止日期**(近7天/本月/上月/今年/自定义),旁边输入**卡组 tag**(带补全)查该卡组上位;结果上半部分是**PDF 去掉附录**的饼图 + 全主轴数量表,下半部分是**扩充到 20 条**的上位记录(日期/名次/卡组/比赛/原帖链接)。**首次进入未搜索时展示 10 月默认饼图**(`web/public/default-october.jpg`),查询后替换。数据/抓取完全复用 `agent/ygometa/meta.mjs`;新时间段会自动爬、之后走缓存;服务**串行处理**查询、不抓网页端图片,常驻内存约 60MB。代码在 `agent/ygometa/web/`(零依赖 Node HTTP + 单页 HTML/CSS/JS,无前端框架);systemd 用户服务 `ygoweb.service`,日志 `journalctl --user -u ygoweb`。改完代码先 `sync-server.ps1` 再 `systemctl --user restart ygoweb`。
 
 
 ## 部署约定(2026-10-26)
