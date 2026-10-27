@@ -49,9 +49,9 @@ const THREADS_FILE = join(CACHE_DIR, 'threads.json');
 
 // 版本号:改了抓取/解析/画图口径就 +1,旧缓存自动失效(不用手删文件)
 const STORE_VERSION = 3;
-const PARSE_VERSION = 14;   // 2026-10-28:补混沌/黑魔导/雷盟/幕帘猫等卡组字段
-const PIE_VERSION = 30;     // 2026-10-28:混轴按全局主轴承组 + 同场去重
-const PDF_VERSION = 15;     // 2026-10-28:混轴主轴承组 + 同场去重
+const PARSE_VERSION = 15;   // 2026-10-28:卡组分布/图注/多玩家单行不硬拼
+const PIE_VERSION = 31;     // 2026-10-28:过滤分布行/重复图注后的统计
+const PDF_VERSION = 16;     // 2026-10-28:过滤分布行/重复图注后的数量表
 
 const FORUM_KW = process.env.YGOMETA_FORUM || '上位卡组';
 const PAGE_RN = Math.min(100, Math.max(20, Number(process.env.YGOMETA_PAGE_RN || 100)));
@@ -694,7 +694,15 @@ function parseRoleList(text) {
   const out = [];
   for (let i = 0; i < marks.length; i++) {
     const role = marks[i].role.replace(/^冠$/, '冠军').replace(/^亚$/, '亚军');
-    const seg = t.slice(marks[i].end, i + 1 < marks.length ? marks[i + 1].idx : t.length);
+    let seg = t.slice(marks[i].end, i + 1 < marks.length ? marks[i + 1].idx : t.length);
+    // 「卡组分布：A1 B2 ...」「出轮卡组：...」是参赛统计,不是这一名的卡组
+    seg = seg.split(/(?:卡组)?(?:分布|统计|数量)|出轮卡组|环境分布|上位卡组如下|赛制\s*[:：]/)[0];
+    // 「4轮出八强」「十六强卡组」不是名次,是赛制/统计描述
+    const before = t.slice(Math.max(0, marks[i].idx - 4), marks[i].idx);
+    const head = seg.replace(/^\s*[:：]?\s*/, '');
+    if (/(?:出|进)$/.test(before) || /^(?:卡组|分布|统计|出轮|如下)/.test(head)) continue;
+    // 一行里多个「玩家：卡组」时当前解析不可靠,不要硬拼成一套卡组
+    if ((head.match(/[:：]/g) || []).length >= 2 && !head.includes('\n')) continue;
     // 这是战报里的对手/记录段,不是榜单 → 跳过(否则会把对手卡组算成上位)
     if (/^\s*(?:VS|vs|对战|打|赢骰|输骰)/.test(seg)) continue;
     const decks = [];
@@ -707,6 +715,7 @@ function parseRoleList(text) {
       const seen = new Set();
       for (const g of groups) {
         if (decks.length >= (ROLE_MAX[role] || 1)) break;
+        if (/^(?:卡组)?(?:分布|统计|数量)|上位卡组如下/.test(g)) continue;
         const pm = g.match(/^([^（(]{2,20})[（(]([^）)]{2,30})[）)]/);
         if (pm) {
           const outside = canonicalDeck(pm[1]);
@@ -784,7 +793,8 @@ function listScore(body) {
  */
 export function analyzeThread(thread) {
   const title = cleanText(thread.title || '');
-  const body = cleanText(thread.text || '');
+  // 图注里常重复一遍「图6: 冠军 烙印」;统计只看正文榜单,避免同一条记录出现两次
+  const body = cleanText(thread.text || '').replace(/图\s*\d+\s*[:：][\s\S]*?(?=图\s*\d+\s*[:：]|$)/g, ' ');
   const tr = parseTitleRole(title);
   const firstLine = body.split(/\n/).map(x => x.trim()).filter(Boolean)[0] || '';
   const useDeck = body.match(/(?:使用)?卡组\s*(?!分布|统计|数量|如下)[:：]?\s*([^\n，,。；;]{2,30})/);
@@ -810,7 +820,15 @@ export function analyzeThread(thread) {
     if (c.name) { entries = [{ role, ...c }]; mode = 'report'; }
   }
   if (entries.length > 24) return [];            // 明显解析炸了(一帖 24 个上位),宁可不计
-  return entries;
+  // 兜底:整段卡组分布被当成一套卡组时会有 8~20 个轴/超长名字;宁可不计
+  const clean = [];
+  for (const e of entries) {
+    const axes = Array.isArray(e.axes) ? e.axes : [];
+    const name = String(e.name || '');
+    if (axes.length > 6 || name.length > 30) continue;
+    clean.push(e);
+  }
+  return clean;
 }
 
 const COMP_TITLE_RE = /(杯|赛|CS|战报|积分|巡回|WCQ|YCS|店赛|周赛|月赛|冠|上位|人)/;
@@ -944,8 +962,9 @@ function aggregate(records) {
       if (!axes.length) continue;
       const sig = `${day}|${e.role || ''}|${e.name || axes[0]}`;
       const prev = seenEntries.get(sig) || [];
-      if (prev.some(x => sameEventKey(x, ek))) continue;  // 同场同名的重复战报
-      prev.push(ek);
+      // 只把「个人单帖」和另一份榜单视为同一条重复;两份完整榜单可能是不同选手同卡组同名次
+      if (prev.some(x => x.size === 1 && sameEventKey(x.ek, ek)) || (list.length === 1 && prev.some(x => sameEventKey(x.ek, ek)))) continue;
+      prev.push({ ek, size: list.length });
       seenEntries.set(sig, prev);
       items.push({ axes, role: e.role || '', name: e.name || axes[0] });
       entries++;
@@ -1924,6 +1943,11 @@ export async function metaSelftest() {
     text: '10.17简中沈阳巡回赛\n使用卡组:磁石战士\n使用id:顺飞马\n135人7轮出16 亚军\nr1 输骰升月 oo',
   });
   ok(mag.length === 1 && mag[0].name === '磁石战士' && mag[0].role === '亚军', '磁石战士单卡组战报按正文亚军', mag.map(x => `${x.role}:${x.name}`).join(','));
+  const dist = analyzeThread({
+    title: '韩山师范学院游戏王迎新吾悦杯圆满结束',
+    text: '参赛人数：18人\n冠军：erAir（杀手旋律）\n亚军：xtqhy（奥艺耀圣）\n四强：星焱（水机列车）\n四强：清与悲（妖精魔女术）\n卡组分布：杀手旋律1奥艺耀圣2狱神奥艺1烙印3三幻魔1幕帘猫1刻魔魔弹1闪刀160朋克巳剑1升月154混沌绚岚闪刀1水机列车1皇国妖精魔女术1星辰烙印1磁石战士魔救1\n上位卡组如下：',
+  });
+  ok(dist.length === 4 && dist.map(x => x.name).join(',') === '杀手旋律,奥艺耀圣,列车,魔女术', '卡组分布不被当成一套卡组', dist.map(x => `${x.role}:${x.name}`).join(','));
   const b = analyzeThread({
     title: '栖风营地卡牌12人冠军',
     text: '使用卡组：D.D.炸药\n第一轮 对战升月白银城 输骰 oo\n四强 对战升月 赢骰 oo\n决赛 对战归光黑魔女黑魔导 输骰 oo',
