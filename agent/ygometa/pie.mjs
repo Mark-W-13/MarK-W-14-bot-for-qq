@@ -242,10 +242,11 @@ export async function renderMetaPie(opt) {
       // 主轴:单张代表图,按扇区包围盒铺一块,不重复平铺
       if (art) {
         const box = arcBox(cx, cy, r, 0, a0, a1);
+        const size = Math.min(360, Math.max(220, Math.max(box.w, box.h) * 1.05));
         const clip = clipFor(bodyPath);
         chart += `<path d="${bodyPath}" fill="${bodyColor}" stroke="none"/>`;
-        // 单张图,中心对准扇区质心;整圈尺寸保证扇区里没有纯色缺口
-        chart += `<image href="${art.dataUri}" x="${box.x - r}" y="${box.y - r}" width="${r * 2}" height="${r * 2}" preserveAspectRatio="xMidYMid slice" clip-path="url(#${clip})"/>`;
+        // 单张图,中心对准扇区质心;控制尺寸,避免放大到糊
+        chart += `<image href="${art.dataUri}" x="${box.x - size / 2}" y="${box.y - size / 2}" width="${size}" height="${size}" preserveAspectRatio="xMidYMid slice" clip-path="url(#${clip})"/>`;
         chart += `<path d="${bodyPath}" fill="${bodyColor}" opacity="0.14" stroke="none"/>`;
         chart += `<path d="${bodyPath}" fill="none" stroke="${PAPER}" stroke-width="2.4" stroke-linejoin="round"/>`;
       } else {
