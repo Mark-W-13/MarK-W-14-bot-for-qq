@@ -1765,7 +1765,7 @@ async function processTopSearch(entry, q) {
     const r = await searchTopDeck(q.primary, q.range, { log: m => log('   ', m, C.dim) });
     if (!r) {
       const where = q.range ? q.range.label : '本地记录';
-      await sendReply(entry, [{ type: 'text', data: { text: `没找到「${q.deck}」在${where}的上位构筑图,换个时间或卡组名再试。` } }]);
+      await sendReply(entry, [{ type: 'text', data: { text: `找不到含「${q.deck}」的上位卡组（${where}）。` } }]);
       appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
       return;
     }

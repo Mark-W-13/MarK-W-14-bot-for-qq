@@ -330,7 +330,7 @@ export function parseTopSearch(text, now = new Date()) {
   const m = s.match(/^(?:查|找|搜)?\s*上位(?:卡组)?\s*[:：,，]?\s*([\s\S]+)$/);
   if (!m) return null;
   const rest = m[1].trim();
-  if (!rest) return null;
+  if (!rest) return { triggered: true, error: '用法：上位 卡组 [时间]，例如「上位 烙印 10月」。', query: '' };
 
   let deckText = rest;
   let range = null;
@@ -347,8 +347,18 @@ export function parseTopSearch(text, now = new Date()) {
   }
 
   const parsed = parseDeckAxes(deckText);
-  if (!parsed.axes.length) return null;
-  if (parsed.coverage < 0.9 && parsed.label !== deckText) return null;
+  if (!parsed.axes.length || (parsed.coverage < 0.9 && parsed.label !== deckText)) {
+    // 认不出卡组也只回这句,不能漏给闲聊 AI
+    let field = deckText;
+    if (field === rest) {
+      for (let i = rest.length - 1; i > 0; i--) {
+        const d = rest.slice(0, i).trim();
+        const t = rest.slice(i).trim();
+        if (d && parseMetaRange(t, now)) { field = d; break; }
+      }
+    }
+    return { triggered: true, error: `找不到含「${field}」的上位卡组。`, query: rest };
+  }
   return {
     triggered: true,
     deck: parsed.axes.join('+'),
@@ -1786,6 +1796,8 @@ export async function metaSelftest() {
   ok(!!s2 && s2.primary === 'K9' && !s2.error, '「上位 K9 10月」解析');
   const s3 = parseTopSearch('上位卡组 烙印', now);
   ok(!!s3 && s3.primary === '烙印' && !s3.range, '「上位卡组 烙印」无时间解析');
+  const s4 = parseTopSearch('上位 震灵 9月', now);
+  ok(!!s4?.error && s4.error.includes('震灵') && !s4.primary, '不认识的卡组返回错误而不是 null', JSON.stringify(s4));
   ok(parseTopSearch('环境 10月', now) === null, '「环境」不触发上位检索');
 
   // ③ 卡组归一化
