@@ -106,6 +106,22 @@ function arcBox(cx, cy, rOut, rIn, a0, a1) {
   return { x: sx / pts.length, y: sy / pts.length, w: maxX - minX, h: maxY - minY, minX, minY, maxX, maxY };
 }
 
+/** 选中心后,到扇区/圆环最远点的距离;用于算「刚好盖住」的图片尺寸 */
+function maxDistToBand(cx, cy, centerR, mid, a0, a1, rOut, rIn) {
+  const c = polar(cx, cy, centerR, mid);
+  const pts = [];
+  if (!rIn) pts.push({ x: cx, y: cy });
+  const n = Math.max(10, Math.ceil(Math.abs(a1 - a0) / 6));
+  for (let i = 0; i <= n; i++) {
+    const deg = a0 + (a1 - a0) * i / n;
+    pts.push(polar(cx, cy, rOut, deg));
+    if (rIn) pts.push(polar(cx, cy, rIn, deg));
+  }
+  let d = 0;
+  for (const p of pts) d = Math.max(d, Math.hypot(p.x - c.x, p.y - c.y));
+  return d;
+}
+
 function bandPath(cx, cy, rOut, rIn, a0, a1) {  if (a1 - a0 >= 359.999) {
     const o1 = polar(cx, cy, rOut, a0), o2 = polar(cx, cy, rOut, a0 + 180);
     const i1 = polar(cx, cy, rIn, a0), i2 = polar(cx, cy, rIn, a0 + 180);
@@ -203,9 +219,6 @@ export async function renderMetaPie(opt) {
       <filter id="blur" x="-40%" y="-40%" width="180%" height="180%">
         <feGaussianBlur stdDeviation="34"/>
       </filter>
-      <filter id="soft" x="-20%" y="-20%" width="140%" height="140%">
-        <feGaussianBlur stdDeviation="14"/>
-      </filter>
     </defs>
     <rect width="${W}" height="${H}" fill="url(#paper)"/>
     <rect width="${W}" height="${H}" fill="url(#dots)"/>
@@ -247,19 +260,16 @@ export async function renderMetaPie(opt) {
           .filter(b => b.name !== '其他混轴' && b.count > 0)
           .filter(b => b.share >= 0.40 || (topNames.has(b.name) && b.share >= 0.10))
         : [];
-      // 主轴:单张代表图;有副轴压在外圈时,中心略向圆心收,避免主体被外圈挡住
+      // 主轴:单张图;中心放在约 1/2 半径处,有副轴外圈时略向圆心收
       if (art) {
-        const box = arcBox(cx, cy, r, 0, a0, a1);
-        // 标准 360px;只有占比特别大的块放大一档,避免大扇区靠柔焦底撑
-        const size = (s.num / total >= 0.18) ? 450 : 360;
-        const k = picks.length ? 0.12 : 0;
-        const centerX = box.x + (cx - box.x) * k;
-        const centerY = box.y + (cy - box.y) * k;
+        const mid = (a0 + a1) / 2;
+        const centerR = r * (picks.length ? 0.46 : 0.50);
+        const c = polar(cx, cy, centerR, mid);
+        const dist = maxDistToBand(cx, cy, centerR, mid, a0, a1, r, 0);
+        const size = Math.min(620, Math.max(360, dist * 2 + 4));
         const clip = clipFor(bodyPath);
         chart += `<path d="${bodyPath}" fill="${bodyColor}" stroke="none"/>`;
-        // 同一张代表图先铺满扇区做柔焦底,避免露出纯色;上面再放清晰的标准大小图
-        chart += `<image href="${art.dataUri}" x="${cx - r}" y="${cy - r}" width="${r * 2}" height="${r * 2}" preserveAspectRatio="xMidYMid slice" filter="url(#soft)" opacity="0.88" clip-path="url(#${clip})"/>`;
-        chart += `<image href="${art.dataUri}" x="${centerX - size / 2}" y="${centerY - size / 2}" width="${size}" height="${size}" preserveAspectRatio="xMidYMid slice" clip-path="url(#${clip})"/>`;
+        chart += `<image href="${art.dataUri}" x="${c.x - size / 2}" y="${c.y - size / 2}" width="${size}" height="${size}" preserveAspectRatio="xMidYMid slice" clip-path="url(#${clip})"/>`;
         chart += `<path d="${bodyPath}" fill="${bodyColor}" opacity="0.14" stroke="none"/>`;
         chart += `<path d="${bodyPath}" fill="none" stroke="${PAPER}" stroke-width="2.4" stroke-linejoin="round"/>`;
       } else {
@@ -278,12 +288,14 @@ export async function renderMetaPie(opt) {
           const subArt = arts.get(b.name);
           if (subArt) {
             const mid = pa + span / 2;
-            const c = polar(cx, cy, (r + rBody) / 2, mid);
+            const centerR = (r + rBody) / 2;
+            const c = polar(cx, cy, centerR, mid);
+            const dist = maxDistToBand(cx, cy, centerR, mid, pa, pa + span, r, rBody);
+            const size = Math.min(620, Math.max(256, dist * 2 + 4));
             const clip = clipFor(band);
             chart += `<path d="${band}" fill="${color}" fill-rule="evenodd" stroke="none"/>`;
-            chart += `<image href="${subArt.dataUri}" x="${cx - r}" y="${cy - r}" width="${r * 2}" height="${r * 2}" preserveAspectRatio="xMidYMid slice" filter="url(#soft)" opacity="0.88" clip-path="url(#${clip})"/>`;
-            // 副轴不缩图:直接按原图 256px 盖在弧段上,裁掉多余部分
-            chart += `<image href="${subArt.dataUri}" x="${c.x - 128}" y="${c.y - 128}" width="256" height="256" preserveAspectRatio="xMidYMid slice" clip-path="url(#${clip})"/>`;
+            // 副轴原图尺寸为下限,只有盖不住时才放大
+            chart += `<image href="${subArt.dataUri}" x="${c.x - size / 2}" y="${c.y - size / 2}" width="${size}" height="${size}" preserveAspectRatio="xMidYMid slice" clip-path="url(#${clip})"/>`;
             chart += `<path d="${band}" fill="${color}" opacity="0.10" fill-rule="evenodd" stroke="none"/>`;
           } else {
             chart += `<path d="${band}" fill="${color}" fill-rule="evenodd" stroke="none"/>`;
