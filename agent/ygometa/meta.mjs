@@ -50,8 +50,8 @@ const THREADS_FILE = join(CACHE_DIR, 'threads.json');
 // 版本号:改了抓取/解析/画图口径就 +1,旧缓存自动失效(不用手删文件)
 const STORE_VERSION = 3;
 const PARSE_VERSION = 15;   // 2026-10-28:卡组分布/图注/多玩家单行不硬拼
-const PIE_VERSION = 32;     // 2026-10-28:饼图主轴/副轴改用代表卡图填充
-const PDF_VERSION = 17;     // 2026-10-28:新版卡图饼图
+const PIE_VERSION = 33;     // 2026-10-28:代表卡图填充 + 1x 控体积
+const PDF_VERSION = 18;     // 2026-10-28:代表卡图饼图 1x
 
 const FORUM_KW = process.env.YGOMETA_FORUM || '上位卡组';
 const PAGE_RN = Math.min(100, Math.max(20, Number(process.env.YGOMETA_PAGE_RN || 100)));

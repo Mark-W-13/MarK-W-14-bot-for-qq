@@ -361,8 +361,8 @@ function screenshot(htmlPath, outPath, W, H, profile, log = () => {}) {
     }
     try { rmSync(outPath, { force: true }); } catch { /* ignore */ }
     const headless = process.platform === 'win32' ? '--headless' : '--headless=new';
-    // 1.5x 已经足够清晰,而且 PNG/base64 比 2x 小一半(2x 的 2720px 图曾让 OneBot 上传失败)
-    const scale = Math.min(2, Math.max(1, Number(process.env.YGOMETA_SCALE || 1.5)));
+    // 1x 是为了 OneBot 发图:卡图填充后 PNG 熵更高,1.5x 会到 ~2MB 发不出去
+    const scale = Math.min(2, Math.max(1, Number(process.env.YGOMETA_SCALE || 1)));
     const args = [
       headless,
       '--no-sandbox',
