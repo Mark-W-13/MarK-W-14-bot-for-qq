@@ -12,6 +12,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, wri
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromePath } from '../env.mjs';
+import { cardArtFor } from './cardart.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const TMP_DIR = process.env.YGOMETA_TMP_DIR || join(__dirname, 'cache', 'html');
@@ -134,6 +135,37 @@ export async function renderMetaPie(opt) {
   const colorMap = new Map();
   slices.forEach((s, i) => { if (!s.isOthers) colorMap.set(s.name, PALETTE[i % PALETTE.length]); });
   const colorOf = name => colorMap.get(name) || MIX_OTHER_COLOR;
+  const topNames = new Set(slices.filter(x => !x.isOthers).map(x => x.name));
+
+  // 主轴 + 真正会画出来的副轴才去找代表图;其他/其他混轴保持纯色
+  const needArt = new Set(slices.filter(s => !s.isOthers).map(s => s.name));
+  for (const s of slices) {
+    if (s.isOthers || !Array.isArray(s.buckets)) continue;
+    for (const b of s.buckets) {
+      if (b.name === '其他混轴' || !b.count) continue;
+      if (b.share >= 0.40 || (topNames.has(b.name) && b.share >= 0.10)) needArt.add(b.name);
+    }
+  }
+  const arts = new Map();
+  await Promise.all([...needArt].map(async name => {
+    try {
+      const a = await cardArtFor(name);
+      if (a) arts.set(name, a);
+    } catch { /* 单张失败不影响饼图 */ }
+  }));
+  if (arts.size) log(`  卡组代表图:${arts.size}/${needArt.size} 张`);
+
+  let pseq = 0;
+  const mainPat = new Map(), subPat = new Map(), patDefs = [];
+  const patternFor = (name, tile, bucket) => {
+    const a = arts.get(name);
+    if (!a) return null;
+    if (bucket.has(name)) return bucket.get(name);
+    const id = `art${++pseq}`;
+    bucket.set(name, id);
+    patDefs.push(`<pattern id="${id}" patternUnits="userSpaceOnUse" width="${tile}" height="${tile}"><image href="${a.dataUri}" x="0" y="0" width="${tile}" height="${tile}" preserveAspectRatio="xMidYMid slice" opacity="0.92"/></pattern>`);
+    return id;
+  };
 
   const W = 1360;
   const H = 1020;
@@ -141,7 +173,8 @@ export async function renderMetaPie(opt) {
   const EXTRA_H = process.platform === 'win32' ? 0 : Math.max(0, Number(process.env.YGOMETA_CHROME_EXTRA_HEIGHT ?? 88));
   const BODY_H = H + EXTRA_H;
 
-  const cx = 680, cy = 555, r = 310, rBody = r - 44;   // 固定外径的外圈色带(44px 宽)
+  // 副轴外圈从 44px 加厚到 64px(向内约 45%),让卡图更明显
+  const cx = 680, cy = 555, r = 310, rBody = r - 64;
 
   const bg = `
     <defs>
@@ -184,15 +217,17 @@ export async function renderMetaPie(opt) {
   } else {
     let a = 0;
     const items = [];
-    const topNames = new Set(slices.filter(x => !x.isOthers).map(x => x.name));
     const subs = [];
     slices.forEach((s, i) => {
       const full = total ? s.num / total * 360 : 0;
       const a0 = a, a1 = a + full;
       a = a1;
       const bodyColor = s.isOthers ? OTHERS_COLOR : colorOf(s.name);
-      // 饼体整块先涂主轴色(不再单独画一圈内外径)
-      chart += `<path d="${sectorPath(cx, cy, r, a0, a1)}" fill="${bodyColor}" stroke="${PAPER}" stroke-width="2.4" stroke-linejoin="round"/>`;
+      const bodyPath = sectorPath(cx, cy, r, a0, a1);
+      const bodyPat = s.isOthers ? null : patternFor(s.name, 210, mainPat);
+      // 主轴用代表卡插画填充;叠一层淡主轴色,仍能看出图片
+      chart += `<path d="${bodyPath}" fill="${bodyPat ? `url(#${bodyPat})` : bodyColor}" stroke="${PAPER}" stroke-width="2.4" stroke-linejoin="round"/>`;
+      if (bodyPat) chart += `<path d="${bodyPath}" fill="${bodyColor}" opacity="0.20" stroke="none"/>`;
 
       // 只在外圈(rBody..r)叠「显著混轴」的弧段:
       // 占本块 ≥40%,或者本身是露出来的大主轴且在本块 ≥10%;其余混轴不体现颜色。
@@ -205,7 +240,10 @@ export async function renderMetaPie(opt) {
           const span = (a1 - a0) * b.share;
           if (span <= 0) continue;
           const color = topNames.has(b.name) ? colorOf(b.name) : MIX_OTHER_COLOR;
-          chart += `<path d="${bandPath(cx, cy, r, rBody, pa, pa + span)}" fill="${color}" fill-rule="evenodd" stroke="none"/>`;
+          const band = bandPath(cx, cy, r, rBody, pa, pa + span);
+          const subPatId = patternFor(b.name, 100, subPat);
+          chart += `<path d="${band}" fill="${subPatId ? `url(#${subPatId})` : color}" fill-rule="evenodd" stroke="${PAPER}" stroke-width="1.2"/>`;
+          if (subPatId) chart += `<path d="${band}" fill="${color}" opacity="0.12" fill-rule="evenodd" stroke="none"/>`;
           // 副轴小色块单独引一条线,标签写成「+ 副轴名」
           subs.push({ kind: 'sub', text: `+ ${b.name}`, color, mid: pa + span / 2, share: b.share });
           pa += span;
@@ -270,6 +308,7 @@ export async function renderMetaPie(opt) {
 
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" font-family="'Noto Sans CJK SC','Source Han Sans SC','Microsoft YaHei','PingFang SC',sans-serif">
     ${bg}
+    ${patDefs.length ? `<defs>${patDefs.join('')}</defs>` : ''}
     <g>${chart}</g>
     ${header}
     ${footer}
