@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>上位卡组 · 环境与构筑检索</title>
+  <meta name="description" content="游戏王 OCG 上位卡组环境与构筑检索,数据来自百度贴吧「上位卡组吧」。">
+  <link rel="stylesheet" href="/style.css">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%23f4f1e8'/%3E%3Ccircle cx='32' cy='32' r='19' fill='%233e6fa6'/%3E%3Cpath d='M32 13a19 19 0 0 1 19 19H32z' fill='%23c46f4d'/%3E%3C/svg%3E">
+</head>
+<body>
+  <div class="bg-dots" aria-hidden="true"></div>
+  <header class="site-head">
+    <div class="brand">
+      <div class="mark" aria-hidden="true"><span></span></div>
+      <div>
+        <p class="eyebrow">YU-GI-OH! OCG · META SNAPSHOT</p>
+        <h1>上位卡组 <span>环境与构筑检索</span></h1>
+      </div>
+    </div>
+    <div class="source-pill"><i></i>数据来源 · 百度贴吧「上位卡组吧」</div>
+  </header>
+
+  <main>
+    <section class="query-card" aria-labelledby="query-title">
+      <div class="query-top">
+        <div>
+          <p class="section-kicker">QUERY</p>
+          <h2 id="query-title">查一段时间的环境，或某个卡组的上位</h2>
+        </div>
+        <div class="quick" role="group" aria-label="快捷时间">
+          <button type="button" data-preset="7">近 7 天</button>
+          <button type="button" data-preset="month" class="on">本月</button>
+          <button type="button" data-preset="last">上月</button>
+          <button type="button" data-preset="year">今年</button>
+          <button type="button" data-preset="custom">自定义</button>
+        </div>
+      </div>
+
+      <div class="query-row dates">
+        <label class="field">
+          <span>开始日期</span>
+          <input id="start" type="date" autocomplete="off">
+        </label>
+        <span class="tilde">至</span>
+        <label class="field">
+          <span>结束日期</span>
+          <input id="end" type="date" autocomplete="off">
+        </label>
+        <div class="date-note" id="date-note"></div>
+      </div>
+
+      <div class="query-row deck-row">
+        <label class="field grow">
+          <span>卡组 tag <em>可选 · 输入后看该卡组的上位记录</em></span>
+          <div class="tag-input">
+            <div id="tag-chip" class="tag-chip" hidden><span id="tag-text"></span><button type="button" id="tag-clear" aria-label="清除卡组">×</button></div>
+            <input id="deck" list="deck-list" placeholder="例如：烙印 / 耀圣 / 光与暗的仪式" autocomplete="off" maxlength="30">
+            <button type="button" id="tag-add" class="ghost" aria-label="添加卡组">＋</button>
+          </div>
+          <datalist id="deck-list"></datalist>
+        </label>
+        <button id="submit" class="primary" type="button">
+          <span class="btn-label">查询</span>
+          <span class="spinner" aria-hidden="true"></span>
+        </button>
+      </div>
+      <p class="hint">首次查询新时间段会自动抓取贴吧，可能需要几十秒；之后走缓存。</p>
+    </section>
+
+    <div id="error" class="error" hidden></div>
+
+    <div id="loading" class="loading" hidden>
+      <div class="loading-bar"><span></span></div>
+      <p id="loading-text">正在读取记录 / 抓取贴吧 ...</p>
+    </div>
+
+    <div id="results" hidden>
+      <section class="panel env-panel">
+        <div class="panel-head">
+          <div>
+            <p class="section-kicker">ENVIRONMENT</p>
+            <h2 id="env-title">环境分布</h2>
+            <p class="sub" id="env-sub"></p>
+          </div>
+          <div class="stat-strip" id="env-stats"></div>
+        </div>
+        <div class="env-grid">
+          <figure class="chart-wrap">
+            <img id="chart" alt="环境饼图" decoding="async">
+            <figcaption id="chart-cap"></figcaption>
+          </figure>
+          <div class="counts-wrap">
+            <div class="counts-head">
+              <h3>上位卡组数量</h3>
+              <span id="counts-note">按主轴计 · 悬停看构成</span>
+            </div>
+            <div class="counts" id="counts"></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel top-panel" id="top-panel" hidden>
+        <div class="panel-head">
+          <div>
+            <p class="section-kicker">TOP CUTS</p>
+            <h2 id="top-title">卡组上位</h2>
+            <p class="sub" id="top-sub"></p>
+          </div>
+          <div class="top-actions">
+            <span class="count-badge" id="top-count"></span>
+          </div>
+        </div>
+        <ol class="top-list" id="top-list"></ol>
+      </section>
+
+      <footer class="result-foot">
+        <span>数据来源：百度贴吧「上位卡组吧」</span>
+        <span id="gen-time"></span>
+        <span>统计口径：冠军 / 亚军 / 四强 / 八强 · 样本不重复</span>
+      </footer>
+    </div>
+  </main>
+
+  <script src="/app.js" defer></script>
+</body>
+</html>

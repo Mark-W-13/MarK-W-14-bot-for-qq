@@ -1426,7 +1426,10 @@ async function readDeckName(buf) {
  * 最多试 tries 个来源(用户要求一次问询最多重复 2 次检索)。
  */
 export async function searchTopDeck(primary, range = null, opts = {}) {
-  const { tries = Math.max(1, Number(process.env.YGOMETA_TOP_TRIES || 2)), log = () => {} } = opts;
+  const {
+    tries = Math.max(1, Number(process.env.YGOMETA_TOP_TRIES || 2)),
+    log = () => {}, noImage = false, listLimit = 5,
+  } = opts;
   if (!primary) return null;
   const collect = (store) => {
     const out = [];
@@ -1465,7 +1468,7 @@ export async function searchTopDeck(primary, range = null, opts = {}) {
     seenTid.add(c.thread.tid);
     return true;
   });
-  const list = uniqPool.slice(0, 5).map(c => ({
+  const list = uniqPool.slice(0, Math.max(1, listLimit)).map(c => ({
     tid: c.thread.tid,
     entryName: c.entry.name,
     role: c.entry.role,
@@ -1474,6 +1477,11 @@ export async function searchTopDeck(primary, range = null, opts = {}) {
     title: cleanText(c.thread.title || ''),
     url: c.url,
   }));
+
+  // 网页版只取链接列表,不抓图(省内存/时间)
+  if (noImage) {
+    return { ...uniqPool[0], image: null, attempts: 0, target, list };
+  }
 
   let attempts = 0;
   const seen = new Set();
@@ -1655,6 +1663,21 @@ async function deckAliasCheck() {
 }
 
 export function metaCacheDir() { return CACHE_DIR; }
+
+/** 网页自动补全用:当前记录库里出现过的轴,按次数降序 */
+export function listDeckAxes(limit = 300) {
+  const store = loadStore();
+  const counts = new Map();
+  for (const t of Object.values(store.threads || {})) {
+    for (const e of t.entries || []) {
+      for (const a of e.axes || []) counts.set(a, (counts.get(a) || 0) + 1);
+    }
+  }
+  return [...counts.entries()]
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], 'zh'))
+    .slice(0, Math.max(1, limit))
+    .map(([name, count]) => ({ name, count }));
+}
 
 // 兼容 self-test 里直接构造区间
 function rangeFromDates(startStr, endStr) {

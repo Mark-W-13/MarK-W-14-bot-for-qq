@@ -1,0 +1,16 @@
+[Unit]
+Description=YGOMeta Web (环境与上位检索)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/w-13/mc_agent
+ExecStart=/home/w-13/opt/node/bin/node agent/ygometa/web/server.mjs
+Restart=always
+RestartSec=3
+Environment=TZ=Asia/Shanghai
+Environment=YGOWEB_PORT=8080
+Environment=YGOWEB_HOST=127.0.0.1
+
+[Install]
+WantedBy=default.target

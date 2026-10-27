@@ -83,6 +83,8 @@ QQ 机器人「测试bot.fd」(QQ 3757588606)的自动回复系统,两个功能:
 
     **同卡异名自检(2026-10-27 新增)**:`node agent/ygometa/meta.mjs --deck-alias-check` 会把 `threads.json` 里所有提取到的轴字段拿到**本地百鸽卡库**逐条搜,按「搜出来的第一张卡 id」分组;同一张卡的不同字段就是疑似同一套卡组。输出 `[已归一]` / `[待确认]`,并做已知别名回归(味美喵/黯蜜、魔镌/刻魔)。**官方简中名以百鸽 `sc_name` 为准**(不是 `cn_name`):所以 `味美喵` 归一到 **黯蜜**(`黯蜜★史拿奇`),不是反过来。**抓取更新完 threads.json 后会自动跑一次**,报告写到 `agent/ygometa/cache/alias_report.txt`,不参与每次查询、不反复跑;确认新别名后并进 `RULES`。当前已归一二组:**味美喵/黯密 → 黯蜜**、**魔镌 → 刻魔**。
 
+13. **网页版环境/上位查询(2026-10-27 新增)**:`http://192.144.153.94/`(服务器 80 端口 nginx 已开放,反代到 `127.0.0.1:8080`;`onelegocg.top` 当前指向别的站,不要用)。页面可选**起止日期**(近7天/本月/上月/今年/自定义),旁边输入**卡组 tag**(带补全)查该卡组上位;结果上半部分是**PDF 去掉附录**的饼图 + 全主轴数量表,下半部分是**扩充到 20 条**的上位记录(日期/名次/卡组/比赛/原帖链接)。数据/抓取完全复用 `agent/ygometa/meta.mjs`;新时间段会自动爬、之后走缓存;服务**串行处理**查询、不抓网页端图片,常驻内存约 60MB。代码在 `agent/ygometa/web/`(零依赖 Node HTTP + 单页 HTML/CSS/JS,无前端框架);systemd 用户服务 `ygoweb.service`,日志 `journalctl --user -u ygoweb`。改完代码先 `sync-server.ps1` 再 `systemctl --user restart ygoweb`。
+
 
 ## 部署约定(2026-10-26)
 
@@ -109,6 +111,7 @@ powershell -ExecutionPolicy Bypass -File sync-server.ps1
 | 银河皇帝模式 | `agent/belial/belial.mjs` | 银河皇帝贝利亚人格 + 分群开关(`agent/belial/state.json`)+ 表情包库(`agent/belial/stickers/`,查看/删除/上传);CLI `--selftest / --prompt / --stickers`,或 `<群号> on\|off` 读/写开关 |
 | 游戏王环境饼图 | `agent/ygometa/meta.mjs` | 贴吧「上位卡组吧」按时间段抓取赛事战报 → 主轴归组 + 显著混轴外圈弧段统计 → 缓存(`agent/ygometa/cache/`)+ 饼图/PDF;CLI `--selftest / --trigger / --chart / --pdf / --top / --deck-alias-check` |
 | 上位卡组检索 | `agent/ygometa/meta.mjs` | 本地 `threads.json` 按主轴/时间找最近来源 → 原帖 `pb/page` 抓构筑图(最多 2 个来源);CLI `--top` |
+| 环境/上位网页 | `agent/ygometa/web/` | 零依赖 Node HTTP + 单页 UI;日期/卡组 tag 查询,饼图 + 20 条上位链接;systemd `ygoweb` |
 | 饼图渲染 | `agent/ygometa/pie.mjs` | 浅色大饼图 + 外引卡组名 + 右上角样本数(无图例、无卡图)→ Chrome headless 截图 PNG |
 | 框神语录模块 | `agent/kuangshen/kuangshen.mjs` | 语录库(quotes.json)+ 历史回填 + 实时采集 + 精筛 + 随机抽取;CLI 自测 `node kuangshen.mjs [--backfill|--dump|--dump-raw]` |
 | AI 闲聊消息解析 | `agent/aichat/aichat.mjs` | @/引用/QQ 表情/图片 → 模型读得懂的正文(**图片默认直传,一轮出结果**;`describe` 模式为两轮识别 → 拼回正文);CLI 自测 `node aichat.mjs [--selftest|--image|--render]` |
@@ -340,7 +343,8 @@ mc_agent/
     ├── kuangshen/         # 框神语录:采集 / 回填
     ├── ygometa/           # 游戏王环境饼图:贴吧抓取 / 缓存 / 统计 / 画图
     │   ├── meta.mjs           # 时间段 / 触发词 / 贴吧接口 / 战报解析 / 主轴归组 + 显著混轴 / 图表 + PDF + 上位检索 / 缓存(自测 --selftest)
-    │   └── pie.mjs            # 浅色大饼图 + 外引卡组名 + 右上角样本数(无图例/无卡图)+ Chrome headless 截图
+    │   ├── pie.mjs            # 浅色大饼图 + 外引卡组名 + 右上角样本数(无图例/无卡图)+ Chrome headless 截图
+    │   └── web/               # 环境/上位网页版(零依赖 Node HTTP + 单页 UI)+ ygoweb.service
     ├── shitpost/          # 搬屎:随机一搬 / 精选一搬
     └── ygocard/           # 卡牌:效果查询 / 卡图 / 卡库 / 裁定 / 卡表
 ```
