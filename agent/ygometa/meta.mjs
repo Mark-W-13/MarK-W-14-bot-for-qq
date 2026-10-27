@@ -1455,10 +1455,11 @@ export async function searchTopDeck(primary, range = null, opts = {}) {
 
   const target = range ? range.end - DAY : Date.now();
   const roleRank = r => ({ 冠军: 0, 亚军: 1, 四强: 2, 八强: 3, 十六强: 4, 三位: 5, 四位: 6, 上位: 9 }[r] ?? 8);
+  const eventTs = c => Date.parse(`${eventDateFromTitle(c.thread.title, c.thread.create)}T00:00:00`);
   const within = range ? candidates.filter(inRange) : candidates;
   const pool = (within.length ? within : candidates).slice().sort((a, b) => {
-    const da = Math.abs(a.thread.create * 1000 - target);
-    const db = Math.abs(b.thread.create * 1000 - target);
+    const da = Math.abs(eventTs(a) - target);
+    const db = Math.abs(eventTs(b) - target);
     return da - db || roleRank(a.entry.role) - roleRank(b.entry.role) || b.thread.create - a.thread.create;
   });
   // 同一帖子多个名次只保留最靠前的一条,5 条列表要是 5 场不同的比赛
