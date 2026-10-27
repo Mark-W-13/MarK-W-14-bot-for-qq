@@ -49,9 +49,9 @@ const THREADS_FILE = join(CACHE_DIR, 'threads.json');
 
 // 版本号:改了抓取/解析/画图口径就 +1,旧缓存自动失效(不用手删文件)
 const STORE_VERSION = 3;
-const PARSE_VERSION = 13;   // 2026-10-28:磁石战士轴;单卡组战报正文名次
-const PIE_VERSION = 28;     // 2026-10-28:磁石战士纳入统计
-const PDF_VERSION = 13;     // 2026-10-28:磁石战士/正文名次
+const PARSE_VERSION = 14;   // 2026-10-28:补混沌/黑魔导/雷盟/幕帘猫等卡组字段
+const PIE_VERSION = 29;     // 2026-10-28:补卡组字段后的统计
+const PDF_VERSION = 14;     // 2026-10-28:补卡组字段后的数量表
 
 const FORUM_KW = process.env.YGOMETA_FORUM || '上位卡组';
 const PAGE_RN = Math.min(100, Math.max(20, Number(process.env.YGOMETA_PAGE_RN || 100)));
@@ -497,6 +497,7 @@ const RULES = [
   // 卡库里官方中文名是「盈彩月夜」,所以统一归到这个名下。
   ['盈彩月夜', /盈彩月夜|盈彩月|加[辉瑞]{2}月|升月|升辉月/],
   ['雷火沸动', /雷火/],
+  ['雷盟', /雷盟/],
   ['巳剑', /巳剑/],
   ['白森', /白森|白森林|白鸦白森/],
   ['魔女术', /魔女术|魔女工艺/],
@@ -524,13 +525,15 @@ const RULES = [
   ['D.D.炸药', /D\.?D\.?\s*炸药|dd炸弹|d\.d\.ダイナマイト/i],
   ['救援王牌', /救援王牌/],
   ['魔术师', /魔术师/],
+  // 黑魔导=黑魔术师;「幕帘」是只带黑魔导副轴的常见记法
+  ['黑魔导', /黑魔导|黑魔术师|黑魔导士|幕帘/],
   ['英雄', /英雄/],
   ['青眼白龙', /青眼|白龙/],
   ['原石', /原石/],
   ['耀圣', /耀圣/],
   ['奥艺', /奥艺|奥义|艺术(?!家)/],
   ['莫忘', /莫忘/],
-  ['黯蜜', /黯蜜|黯密|味美喵/],
+  ['黯蜜', /黯蜜|黯密|味美喵|猫/],
   ['流沙', /流沙/],
   ['无冕者', /无冕者/],
   ['星骑士', /星骑士/],
@@ -538,7 +541,7 @@ const RULES = [
   ['弹丸', /弹丸/],
   ['龙拳', /龙拳|龙link/i],
   ['同步士', /同步士|同调士/],
-  ['列车', /列车/],
+  ['列车', /列车|车车/],
   ['白银城', /白银城|拉比丽斯/],
   ['亚特兰蒂斯', /亚特兰蒂斯/],
   ['K9', /k9/i],
@@ -549,7 +552,15 @@ const RULES = [
   ['绚岚', /绚岚|炫岚/],
   ['星宿', /星宿/],
   ['星辰', /星辰/],
-  ['光与暗的仪式', /光与暗|光暗/],
+  ['光与暗的仪式', /光与暗|光暗|混沌/],
+  ['召唤兽', /召唤兽|召唤师/],
+  ['妖精传姬', /妖精传姬|妖精之传姬/],
+  ['朱罗纪', /朱罗纪/],
+  ['炎王', /炎王/],
+  ['伟魔', /伟魔|伟贤/],
+  ['教导', /教导/],
+  ['地中骇界', /地中族|地中骇界/],
+  ['翼神龙', /翼神龙/],
   ['转生炎兽', /炎兽/],
   ['磁石战士', /磁石/],
   ['恐龙', /恐龙/],
@@ -631,6 +642,11 @@ export function parseDeckAxes(raw) {
   chosen.sort((a, b) => a.start - b.start || b.len - a.len);
   const axes = [];
   for (const m of chosen) if (!axes.includes(m.name)) axes.push(m.name);
+  // 「幕帘猫/幕帘黯蜜」:猫是黯蜜,幕帘只是黑魔导副轴,主卡组仍是黯蜜
+  if (axes.includes('黯蜜') && axes[0] !== '黯蜜' && /幕帘|猫/.test(s)) {
+    axes.splice(axes.indexOf('黯蜜'), 1);
+    axes.unshift('黯蜜');
+  }
 
   // 覆盖率:整段是否基本由卡组轴组成。检索「上位 烙印真的强」时不能因为含「烙印」就触发
   const covered = new Array(s.length).fill(false);
@@ -1832,6 +1848,13 @@ export async function metaSelftest() {
   ok(parseDeckAxes('魔镌').axes.join('|') === '刻魔', '别名归一:魔镌 → 刻魔');
   ok(parseDeckAxes('磁石战士').axes.join('|') === '磁石战士', '磁石战士轴');
   ok(parseDeckAxes('磁石魔救').axes.includes('磁石战士'), '磁石魔救识别为磁石战士', parseDeckAxes('磁石魔救').axes.join('+'));
+  ok(parseDeckAxes('混沌黑魔导').axes.join('|') === '光与暗的仪式|黑魔导', '混沌=光与暗, 黑魔导=黑魔术师', parseDeckAxes('混沌黑魔导').axes.join('+'));
+  ok(parseDeckAxes('雷盟').axes.join('|') === '雷盟', '雷盟轴');
+  ok(parseDeckAxes('幕帘猫').axes.join('|') === '黯蜜|黑魔导', '幕帘猫=黯蜜主卡+黑魔导副轴', parseDeckAxes('幕帘猫').axes.join('+'));
+  ok(parseDeckAxes('车车FTK').axes.includes('列车'), '车车=列车', parseDeckAxes('车车FTK').axes.join('+'));
+  ok(parseDeckAxes('召唤兽阿莱斯特').axes.includes('召唤兽'), '召唤兽轴');
+  ok(parseDeckAxes('朱罗纪炎王').axes.join('|') === '朱罗纪|炎王', '朱罗纪/炎王拆轴', parseDeckAxes('朱罗纪炎王').axes.join('+'));
+  ok(parseDeckAxes('地中族').axes.includes('地中骇界') && parseDeckAxes('翼神龙').axes.includes('翼神龙'), '地中族/翼神龙轴');
   const mag = analyzeThread({
     title: '10.17简中沈阳巡回赛',
     text: '10.17简中沈阳巡回赛\n使用卡组:磁石战士\n使用id:顺飞马\n135人7轮出16 亚军\nr1 输骰升月 oo',
