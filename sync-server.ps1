@@ -77,7 +77,6 @@ if ($LASTEXITCODE -ne 0) { throw "远端解包失败(exit $LASTEXITCODE)" }
 
 Write-Host "== 4/6 远端语法检查 ==" -ForegroundColor Cyan
 $check = ssh @SshOpts $Server "$Node --check ~/mc_agent/agent/monitor.mjs && $Node --check ~/mc_agent/agent/opsweb.mjs && $Node --check ~/mc_agent/agent/belial/belial.mjs && $Node --check ~/mc_agent/agent/aichat/aichat.mjs && $Node --check ~/mc_agent/agent/ygometa/meta.mjs && $Node --check ~/mc_agent/agent/ygometa/pie.mjs && $Node --check ~/mc_agent/agent/ygometa/web/server.mjs && echo syntax-ok"
-  'agent/ygometa/cardart.mjs',
 if ($LASTEXITCODE -ne 0 -or $check -notmatch 'syntax-ok') {
   Write-Host "语法检查失败,回滚服务器代码(服务未重启) ..." -ForegroundColor Red
   ssh @SshOpts $Server "cd $RemoteDir && tar xzf $backup 2>/dev/null || true"
