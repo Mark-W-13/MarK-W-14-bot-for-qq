@@ -69,6 +69,21 @@ export async function cardArtFor(axis) {
   ensure();
   if (memo.has(axis)) return memo.get(axis);
   const task = (async () => {
+    // 对应表优先:手动改 map.json 的 id/file 后直接复用,不再被搜索覆盖
+    const mapped = map[axis];
+    if (mapped?.id && mapped.file) {
+      const p = join(CACHE_DIR, mapped.file);
+      if (existsSync(p) && statSync(p).size >= 1024) {
+        const rec = {
+          id: mapped.id,
+          mime: mapped.mime || 'image/webp',
+          card: mapped.card || axis,
+          dataUri: `data:${mapped.mime || 'image/webp'};base64,${readFileSync(p).toString('base64')}`,
+        };
+        memo.set(axis, rec);
+        return rec;
+      }
+    }
     let hits = [];
     try { hits = searchCards(axis, 8); } catch { return null; }
     for (const c of hits) {
