@@ -203,6 +203,9 @@ export async function renderMetaPie(opt) {
       <filter id="blur" x="-40%" y="-40%" width="180%" height="180%">
         <feGaussianBlur stdDeviation="34"/>
       </filter>
+      <filter id="soft" x="-20%" y="-20%" width="140%" height="140%">
+        <feGaussianBlur stdDeviation="14"/>
+      </filter>
     </defs>
     <rect width="${W}" height="${H}" fill="url(#paper)"/>
     <rect width="${W}" height="${H}" fill="url(#dots)"/>
@@ -239,14 +242,24 @@ export async function renderMetaPie(opt) {
       const bodyColor = s.isOthers ? OTHERS_COLOR : colorOf(s.name);
       const bodyPath = sectorPath(cx, cy, r, a0, a1);
       const art = s.isOthers ? null : arts.get(s.name);
-      // 主轴:单张代表图,按扇区包围盒铺一块,不重复平铺
+      const picks = (!s.isOthers && Array.isArray(s.buckets))
+        ? s.buckets
+          .filter(b => b.name !== '其他混轴' && b.count > 0)
+          .filter(b => b.share >= 0.40 || (topNames.has(b.name) && b.share >= 0.10))
+        : [];
+      // 主轴:单张代表图;有副轴压在外圈时,中心略向圆心收,避免主体被外圈挡住
       if (art) {
         const box = arcBox(cx, cy, r, 0, a0, a1);
-        const size = 360;
+        // 标准 360px;只有占比特别大的块放大一档,避免大扇区靠柔焦底撑
+        const size = (s.num / total >= 0.18) ? 450 : 360;
+        const k = picks.length ? 0.12 : 0;
+        const centerX = box.x + (cx - box.x) * k;
+        const centerY = box.y + (cy - box.y) * k;
         const clip = clipFor(bodyPath);
         chart += `<path d="${bodyPath}" fill="${bodyColor}" stroke="none"/>`;
-        // 单张图,中心对准扇区质心;控制尺寸,避免放大到糊
-        chart += `<image href="${art.dataUri}" x="${box.x - size / 2}" y="${box.y - size / 2}" width="${size}" height="${size}" preserveAspectRatio="xMidYMid slice" clip-path="url(#${clip})"/>`;
+        // 同一张代表图先铺满扇区做柔焦底,避免露出纯色;上面再放清晰的标准大小图
+        chart += `<image href="${art.dataUri}" x="${cx - r}" y="${cy - r}" width="${r * 2}" height="${r * 2}" preserveAspectRatio="xMidYMid slice" filter="url(#soft)" opacity="0.88" clip-path="url(#${clip})"/>`;
+        chart += `<image href="${art.dataUri}" x="${centerX - size / 2}" y="${centerY - size / 2}" width="${size}" height="${size}" preserveAspectRatio="xMidYMid slice" clip-path="url(#${clip})"/>`;
         chart += `<path d="${bodyPath}" fill="${bodyColor}" opacity="0.14" stroke="none"/>`;
         chart += `<path d="${bodyPath}" fill="none" stroke="${PAPER}" stroke-width="2.4" stroke-linejoin="round"/>`;
       } else {
@@ -255,10 +268,7 @@ export async function renderMetaPie(opt) {
 
       // 只在外圈(rBody..r)叠「显著混轴」的弧段:
       // 占本块 ≥40%,或者本身是露出来的大主轴且在本块 ≥10%;其余混轴不体现颜色。
-      if (!s.isOthers && Array.isArray(s.buckets)) {
-        const picks = s.buckets
-          .filter(b => b.name !== '其他混轴' && b.count > 0)
-          .filter(b => b.share >= 0.40 || (topNames.has(b.name) && b.share >= 0.10));
+      if (picks.length) {
         let pa = a0;
         for (const b of picks) {
           const span = (a1 - a0) * b.share;
@@ -271,6 +281,7 @@ export async function renderMetaPie(opt) {
             const c = polar(cx, cy, (r + rBody) / 2, mid);
             const clip = clipFor(band);
             chart += `<path d="${band}" fill="${color}" fill-rule="evenodd" stroke="none"/>`;
+            chart += `<image href="${subArt.dataUri}" x="${cx - r}" y="${cy - r}" width="${r * 2}" height="${r * 2}" preserveAspectRatio="xMidYMid slice" filter="url(#soft)" opacity="0.88" clip-path="url(#${clip})"/>`;
             // 副轴不缩图:直接按原图 256px 盖在弧段上,裁掉多余部分
             chart += `<image href="${subArt.dataUri}" x="${c.x - 128}" y="${c.y - 128}" width="256" height="256" preserveAspectRatio="xMidYMid slice" clip-path="url(#${clip})"/>`;
             chart += `<path d="${band}" fill="${color}" opacity="0.10" fill-rule="evenodd" stroke="none"/>`;
