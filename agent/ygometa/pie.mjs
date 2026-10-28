@@ -12,7 +12,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, wri
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromePath } from '../env.mjs';
-import { cardArtFor } from './cardart.mjs';
+import { cardArtFor, PINNED_AXES } from './cardart.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const TMP_DIR = process.env.YGOMETA_TMP_DIR || join(__dirname, 'cache', 'html');
@@ -171,8 +171,9 @@ export async function renderMetaPie(opt) {
   const colorOf = name => colorMap.get(name) || MIX_OTHER_COLOR;
   const topNames = new Set(slices.filter(x => !x.isOthers).map(x => x.name));
 
-  // 主轴 + 真正会画出来的副轴才去找代表图;其他/其他混轴保持纯色
-  const needArt = new Set(slices.filter(s => !s.isOthers).map(s => s.name));
+  // 主轴 + 真正会画出来的副轴才去找代表图;「其他」也可以有固定代表图(悠悠王)
+  const needArt = new Set(slices.map(s => s.name));
+  for (const name of PINNED_AXES) needArt.add(name);
   for (const s of slices) {
     if (s.isOthers || !Array.isArray(s.buckets)) continue;
     for (const b of s.buckets) {
@@ -254,7 +255,7 @@ export async function renderMetaPie(opt) {
       a = a1;
       const bodyColor = s.isOthers ? OTHERS_COLOR : colorOf(s.name);
       const bodyPath = sectorPath(cx, cy, r, a0, a1);
-      const art = s.isOthers ? null : arts.get(s.name);
+      const art = arts.get(s.name);
       const picks = (!s.isOthers && Array.isArray(s.buckets))
         ? s.buckets
           .filter(b => b.name !== '其他混轴' && b.count > 0)

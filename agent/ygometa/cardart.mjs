@@ -10,9 +10,14 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const CACHE_DIR = join(__dirname, 'cache', 'cardart');
 const MAP_FILE = join(CACHE_DIR, 'map.json');
 const CDN = 'https://cdn.233.momobako.com/ygopro/pics';
-// 个别卡组的代表卡手动钉死(用户指定:狱神用「混绝狱神」)
-const PINNED = { '狱神': 70488851 };
-const PINNED_CARD = { '狱神': '混绝狱神 比托利姆' };
+// 个别卡组的代表卡手动钉死
+const PINNED = { '狱神': 70488851, '卡通': 7293697, '其他': 13803864 };
+const PINNED_CARD = {
+  '狱神': '混绝狱神 比托利姆',
+  '卡通': '完美卡通世界',
+  '其他': '悠悠王',
+};
+export const PINNED_AXES = Object.keys(PINNED);
 
 let memo = null; // axis -> { id, mime, dataUri, card }
 let map = null;
@@ -68,7 +73,7 @@ async function downloadArt(id) {
  * 只走百鸽 CDN 的 !art 中间图,保证无卡片边框。
  */
 export async function cardArtFor(axis) {
-  if (!axis || /其他/.test(axis)) return null;
+  if (!axis || axis === '其他混轴') return null;
   ensure();
   if (memo.has(axis)) return memo.get(axis);
   const task = (async () => {
