@@ -49,9 +49,9 @@ const THREADS_FILE = join(CACHE_DIR, 'threads.json');
 
 // 版本号:改了抓取/解析/画图口径就 +1,旧缓存自动失效(不用手删文件)
 const STORE_VERSION = 3;
-const PARSE_VERSION = 15;   // 2026-10-28:卡组分布/图注/多玩家单行不硬拼
-const PIE_VERSION = 41;     // 2026-10-28:卡通/其他固定代表图
-const PDF_VERSION = 26;     // 2026-10-28:卡通/其他代表图
+const PARSE_VERSION = 16;   // 2026-10-29:妖精别名归到妖精传姬
+const PIE_VERSION = 42;     // 2026-10-29:妖精传姬补统计
+const PDF_VERSION = 27;     // 2026-10-29:妖精传姬补统计
 
 const FORUM_KW = process.env.YGOMETA_FORUM || '上位卡组';
 const PAGE_RN = Math.min(100, Math.max(20, Number(process.env.YGOMETA_PAGE_RN || 100)));
@@ -554,7 +554,7 @@ const RULES = [
   ['星辰', /星辰/],
   ['光与暗的仪式', /光与暗|光暗|混沌/],
   ['召唤兽', /召唤兽|召唤师/],
-  ['妖精传姬', /妖精传姬|妖精之传姬/],
+  ['妖精传姬', /妖精传姬|妖精之传姬|妖精/],
   ['朱罗纪', /朱罗纪/],
   ['炎王', /炎王/],
   ['伟魔', /伟魔|伟贤/],
@@ -1913,6 +1913,8 @@ export async function metaSelftest() {
   ok(parseDeckAxes('召唤兽阿莱斯特').axes.includes('召唤兽'), '召唤兽轴');
   ok(parseDeckAxes('朱罗纪炎王').axes.join('|') === '朱罗纪|炎王', '朱罗纪/炎王拆轴', parseDeckAxes('朱罗纪炎王').axes.join('+'));
   ok(parseDeckAxes('地中族').axes.includes('地中骇界') && parseDeckAxes('翼神龙').axes.includes('翼神龙'), '地中族/翼神龙轴');
+  ok(parseDeckAxes('妖精').axes.join('|') === '妖精传姬', '妖精=妖精传姬', parseDeckAxes('妖精').axes.join('+'));
+  ok(parseDeckAxes('伟贤妖精').axes.includes('妖精传姬'), '伟贤妖精含妖精传姬', parseDeckAxes('伟贤妖精').axes.join('+'));
   const k1 = eventTitleKey('10.18 共青咕咕屋24人迎新杯亚军');
   const k2 = eventTitleKey('10.18 【共青】咕咕屋迎新杯24人');
   ok(sameEventKey(k1, k2), '同场不同战报标题可归并', `${k1} / ${k2}`);
@@ -1947,7 +1949,7 @@ export async function metaSelftest() {
     title: '韩山师范学院游戏王迎新吾悦杯圆满结束',
     text: '参赛人数：18人\n冠军：erAir（杀手旋律）\n亚军：xtqhy（奥艺耀圣）\n四强：星焱（水机列车）\n四强：清与悲（妖精魔女术）\n卡组分布：杀手旋律1奥艺耀圣2狱神奥艺1烙印3三幻魔1幕帘猫1刻魔魔弹1闪刀160朋克巳剑1升月154混沌绚岚闪刀1水机列车1皇国妖精魔女术1星辰烙印1磁石战士魔救1\n上位卡组如下：',
   });
-  ok(dist.length === 4 && dist.map(x => x.name).join(',') === '杀手旋律,奥艺耀圣,列车,魔女术', '卡组分布不被当成一套卡组', dist.map(x => `${x.role}:${x.name}`).join(','));
+  ok(dist.length === 4 && dist.map(x => x.name).join(',') === '杀手旋律,奥艺耀圣,列车,妖精传姬魔女术', '卡组分布不被当成一套卡组', dist.map(x => `${x.role}:${x.name}`).join(','));
   const b = analyzeThread({
     title: '栖风营地卡牌12人冠军',
     text: '使用卡组：D.D.炸药\n第一轮 对战升月白银城 输骰 oo\n四强 对战升月 赢骰 oo\n决赛 对战归光黑魔女黑魔导 输骰 oo',
