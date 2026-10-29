@@ -50,8 +50,8 @@ const THREADS_FILE = join(CACHE_DIR, 'threads.json');
 // 版本号:改了抓取/解析/画图口径就 +1,旧缓存自动失效(不用手删文件)
 const STORE_VERSION = 3;
 const PARSE_VERSION = 16;   // 2026-10-29:妖精别名归到妖精传姬
-const PIE_VERSION = 42;     // 2026-10-29:妖精传姬补统计
-const PDF_VERSION = 27;     // 2026-10-29:妖精传姬补统计
+const PIE_VERSION = 43;     // 2026-10-29:环境只统计前四强
+const PDF_VERSION = 28;     // 2026-10-29:环境/附录只统计前四强
 
 const FORUM_KW = process.env.YGOMETA_FORUM || '上位卡组';
 const PAGE_RN = Math.min(100, Math.max(20, Number(process.env.YGOMETA_PAGE_RN || 100)));
@@ -942,7 +942,11 @@ function sameEventKey(a, b) {
   return min >= 4 && (a.includes(b) || b.includes(a));
 }
 
+const TOP4_ROLES = new Set(['冠军', '亚军', '四强', '优胜', '一位', '二位', '三位', '四位']);
+const isTop4 = e => TOP4_ROLES.has(String(e?.role || ''));
+
 function aggregate(records) {
+  // 环境统计只取前四强(冠军/亚军/四强);八强、十六强、未定名次都不进饼图。
   // 一个卡组只算 1 副:混轴先选「全局出现次数最多的轴」当主轴,其余进副轴桶。
   // 例:原石白龙 2 + 白龙 1 → 白龙 3(纯1 + 原石2),不会拆成原石2 + 白龙1。
   const items = [];
@@ -951,7 +955,7 @@ function aggregate(records) {
   let posts = 0;
   let entries = 0;
   for (const t of records) {
-    const list = t.entries || [];
+    const list = (t.entries || []).filter(isTop4);
     if (!list.length) continue;
     const day = eventDateFromTitle(t.title, t.create);
     const ek = eventTitleKey(t.title);
@@ -1119,7 +1123,7 @@ function buildPdfHtml({ range, piePath, stats, records }) {
   for (const [day, list] of byDay) {
     cols += `<div class="day">${day}</div>`;
     for (const r of list) {
-      const entries = (r.entries || []).map(pdfEntryText).filter(Boolean);
+      const entries = (r.entries || []).filter(isTop4).map(pdfEntryText).filter(Boolean);
       if (!entries.length) continue;
       const title = cleanText(r.title || '').replace(/\s+/g, ' ').trim() || '(无标题)';
       cols += `<div class="event"><div class="etitle">${pdfEsc(title)}</div><div class="elist">${entries.map(pdfEsc).join('<br>')}</div></div>`;
@@ -1922,7 +1926,7 @@ export async function metaSelftest() {
     { title: '10.18 共青咕咕屋24人迎新杯亚军', create: 1792000000, entries: [{ role: '亚军', name: '教导', axes: ['教导'] }] },
     { title: '10.18 【共青】咕咕屋迎新杯24人', create: 1792000000, entries: [
       { role: '亚军', name: '教导', axes: ['教导'] },
-      { role: '八强', name: '烙印', axes: ['烙印'] },
+      { role: '四强', name: '烙印', axes: ['烙印'] },
     ] },
   ]);
   ok(agg.posts === 1 && agg.entries === 2, '同场个人战报+完整战报不重复计样本', JSON.stringify({ posts: agg.posts, entries: agg.entries }));
@@ -1940,6 +1944,18 @@ export async function metaSelftest() {
     { title: '10.22 教导', create: 1792200000, entries: [{ role: '冠军', name: '教导', axes: ['教导'] }] },
   ]);
   ok(agg3.list.find(x => x.name === '教导')?.num === 3 && !agg3.list.some(x => x.name === '伟魔'), '混轴不拆成两个主轴:伟魔教导 + 教导 → 教导3', JSON.stringify(agg3.list));
+  const agg4 = aggregate([{
+    title: '10.20 只取前四', create: 1792000000,
+    entries: [
+      { role: '冠军', name: '烙印', axes: ['烙印'] },
+      { role: '亚军', name: '烙印', axes: ['烙印'] },
+      { role: '四强', name: '烙印', axes: ['烙印'] },
+      { role: '八强', name: '烙印', axes: ['烙印'] },
+      { role: '十六强', name: '烙印', axes: ['烙印'] },
+      { role: '上位', name: '烙印', axes: ['烙印'] },
+    ],
+  }]);
+  ok(agg4.entries === 3 && agg4.list.find(x => x.name === '烙印')?.num === 3, '环境只统计前四强', JSON.stringify({ entries: agg4.entries }));
   const mag = analyzeThread({
     title: '10.17简中沈阳巡回赛',
     text: '10.17简中沈阳巡回赛\n使用卡组:磁石战士\n使用id:顺飞马\n135人7轮出16 亚军\nr1 输骰升月 oo',
