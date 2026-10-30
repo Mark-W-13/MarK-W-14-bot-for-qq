@@ -1,4 +1,4 @@
-// 贝利亚表情包:图片搜索(360 图片接口)+ 从公网 URL 下载进库
+// 通用图片搜索(360 图片接口)+ 从公网 URL 下载进表情包库(2026-10-29 去掉「只搜贝利亚」的限制)
 //
 // 为什么图片搜索不走 DeepSeek 官方 Search:DS Search 返回的是网页结果,不是可直接下载的图片 URL;
 // 模型要「找一张新表情包」得先拿到图片直链,所以这里用 360 图片搜索补这一层。
@@ -6,7 +6,7 @@
 //
 // 下载权限的护栏:
 //   · 只允许 http/https、公网 host(拒绝 localhost/内网/链路本地,防 SSRF)
-//   · 单张 ≤ BELIAL_STICKER_MAX_BYTES(默认 5MB)
+//   · 单张 ≤ maxBytes(默认 5MB)
 //   · 不信 Content-Type,addSticker 按文件头只认 jpg/png/gif/webp
 import { basename } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -29,7 +29,7 @@ export function isPrivateHost(host) {
   return false;
 }
 
-/** 搜贝利亚表情包图片(360 图片),返回图片直链,交给模型挑 */
+/** 搜图片(360 图片),返回图片直链,交给模型挑。**通用接口**:不预设贝利亚/任何角色 */
 export async function searchStickerImages(query, { count = 6, timeout = 20000 } = {}) {
   const q = String(query || '').trim().slice(0, 60);
   if (!q) return { ok: false, error: '搜索词为空' };
@@ -66,9 +66,10 @@ export async function searchStickerImages(query, { count = 6, timeout = 20000 } 
 
 /**
  * 从公网图片 URL 下载一张图,存进表情包库。
+ * 人格不同时传自己的 add / maxBytes(脚刷周等);不传就是贝利亚库(老行为)。
  * @returns {{ok:boolean, name?:string, size?:number, error?:string, message?:string}}
  */
-export async function downloadSticker(rawUrl, name = '') {
+export async function downloadSticker(rawUrl, name = '', { add = addSticker, maxBytes = MAX_STICKER_BYTES } = {}) {
   let u;
   try { u = new URL(String(rawUrl || '').trim()); }
   catch { return { ok: false, error: 'URL 不合法' }; }
@@ -91,13 +92,13 @@ export async function downloadSticker(rawUrl, name = '') {
         break;
       }
       const declared = Number(r.headers.get('content-length') || 0);
-      if (declared > MAX_STICKER_BYTES + 1024 * 1024) return { ok: false, error: `图片太大(${Math.round(declared / 1024 / 1024)}MB)` };
+      if (declared > maxBytes + 1024 * 1024) return { ok: false, error: `图片太大(${Math.round(declared / 1024 / 1024)}MB)` };
       const buf = Buffer.from(await r.arrayBuffer());
       if (!buf.length) { last = '空内容'; continue; }
-      if (buf.length > MAX_STICKER_BYTES) return { ok: false, error: `图片太大(上限 ${Math.round(MAX_STICKER_BYTES / 1024 / 1024)}MB)` };
+      if (buf.length > maxBytes) return { ok: false, error: `图片太大(上限 ${Math.round(maxBytes / 1024 / 1024)}MB)` };
       const guessed = basename(u.pathname || '') || '搜到的表情包';
-      const r2 = addSticker(buf, String(name || '').trim() || guessed);
-      return r2.ok ? { ok: true, name: r2.name, size: r2.size } : { ok: false, error: r2.message || '保存失败' };
+      const r2 = add(buf, String(name || '').trim() || guessed);
+      return r2.ok ? { ok: true, name: r2.name, size: r2.size, path: r2.path || '', cacheId: r2.cacheId || '' } : { ok: false, error: r2.message || '保存失败' };
     } catch (e) {
       last = e?.name === 'TimeoutError' || e?.name === 'AbortError' ? `超时 ${timeoutMs()}ms` : (e?.message || String(e));
     }
@@ -121,7 +122,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
       process.exitCode = checks.every(x => x[0]) ? 0 : 1;
     });
   } else {
-    const q = args.join(' ') || '贝利亚表情包';
+    const q = args.join(' ') || '表情包';
     searchStickerImages(q, { count: 6 }).then(r => {
       console.log(r.ok ? r.text : `图片搜索失败: ${r.error}`);
       process.exitCode = r.ok ? 0 : 1;

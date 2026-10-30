@@ -37,10 +37,37 @@ import {
 // 写状态文件、收发上传的图片 —— monitor 每次回复前现读 state.json / 表情包目录,点完立即生效。
 import {
   allOn as belialAll, isOn as belialOn, setOn as belialSetOn, statePath as belialStatePath,
-  listStickers as belialStickers, addSticker as belialAddSticker, deleteSticker as belialDeleteSticker,
+  nonAtProbOf as belialNonAtProbOf, setNonAtProb as belialSetNonAtProb, NONAT_PROB_DEFAULT as BELIAL_NONAT_PROB,
+  nonAtAutoOf as belialNonAtAutoOf, setNonAtAuto as belialSetNonAtAuto,
+  autoProbsOf as belialAutoProbsOf, setAutoProbs as belialSetAutoProbs,
+  stickerCatalog as belialStickerCatalog,
+  addSticker as belialAddSticker, deleteSticker as belialDeleteSticker,
+  setStickerMeta as belialSetStickerMeta, dynamicStickerMeta as belialDynamicStickerMeta,
   stickerPath as belialStickerPath, stickerMime as belialStickerMime, stickerDir as belialStickerDir,
   MAX_STICKER_BYTES as BELIAL_MAX_STICKER, FEATURE_CN as BELIAL_CN, KEYWORD as BELIAL_KEYWORD,
+  personaOf as belialPersonaOf, setPersona as belialSetPersona, PERSONA_IDS, PERSONA_LABELS,
+  GROUP_CARD as BELIAL_GROUP_CARD, originalCardOf as belialOriginalCardOf,
+  setOriginalCard as belialSetOriginalCard, clearOriginalCard as belialClearOriginalCard,
 } from './belial/belial.mjs';
+// 脚刷周模式(2026-10-29):第二个人格。表情包库/开关与贝利亚共用同一个面板,
+// 这里只多读一份它的表情包目录,并在 /api/belial 里接 persona 参数。
+import {
+  stickerCatalog as jszStickerCatalog, addSticker as jszAddSticker, deleteSticker as jszDeleteSticker,
+  setStickerMeta as jszSetStickerMeta, dynamicStickerMeta as jszDynamicStickerMeta,
+  stickerPath as jszStickerPath, stickerMime as jszStickerMime, stickerDir as jszStickerDir,
+  MAX_STICKER_BYTES as JSZ_MAX_STICKER, PERSONA_CN as JSZ_CN, KEYWORD as JSZ_KEYWORD,
+  PERSONA_ID as JSZ_ID, GROUP_CARD as JSZ_GROUP_CARD, SEED_MEMORIES as JSZ_SEED_MEMORIES,
+} from './jiaoshuazhou/jiaoshuazhou.mjs';
+// 西比拉(2026-10-29 正式上线):记忆驱动人格,系统提示只有一句身份 + 记忆块。
+import {
+  PERSONA_ID as SIBYL_ID, PERSONA_CN as SIBYL_CN, GROUP_CARD as SIBYL_GROUP_CARD,
+} from './persona/sibyl.mjs';
+import {
+  addMemory as personaAddMemory, deleteMemory as personaDeleteMemory, updateMemory as personaUpdateMemory,
+  listMemories as personaListMemories, memoryStats,
+} from './persona/memory.mjs';
+import { readVoiceMode, setVoiceMode, voiceCatalog, voiceModeLabel } from './belial/voice.mjs';
+import { autonameStickers } from './belial/autoname.mjs';
 // ⚠ 这一行只是把 env.mjs **加载**进来 —— 它**被 import 的那一刻**就自己把 agent/.env 读进
 //   process.env 了(env.mjs 文件末尾有 loadEnvFile())。所以本文件**不要再自己调一次** loadEnvFile():
 //   那时 .env 的键已经在 process.env 里,再调会因为「已存在」而全部跳过、返回空数组,
@@ -207,8 +234,8 @@ function filterSnowLog(lines, mode) {
   return lines.filter(keep).map(l => l.replace(/\s+$/, ''));
 }
 
-// 调 OneBot 拿账号信息(本地回环 + 令牌)
-async function onebot(action) {
+// 调 OneBot 拿账号信息 / 改群名片(本地回环 + 令牌)
+async function onebot(action, params = {}) {
   const api = process.env.API || 'http://127.0.0.1:3000/';
   const token = process.env.API_TOKEN || process.env.SNOWLUMA_API_TOKEN || '';
   if (!token) return null;
@@ -218,7 +245,7 @@ async function onebot(action) {
     const r = await fetch(api + action, {
       method: 'POST',
       headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-      body: '{}',
+      body: JSON.stringify(params || {}),
       signal: ctl.signal,
     });
     clearTimeout(t);
@@ -259,9 +286,9 @@ async function groupsWithTieba() {
   return { all: st.all, groups: rows, opened: rows.filter(r => r.tieba).length, file: tiebaStatePath(), updatedAt: st.updatedAt };
 }
 
-// ---------- 银河皇帝模式(2026-10-26) ----------
+// ---------- 人格面板(2026-10-26 银河皇帝,2026-10-29 加脚刷周后改名) ----------
 // 与贴吧模式同一套群列表与开关交互:状态读 belial/state.json(monitor 用的同一个文件),
-// 所以这里显示的就是线上正在生效的状态。表情包库另算(读 stickers/ 目录)。
+// 所以这里显示的就是线上正在生效的状态。每群在「贝利亚 / 脚刷周」里二选一;表情包库也按人格分开。
 async function groupsWithBelial() {
   const st = belialAll();
   const nameOf = new Map();
@@ -269,10 +296,127 @@ async function groupsWithBelial() {
   for (const g of (j?.data || [])) if (g?.group_id) nameOf.set(String(g.group_id), g.group_name || '');
   for (const gid of st.groups) if (gid !== '*' && !nameOf.has(gid)) nameOf.set(gid, '');
   const rows = [...nameOf.entries()]
-    .map(([groupId, name]) => ({ groupId, name, belial: belialOn(groupId) }))
+    .map(([groupId, name]) => {
+      const on = belialOn(groupId);
+      const persona = belialPersonaOf(groupId);
+      return { groupId, name, belial: on, on, persona };
+    })
     .sort((a, b) => Number(b.belial) - Number(a.belial)
       || String(a.name || a.groupId).localeCompare(String(b.name || b.groupId), 'zh'));
-  return { all: st.all, groups: rows, opened: rows.filter(r => r.belial).length, file: belialStatePath(), updatedAt: st.updatedAt };
+  const opened = rows.filter(r => r.belial).length;
+  const jszCount = rows.filter(r => r.belial && r.persona === JSZ_ID).length;
+  return {
+    all: st.all, groups: rows, opened,
+    belialCount: opened - jszCount, jszCount,
+    personas: st.personas || {},
+    nonAtProb: st.nonAtProb, nonAtAuto: st.nonAtAuto !== false,
+    autoMaxProb: st.autoMaxProb, autoMinProb: st.autoMinProb, file: belialStatePath(), updatedAt: st.updatedAt,
+  };
+}
+
+/** 人格 → 群名片(群昵称) */
+const PERSONA_GROUP_CARD = { belial: BELIAL_GROUP_CARD, [JSZ_ID]: JSZ_GROUP_CARD, [SIBYL_ID]: SIBYL_GROUP_CARD };
+const BOT_UIN = () => String(process.env.BOT_ID || '3757588606');
+
+/**
+ * 切人格时同步群名片(2026-10-29 用户要求):
+ *   贝利亚 → 「贝利亚大王」,脚刷周 → 「脚刷周」;关掉时恢复切换前的名片。
+ * 第一次切之前把原名片记进 belial/state.json 的 cards,monitor 与 opsweb 共用。
+ * 群名片是「尽力而为」:OneBot 失败只影响这一项,不影响开关。
+ */
+async function readBotGroupCard(gid) {
+  // 三个来源都可能缓存,历史消息里的发送者名片最接近真实
+  let hist;
+  const h = await onebot('get_group_msg_history', { group_id: Number(gid), count: 20 });
+  for (const m of ((h?.data?.messages) || []).slice().reverse()) {
+    if (String(m.user_id) === BOT_UIN()) { hist = String(m.sender?.card ?? ''); break; }
+  }
+  const list = await onebot('get_group_member_list', { group_id: Number(gid) });
+  const me = (list?.data || []).find(m => String(m.user_id) === BOT_UIN());
+  if (hist !== undefined) return hist;
+  if (me) return String(me.card ?? '');
+  const info = await onebot('get_group_member_info', { group_id: Number(gid), user_id: Number(BOT_UIN()) });
+  if (info?.status === 'ok') return String(info.data?.card ?? '');
+  return undefined;
+}
+async function setBotGroupCard(gid, card) {
+  let target = String(card ?? '');
+  let lastErr = '';
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (attempt) await sleep(700 * attempt);
+    const r = await onebot('set_group_card', { group_id: Number(gid), user_id: Number(BOT_UIN()), card: target });
+    if (r?.status !== 'ok') { lastErr = r?.wording || `retcode ${r?.retcode}`; continue; }
+    await sleep(500);
+    const now = await readBotGroupCard(gid);
+    if (now === target) return true;
+    lastErr = `回读是「${now === undefined ? '读不到' : now}」`;
+    if (!target && now !== undefined) {
+      const fallback = String(process.env.PERSONA_DEFAULT_CARD || 'W14').trim();
+      if (fallback) { target = fallback; lastErr += ',改用默认名片兜底'; }
+    }
+  }
+  console.log(`群名片切换失败 ${gid} → ${card || '(清空)'}: ${lastErr}`);
+  return false;
+}
+async function applyPersonaCard(gid, persona) {
+  if (!PERSONA_GROUP_CARD[persona]) return false;
+  if (belialOriginalCardOf(gid) === undefined) {
+    const cur = await readBotGroupCard(gid);
+    if (cur !== undefined) belialSetOriginalCard(gid, cur);
+  }
+  return setBotGroupCard(gid, PERSONA_GROUP_CARD[persona]);
+}
+async function restorePersonaCard(gid) {
+  const orig = belialOriginalCardOf(gid);
+  if (orig === undefined) return true;
+  const ok = await setBotGroupCard(gid, orig);
+  if (ok) belialClearOriginalCard(gid);
+  return ok;
+}
+// QQ 改群名片有频率限制:当场没恢复成功就隔 30s / 2min / 5min 再试(成功后记录自动清掉)
+const cardRestoreTimers = new Map();
+function scheduleRestoreCard(gid) {
+  if (cardRestoreTimers.has(gid)) return;
+  const delays = [30000, 120000, 300000];
+  const tick = async (i) => {
+    cardRestoreTimers.delete(gid);
+    if (belialOriginalCardOf(gid) === undefined) return;
+    await restorePersonaCard(gid);
+    if (belialOriginalCardOf(gid) !== undefined && i + 1 < delays.length) {
+      cardRestoreTimers.set(gid, setTimeout(() => tick(i + 1), delays[i + 1]));
+    }
+  };
+  cardRestoreTimers.set(gid, setTimeout(() => tick(0), delays[0]));
+}
+const cardApplyTimers = new Map();
+function scheduleApplyCard(gid, persona) {
+  if (cardApplyTimers.has(gid)) return;
+  const delays = [30000, 120000];
+  const tick = async (i) => {
+    cardApplyTimers.delete(gid);
+    if (!belialOn(gid) || belialPersonaOf(gid) !== persona) return;
+    const ok = await applyPersonaCard(gid, persona);
+    if (!ok && i + 1 < delays.length) {
+      cardApplyTimers.set(gid, setTimeout(() => tick(i + 1), delays[i + 1]));
+    }
+  };
+  cardApplyTimers.set(gid, setTimeout(() => tick(0), delays[0]));
+}
+function stickerApiFor(persona) {
+  if (persona === JSZ_ID) {
+    return {
+      id: JSZ_ID, cn: JSZ_CN, dir: jszStickerDir, catalog: jszStickerCatalog,
+      add: jszAddSticker, remove: jszDeleteSticker, path: jszStickerPath, mime: jszStickerMime,
+      setMeta: jszSetStickerMeta, dynamicMeta: jszDynamicStickerMeta,
+      maxBytes: JSZ_MAX_STICKER,
+    };
+  }
+  return {
+    id: 'belial', cn: PERSONA_LABELS.belial, dir: belialStickerDir, catalog: belialStickerCatalog,
+    add: belialAddSticker, remove: belialDeleteSticker, path: belialStickerPath, mime: belialStickerMime,
+    setMeta: belialSetStickerMeta, dynamicMeta: belialDynamicStickerMeta,
+    maxBytes: BELIAL_MAX_STICKER,
+  };
 }
 
 function hostStats() {
@@ -398,16 +542,48 @@ async function buildStatus() {
         ctx: TIEBA_CTX, maxReply: TIEBA_MAX_REPLY,
         maxChars: TIEBA_MAX_CHARS, gapMs: TIEBA_GAP_MS, minChars: TIEBA_MIN_CHARS };
     })(),
-    // 银河皇帝模式(2026-10-26):分群开关 + 表情包库(查看/删除/上传都在弹窗里)
+    // 人格面板(2026-10-26 银河皇帝,2026-10-29 加脚刷周):分群开关 + 两个人格的表情包库
     belial: await (async () => {
       const b = await groupsWithBelial().catch(() => ({ all: false, groups: [], opened: 0, file: belialStatePath(), updatedAt: 0 }));
       return {
         ...b,
-        stickers: belialStickers(),
+        stickers: belialStickerCatalog(),
+        stickersJsz: jszStickerCatalog(),
         stickerDir: belialStickerDir(),
+        stickerDirJsz: jszStickerDir(),
         maxStickerBytes: BELIAL_MAX_STICKER,
+        maxStickerBytesJsz: JSZ_MAX_STICKER,
         keyword: BELIAL_KEYWORD,
+        keywordJsz: JSZ_KEYWORD,
         cn: BELIAL_CN,
+        cnJsz: JSZ_CN,
+        personas: b.personas || {},
+        personaOptions: [
+          { id: 'belial', cn: BELIAL_CN, short: '贝利亚', keyword: BELIAL_KEYWORD, count: belialStickerCatalog().length },
+          { id: JSZ_ID, cn: JSZ_CN, short: '脚刷周', keyword: JSZ_KEYWORD, count: jszStickerCatalog().length },
+          { id: SIBYL_ID, cn: SIBYL_CN, short: '西比拉', keyword: '西比拉', count: 0 },
+        ],
+        // 人格记忆库(2026-10-29):群聊里模型自己 add/delete,这里给面板看/删/补
+        memories: {
+          belial: personaListMemories('belial', { includeSeed: true }),
+          [JSZ_ID]: personaListMemories(JSZ_ID, { seed: JSZ_SEED_MEMORIES, includeSeed: true }),
+          [SIBYL_ID]: personaListMemories(SIBYL_ID, { includeSeed: true }),
+        },
+        memoryStats: {
+          belial: memoryStats('belial'),
+          [JSZ_ID]: memoryStats(JSZ_ID, { seed: JSZ_SEED_MEMORIES }),
+          [SIBYL_ID]: memoryStats(SIBYL_ID),
+        },
+        nonAtProb: belialNonAtProbOf(),
+        nonAtAuto: belialNonAtAutoOf(),
+        autoMaxProb: belialAutoProbsOf().max,
+        autoMinProb: belialAutoProbsOf().min,
+        nonAtProbEnv: BELIAL_NONAT_PROB,
+        probRange: { min: 0, max: 1, step: 0.05 },
+        voiceMode: readVoiceMode(),
+        voiceOptions: voiceCatalog()
+          .filter(v => ['belial', 'klee', 'laomushi', 'young'].includes(v.id))
+          .map(v => ({ id: v.id, label: v.id === 'klee' ? '可莉' : (v.id === 'laomushi' ? '老牧师' : (v.id === 'young' ? '年轻男声' : '贝利亚')), provider: v.provider })),
         // 开关能点,但「AI 闲聊总开关关了 / 没配聊天 key」时开了也不会回 —— 界面上要说清
         aiOn: !!feat.ai,
         hasKey: !!(process.env.DEEPSEEK_API_KEY || process.env.AI_CHAT_API_KEY),
@@ -618,12 +794,16 @@ button.mini{min-height:28px;padding:4px 10px;font-size:12px;border-radius:7px}
     <div class="mut" style="margin-top:8px;font-size:11px">开了之后<strong>不用 @ 也会接话</strong>(脏话全开、短句、可连发、不 @ 人),而且 <strong>@ 它也归它管</strong>:那个群的兜底闲聊会被同一套人格覆盖(不答疑、不帮忙、只骂人)。
       <br>⚠ 默认全部关闭:只对这里点开的群生效;群友发「贴吧模式 开 / 关」也能切。</div></div>
 
-  <div class="card"><h2>银河皇帝模式 <span class="mut" style="font-weight:400">(按群)</span></h2>
+  <div class="card"><h2>人格面板 <span class="mut" style="font-weight:400">(按群)</span></h2>
     <div id="belial"></div>
     <div style="margin-top:10px"><button onclick="openBelial()">打开控制台…</button>
       <span class="mut" style="margin-left:8px" id="belialnote"></span></div>
-    <div class="mut" style="margin-top:8px;font-size:11px">群友 <strong>@我 说「银河皇帝」</strong>(「银河皇帝模式」也行)就切成本群人格「银河皇帝贝利亚」(再发「银河皇帝 关」切回);
-      只改被 @ 时的口吻,不碰游戏功能。点开控制台可按群开关、<strong>查看/删除/上传表情包</strong>。</div></div>
+    <div style="margin-top:8px;display:flex;align-items:center;gap:6px">
+      <span class="mut" style="font-size:11px">默认声线</span>
+      <div id="blquickvoices" style="display:flex;gap:6px"></div>
+    </div>
+    <div class="mut" style="margin-top:8px;font-size:11px">群友 <strong>@我 说「银河皇帝」</strong>切「银河皇帝贝利亚」,说 <strong>「脚刷周模式」</strong>切「脚刷周」(JoshuaZhou 的音译;再发「银河皇帝 关 / 脚刷周 关」切回);
+      每群二选一,只改被 @ 时的口吻,不碰游戏功能。点开控制台可按群切人格、<strong>查看/删除/上传两个人的表情包</strong>。</div></div>
 
   <div class="card"><h2>服务</h2><div id="svcs"></div></div>
 
@@ -680,20 +860,70 @@ button.mini{min-height:28px;padding:4px 10px;font-size:12px;border-radius:7px}
     概率/上下文/连发条数等口径在 agent/.env(TIEBA_PROB / TIEBA_CTX / TIEBA_MAX_REPLY …),改完要重启 monitor。</div>
 </div></div>
 
-<!-- 银河皇帝模式:主页面只露一个按钮,点开才显示分群开关;表情包库默认折叠 -->
+<!-- 人格面板:主页面只露一个按钮,点开才显示分群开关 + 人格选择;表情包库默认折叠 -->
 <div id="blmodal"><div class="mbox">
-  <h3>银河皇帝模式 <button class="mini" style="margin-left:auto" onclick="closeBelial()">关闭</button></h3>
+  <h3>人格面板 <button class="mini" style="margin-left:auto" onclick="closeBelial()">关闭</button></h3>
   <div class="mut" id="blhint"></div>
+  <div class="tbprob">
+    <label class="tbpc" style="display:flex;align-items:center;gap:4px;white-space:nowrap">
+      <input type="checkbox" id="blauto" checked onchange="blAutoSave(this.checked)"> 自动
+    </label>
+    <span class="tbpc">非@接话概率</span>
+    <input type="range" id="blprob" min="0" max="1" step="0.05" value="0.4" disabled
+      oninput="blProbInput(this.value)" onchange="blProbSave(this.value)">
+    <input type="number" id="blprobn" min="0" max="1" step="0.05" value="0.4" disabled
+      onchange="blProbSave(this.value)">
+    <span class="tbpc" id="blprobv">自动</span>
+  </div>
+  <div class="tbprob">
+    <span class="tbpc">自动上限</span>
+    <input type="number" id="blautohi" min="0" max="100" step="1" value="35"
+      onchange="blAutoLimitsSave()"> <span class="tbpc">%</span>
+    <span class="tbpc">自动下限</span>
+    <input type="number" id="blautolo" min="0" max="100" step="1" value="5"
+      onchange="blAutoLimitsSave()"> <span class="tbpc">%</span>
+    <button class="mini" onclick="blAutoLimitsSave()">保存</button>
+  </div>
+  <div class="mut" style="font-size:11px;margin:-2px 0 8px">自动模式默认开启:按本群最近 5 分钟消息频次平滑调整,
+    低频约 <strong>35%</strong>、高频约 <strong>5%</strong>;关掉「自动」才用滑杆固定值(0 = 完全不自动接话,1 = 每句都接)。
+    上面两个百分比就是 auto 的<strong>低频上限 / 高频下限</strong>,可改。</div>
   <div id="blbody"></div>
+  <div class="mut" style="margin-top:8px;font-size:11px">切人格会同时改机器人在本群的<strong>群名片</strong>:贝利亚 →「贝利亚大王」,脚刷周 →「脚刷周」;关掉人格时恢复切换前的名片(第一次切之前自动记下)。</div>
+  <div style="margin-top:14px;border-top:1px solid var(--line);padding-top:10px">
+    <div style="display:flex;align-items:center;gap:8px">
+      <strong style="font-size:13px">默认声线</strong>
+      <span class="mut" id="blvoicenote"></span>
+      <div id="blvoices" style="margin-left:auto;display:flex;gap:6px"></div>
+    </div>
+    <div class="mut" style="margin-top:6px;font-size:11px">切换后模型调用 <code>send_voice</code> 时默认用这个声线;monitor 每次合成前现读,点一下即时生效。</div>
+  </div>
+  <div style="margin-top:14px;border-top:1px solid var(--line);padding-top:10px">
+    <div style="display:flex;align-items:center;gap:8px">
+      <strong style="font-size:13px">记忆库</strong>
+      <span class="mut" id="blmemnote"></span>
+    </div>
+    <div class="mut" style="margin-top:6px;font-size:11px">模型在群聊里用 <code>add_memory</code> / <code>delete_memory</code> 自己增删;这里也能补/删。内置记忆只读。</div>
+    <div id="blmemlist" style="margin-top:8px"></div>
+    <div class="blupload" style="margin-top:8px">
+      <input id="blmemtext" placeholder="加一条记忆…" maxlength="160" style="flex:1;min-width:140px;font:inherit;padding:5px 7px;border:1px solid var(--line);border-radius:7px">
+      <select id="blmemkind" style="font:inherit;padding:5px 7px;border:1px solid var(--line);border-radius:7px">
+        <option value="fact">事实</option><option value="style">风格</option>
+      </select>
+      <button class="mini pri" onclick="addMemory()">添加</button>
+      <span class="mut" id="blmemaddnote"></span>
+    </div>
+  </div>
   <div style="margin-top:14px;border-top:1px solid var(--line);padding-top:10px">
     <div style="display:flex;align-items:center;gap:8px">
       <strong style="font-size:13px">表情包库</strong>
       <span class="mut" id="blstickernote"></span>
       <button class="mini" style="margin-left:auto" id="blstickerbtn" onclick="toggleStickers()">展开</button>
     </div>
+    <div id="blpersontabs" style="display:flex;gap:6px;margin-top:8px"></div>
     <div id="blstickerbox" style="display:none;margin-top:10px">
       <div class="blupload">
         <button class="mini pri" onclick="document.getElementById('blfile').click()">上传表情包</button>
+        <button class="mini" onclick="autonameStickers()">AI 命名未命名</button>
         <input type="file" id="blfile" accept="image/png,image/jpeg,image/gif,image/webp" multiple style="display:none"
           onchange="uploadStickers(this.files);this.value=''">
         <span class="mut" id="bluploadnote"></span>
@@ -701,8 +931,8 @@ button.mini{min-height:28px;padding:4px 10px;font-size:12px;border-radius:7px}
       <div class="blgrid" id="blgrid"></div>
     </div>
   </div>
-  <div class="mut" style="margin-top:10px;font-size:11px">开关是<strong>每群各记各的</strong>,点了立刻生效(monitor 每次回复前现读状态文件,不用重启)。<br>
-    群里的等价指令:@我 说「银河皇帝」召唤,说「银河皇帝 关」收起;这个模式不在 /help 里。</div>
+  <div class="mut" style="margin-top:10px;font-size:11px">开关/人格是<strong>每群各记各的</strong>,点了立刻生效(monitor 每次回复前现读状态文件,不用重启)。<br>
+    群里的等价指令:@我 说「银河皇帝」或「脚刷周模式」召唤,说「银河皇帝 关」/「脚刷周 关」收起;这个模式不在 /help 里。</div>
 </div></div>
 
 <script>
@@ -769,82 +999,240 @@ function renderTieba(force){
     '<div class="sw'+(t.all?' on':'')+'" onclick="setTieba(\\'*\\','+(t.all?'false':'true')+')"><i></i></div></div>'+
     (t.groups.length?t.groups.map(tbRow).join(''):'<div class="mut">读不到群列表(OneBot 可能没起来)</div>');
 }
-// 银河皇帝模式(2026-10-26):主页面只露一个「打开控制台…」按钮;弹窗里是分群开关 + 折叠的表情包库。
+// 人格面板(2026-10-29:银河皇帝 + 脚刷周):主页面只露一个「打开控制台…」按钮;
+// 弹窗里是分群开关 + 每群人格选择 + 折叠的表情包库(两个人格各一个库)。
 // 状态来自 /api/status 的 belial(读的就是 monitor 正在用的 state.json),所以显示与生效永远一致。
-var blData={groups:[],all:false,opened:0,stickers:[]}, blOpen=false, blStickersOpen=false, blStickerSig='';
-function openBelial(){blOpen=true;renderBelial(true);document.getElementById('blmodal').className='show'}
+var blData={groups:[],all:false,opened:0,stickers:[],stickersJsz:[],personas:{},personaOptions:[],memories:{belial:[],jiaoshuazhou:[]},memoryStats:{belial:{dynamic:0,total:0,max:120},jiaoshuazhou:{dynamic:0,total:0,max:120}},voiceMode:'belial',voiceOptions:[],nonAtProb:0.4,nonAtAuto:true,autoMaxProb:0.35,autoMinProb:0.05}, blOpen=false, blStickersOpen=false, blStickerSig='', blStickerPersona='belial';
+function openBelial(){blOpen=true;syncBlProb(blData);renderBelial(true);document.getElementById('blmodal').className='show'}
 function closeBelial(){blOpen=false;document.getElementById('blmodal').className=''}
 function setBelial(groupId,on){act('belial',{groupId:groupId,on:on})}
+function setPersona(groupId,persona){act('belial',{groupId:groupId,persona:persona})}
+function personaName(id){var o=(blData.personaOptions||[]).find(function(x){return x.id===id});return o?o.short:(id==='jiaoshuazhou'?'脚刷周':'贝利亚')}
+function blProbInput(v){document.getElementById('blprobv').textContent=Math.round(Number(v)*100)+'%'}
+function blProbSave(v){
+  var a=document.getElementById('blauto');
+  if(a&&a.checked)return;                              // 自动模式下滑杆不生效
+  var n=Number(v);
+  if(!isFinite(n))return;
+  n=Math.min(1,Math.max(0,n));
+  blProbInput(n);
+  document.getElementById('blprob').value=n;
+  document.getElementById('blprobn').value=n;
+  act('belial',{prob:n});
+}
+function blAutoSave(on){
+  var auto=!!on;
+  var a=document.getElementById('blauto'),s=document.getElementById('blprob'),n2=document.getElementById('blprobn');
+  if(a)a.checked=auto;
+  if(s)s.disabled=auto;
+  if(n2)n2.disabled=auto;
+  document.getElementById('blprobv').textContent=auto?'自动':Math.round(Number(document.getElementById('blprobn').value||0.4)*100)+'%';
+  act('belial',{auto:auto});
+}
+function syncBlProb(b){
+  if(!b)return;
+  var auto=b.nonAtAuto!==false;
+  var a=document.getElementById('blauto'),s=document.getElementById('blprob'),n2=document.getElementById('blprobn');
+  if(a)a.checked=auto;
+  if(s){s.disabled=auto;s.value=(b.nonAtProb===undefined?0.4:b.nonAtProb);}
+  if(n2){n2.disabled=auto;n2.value=(b.nonAtProb===undefined?0.4:b.nonAtProb);}
+  var hi=document.getElementById('blautohi'),lo=document.getElementById('blautolo');
+  if(hi)hi.value=Math.round((b.autoMaxProb===undefined?0.35:b.autoMaxProb)*100);
+  if(lo)lo.value=Math.round((b.autoMinProb===undefined?0.05:b.autoMinProb)*100);
+  if(auto)document.getElementById('blprobv').textContent='自动';
+  else blProbInput(b.nonAtProb===undefined?0.4:b.nonAtProb);
+}
+function blAutoLimitsSave(){
+  var hiEl=document.getElementById('blautohi'),loEl=document.getElementById('blautolo');
+  var hi=Number(hiEl.value),lo=Number(loEl.value);
+  if(!isFinite(hi)||!isFinite(lo)||hi<0||hi>100||lo<0||lo>100){toast('上下限要填 0~100 的百分比');return;}
+  if(hi<lo){toast('自动上限不能小于下限');return;}
+  act('belial',{autoMax:hi/100,autoMin:lo/100});
+}
+function setBelialVoice(v){
+  fetch('/api/belial/voice',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({voice:v})})
+   .then(function(r){return r.json()})
+   .then(function(j){toast(j.message||(j.ok?'已切换':'切换失败'));return tick()})
+   .catch(function(e){toast('切换失败:'+e.message)});
+}
+function blVoiceName(v){return v==='klee'?'可莉':v==='laomushi'?'老牧师':v==='young'?'年轻男声':'贝利亚'}
+function renderVoiceSwitch(){
+  var b=blData||{},cur=b.voiceMode||'belial';
+  var opts=(b.voiceOptions&&b.voiceOptions.length)?b.voiceOptions:[
+    {id:'belial',label:'贝利亚'},{id:'klee',label:'可莉'},{id:'laomushi',label:'老牧师'}
+  ];
+  var html=opts.map(function(v){
+    var tip=v.provider==='mimo'?'MiMo 克隆':'Edge 回退';
+    return '<button class="mini'+(cur===v.id?' pri':'')+'" title="'+h(tip)+'" onclick="setBelialVoice(\\''+v.id+'\\')">'+h(v.label)+'</button>';
+  }).join('');
+  ['blvoices','blquickvoices'].forEach(function(id){
+    var box=document.getElementById(id);
+    if(box)box.innerHTML=html;
+  });
+  var note=document.getElementById('blvoicenote');
+  if(note)note.textContent='当前:'+blVoiceName(cur);
+}
 function blRow(r){
+  var cur=r.persona||'belial';
+  var open=!!r.belial;
+  var pbtn=function(id,label){
+    return '<button class="mini'+(cur===id?' pri':'')+'" style="min-height:24px;padding:1px 8px;font-size:11px" onclick="setPersona(\\''+r.groupId+'\\',\\''+id+'\\')">'+label+'</button>';
+  };
   return '<div class="blrow"><span class="tk" title="'+h(r.groupId)+'">'+h(r.name||('群 '+r.groupId))+
-    '<div class="tsub">'+h(r.groupId)+(r.belial?' · 已开启':'')+'</div></span>'+
-    '<div class="sw'+(r.belial?' on':'')+'" onclick="setBelial(\\''+r.groupId+'\\','+(r.belial?'false':'true')+')"><i></i></div></div>';
+    '<div class="tsub">'+h(r.groupId)+' · '+(open?('当前:'+personaName(cur)):'关闭(点人格即开启)')+'</div></span>'+
+    '<span style="display:flex;gap:4px;align-items:center">'+pbtn('belial','贝利亚')+pbtn('jiaoshuazhou','脚刷周')+'</span>'+
+    '<div class="sw'+(open?' on':'')+'" onclick="setBelial(\\''+r.groupId+'\\','+(open?'false':'true')+')"><i></i></div></div>';
 }
 function renderBelial(force){
   var b=blData||{groups:[]};
+  var probText=b.nonAtAuto!==false?'自动':(Math.round((b.nonAtProb ?? 0.4)*100)+'%');
   var anyOn=!!(b.all||b.opened);
   var onText=b.all?'全部群开启':(b.opened?('已开 '+b.opened+' 个群'):'全部关闭');
   var note=document.getElementById('belialnote');
   if(note)note.textContent='';
   var sum=document.getElementById('belial');
   if(sum){
+    var belN=b.belialCount||0, jszN=b.jszCount||0;
     sum.innerHTML='<div class="row"><span class="dot '+(anyOn?'ok':'')+'"></span><span class="k">'+onText+
-      '<div class="sub">表情包 '+((b.stickers||[]).length)+' 张</div></span></div>';
+      '<div class="sub">贝利亚 '+belN+' · 脚刷周 '+jszN+' · 表情包 '+((b.stickers||[]).length)+'+'+((b.stickersJsz||[]).length)+' 张 · 非@ '+probText+'</div></span></div>';
   }
+  renderVoiceSwitch();
   if(!force&&!blOpen)return;
+  // 概率框跟着后端当前值走(另一个标签页/群里改过也能对上)
+  if(document.activeElement!==document.getElementById('blprob')
+    &&document.activeElement!==document.getElementById('blprobn')
+    &&document.activeElement!==document.getElementById('blautohi')
+    &&document.activeElement!==document.getElementById('blautolo'))syncBlProb(b);
   var hint=document.getElementById('blhint');
   if(hint){
     var warn='';
     if(b.aiOn===false)warn=' ⚠ AI 闲聊总开关关着,开了也不会回';
     else if(b.hasKey===false)warn=' ⚠ 没配聊天 key,开了也不会回';
-    hint.textContent='共 '+((b.groups||[]).length)+' 个群;表情包 '+((b.stickers||[]).length)+' 张;群里 @我 说「'+
-      (b.keyword||'银河皇帝')+'」召唤,说「银河皇帝 关」收起'+warn;
+    hint.textContent='共 '+((b.groups||[]).length)+' 个群;已开 '+((b.opened)||0)+'(贝利亚 '+(b.belialCount||0)+' / 脚刷周 '+(b.jszCount||0)+
+      ');表情包 '+((b.stickers||[]).length)+'+'+((b.stickersJsz||[]).length)+' 张;非@ '+probText+
+      ';群里 @我 说「银河皇帝」或「脚刷周模式」切人格,说「银河皇帝 关 / 脚刷周 关」收起'+warn;
   }
   var box=document.getElementById('blbody');
   if(!box)return;
-  box.innerHTML='<div class="blrow all"><span class="tk">全部群<div class="tsub">一次把下面所有群都打开/关掉</div></span>'+
+  box.innerHTML='<div class="blrow all"><span class="tk">全部群<div class="tsub">一次把下面所有群都打开/关掉(不改每群选的人格)</div></span>'+
     '<div class="sw'+(b.all?' on':'')+'" onclick="setBelial(\\'*\\','+(b.all?'false':'true')+')"><i></i></div></div>'+
     ((b.groups&&b.groups.length)?b.groups.map(blRow).join(''):'<div class="mut">读不到群列表(OneBot 可能没起来)</div>');
+  renderPersonaTabs();
+  renderMemories();
   renderStickers();
 }
 function fmtBytes(n){n=Number(n)||0;return n>=1048576?((n/1048576).toFixed(1)+'MB'):(Math.max(1,Math.round(n/1024))+'KB')}
 function toggleStickers(){blStickersOpen=!blStickersOpen;renderStickers()}
+function setStickerPersona(id){blStickerPersona=id;blStickerSig='';renderPersonaTabs();renderStickers();renderMemories()}
+function memPersona(){var ids=(blData.personaOptions||[]).map(function(o){return o.id});return ids.indexOf(blStickerPersona)>=0?blStickerPersona:'belial'}
+function renderMemories(){
+  var box=document.getElementById('blmemlist');
+  if(!box)return;
+  var p=memPersona();
+  var list=(blData.memories&&blData.memories[p])||[];
+  var st=(blData.memoryStats&&blData.memoryStats[p])||{dynamic:0,total:list.length,max:120};
+  var note=document.getElementById('blmemnote');
+  if(note)note.textContent='('+personaName(p)+' · 动态 '+st.dynamic+' / 共 '+st.total+' · 上限 '+st.max+')';
+  box.innerHTML=list.length?list.map(function(m){
+    return '<div class="blrow"><span class="tk" style="font-size:12px;word-break:break-all">'+h(m.text)+
+      '<div class="tsub">'+h(m.id)+' · '+(m.kind==='style'?'风格':'事实')+(m.seed?' · 内置只读':'')+'</div></span>'+
+      (m.seed?'':'<button class="mini" title="修改这条记忆" onclick="editMemory(\\''+encodeURIComponent(m.id)+'\\',\\''+encodeURIComponent(m.text)+'\\')">改</button>'+
+        '<button class="mini" title="删除这条记忆" onclick="delMemory(\\''+encodeURIComponent(m.id)+'\\')">×</button>')+'</div>';
+  }).join(''):'<div class="mut" style="font-size:12px">还没有记忆。群里让 bot「记住…」,或下面手动加一条。</div>';
+}
+function addMemory(){
+  var t=document.getElementById('blmemtext');
+  var text=t?String(t.value||'').trim():'';
+  if(!text){toast('先写点内容');return}
+  var kind=(document.getElementById('blmemkind')||{}).value||'fact';
+  var note=document.getElementById('blmemaddnote');
+  if(note)note.textContent='保存中…';
+  fetch('/api/persona/memory',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({persona:memPersona(),action:'add',text:text,kind:kind})})
+   .then(function(r){return r.json()})
+   .then(function(j){if(j.ok&&t)t.value='';if(note)note.textContent='';toast(j.message||(j.ok?'已添加':'添加失败'));return tick()})
+   .catch(function(e){if(note)note.textContent='';toast('添加失败:'+e.message)});
+}
+function delMemory(id){
+  var mid=decodeURIComponent(id||'');
+  if(!confirm('删除记忆 '+mid+' ?'))return;
+  fetch('/api/persona/memory',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({persona:memPersona(),action:'delete',id:mid})})
+   .then(function(r){return r.json()})
+   .then(function(j){toast(j.message||(j.ok?'已删除':'删除失败'));return tick()})
+   .catch(function(e){toast('删除失败:'+e.message)});
+}
+function editMemory(id,oldText){
+  var mid=decodeURIComponent(id||'');
+  var cur=decodeURIComponent(oldText||'');
+  var next=prompt('修改这条记忆(留空取消):',cur);
+  if(next===null)return;
+  next=String(next).trim();
+  if(!next||next===cur)return;
+  fetch('/api/persona/memory',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({persona:memPersona(),action:'edit',id:mid,text:next})})
+   .then(function(r){return r.json()})
+   .then(function(j){toast(j.message||(j.ok?'已改好':'修改失败'));return tick()})
+   .catch(function(e){toast('修改失败:'+e.message)});
+}
+function renderPersonaTabs(){
+  var box=document.getElementById('blpersontabs');
+  if(!box)return;
+  var opts=(blData.personaOptions&&blData.personaOptions.length)?blData.personaOptions:[
+    {id:'belial',short:'贝利亚',count:(blData.stickers||[]).length},
+    {id:'jiaoshuazhou',short:'脚刷周',count:(blData.stickersJsz||[]).length}
+  ];
+  box.innerHTML=opts.map(function(o){
+    return '<button class="mini'+(blStickerPersona===o.id?' pri':'')+'" onclick="setStickerPersona(\\''+o.id+'\\')">'+h(o.short)+
+      ' <span class="mut">'+((o.count!=null)?o.count:'')+'</span></button>';
+  }).join('')+'<span class="mut" style="font-size:11px;align-self:center">← 切人格看各自的图</span>';
+}
 function renderStickers(){
-  var b=blData||{},list=b.stickers||[];
+  var b=blData||{};
+  var isJsz=blStickerPersona==='jiaoshuazhou';
+  var list=isJsz?(b.stickersJsz||[]):(b.stickers||[]);
+  var who=isJsz?'脚刷周':'贝利亚';
   var note=document.getElementById('blstickernote');
-  if(note)note.textContent='('+list.length+' 张)';
+  if(note)note.textContent='('+who+' · '+list.length+' 张)';
   var btn=document.getElementById('blstickerbtn');
   if(btn)btn.textContent=blStickersOpen?'收起':'展开';
   var box=document.getElementById('blstickerbox');
   if(!box)return;
   box.style.display=blStickersOpen?'':'none';
   var up=document.getElementById('bluploadnote');
-  if(up)up.textContent='单张 ≤ '+fmtBytes(b.maxStickerBytes||5242880)+',支持 jpg / png / gif / webp';
+  var max=isJsz?(b.maxStickerBytesJsz||5242880):(b.maxStickerBytes||5242880);
+  if(up)up.textContent='单张 ≤ '+fmtBytes(max)+',支持 jpg / png / gif / webp';
   var grid=document.getElementById('blgrid');
   if(!grid)return;
-  var sig=list.map(function(s){return s.name+':'+s.size+':'+Math.round(s.mtime||0)}).join('|');
+  var sig=blStickerPersona+'|'+list.map(function(s){return s.name+':'+s.size+':'+Math.round(s.mtime||0)+':'+(s.desc||'')+':'+(s.label||'')}).join('|');
   if(sig===blStickerSig&&grid.getAttribute('data-sig')===sig)return;
   blStickerSig=sig;grid.setAttribute('data-sig',sig);
   grid.innerHTML=list.length?list.map(function(s){
     // 带 mtime 做 cache-buster:表情包被替换/缩放后,浏览器不会还拿旧图
-    var url='/api/belial/sticker?name='+encodeURIComponent(s.name)+'&v='+Math.round(s.mtime||0);
-    return '<div class="blitem"><img src="'+url+'" loading="lazy" title="'+h(s.name)+' · '+fmtBytes(s.size)+
+    var url='/api/belial/sticker?persona='+encodeURIComponent(blStickerPersona)+'&name='+encodeURIComponent(s.name)+'&v='+Math.round(s.mtime||0);
+    var tip=s.name+' · '+fmtBytes(s.size)+(s.desc?(' · '+s.desc):'')+(s.tags&&s.tags.length?(' ['+s.tags.join('/')+']'):'');
+    return '<div class="blitem"><img src="'+url+'" loading="lazy" title="'+h(tip)+
       '" onclick="window.open(this.src,\\'_blank\\')">'+
-      '<div class="bn" title="'+h(s.name)+'">'+h(s.name)+'</div>'+
+      '<div class="bn" title="'+h(tip)+'">'+h(s.label || s.desc || s.name)+'</div>'+
       '<button class="bx" title="删除" onclick="delSticker(\\''+encodeURIComponent(s.name)+'\\')">×</button></div>';
-  }).join(''):'<div class="mut">还没有表情包。点「上传表情包」加几张(建议正方形、边长 300~800px)。</div>';
+  }).join(''):'<div class="mut">'+who+'还没有表情包。点「上传表情包」加几张(建议正方形、边长 300~800px)。</div>';
 }
 function delSticker(name){
   var n=decodeURIComponent(name||'');
-  if(!confirm('删除表情包「'+n+'」?'))return;
-  fetch('/api/belial/stickers/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:n})})
+  if(!confirm('从「'+personaName(blStickerPersona)+'」表情包库删除「'+n+'」?'))return;
+  fetch('/api/belial/stickers/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:n,persona:blStickerPersona})})
    .then(function(r){return r.json()}).then(function(j){toast(j.message||(j.ok?'已删除':'删除失败'));return tick()})
    .catch(function(e){toast('删除失败:'+e.message)});
+}
+function autonameStickers(){
+  var note=document.getElementById('bluploadnote');
+  if(note)note.textContent='AI 正在识别「'+personaName(blStickerPersona)+'」未命名的表情包…';
+  fetch('/api/belial/stickers/autoname',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({limit:5,persona:blStickerPersona})})
+   .then(function(r){return r.json()})
+   .then(function(j){toast(j.message||(j.ok?'AI 命名完成':'AI 命名失败'));return tick()})
+   .catch(function(e){toast('AI 命名失败:'+e.message)});
 }
 function uploadStickers(files){
   var arr=Array.prototype.slice.call(files||[]);
   if(!arr.length)return;
-  var i=0,okN=0,failN=0,max=(blData&&blData.maxStickerBytes)||5*1024*1024;
+  var i=0,okN=0,failN=0,isJsz=blStickerPersona==='jiaoshuazhou',max=isJsz?((blData&&blData.maxStickerBytesJsz)||5*1024*1024):((blData&&blData.maxStickerBytes)||5*1024*1024);
   var note=document.getElementById('bluploadnote');
   function next(){
     if(i>=arr.length){
@@ -858,7 +1246,7 @@ function uploadStickers(files){
     var fr=new FileReader();
     fr.onload=function(){
       var b64=String(fr.result||'').split(',')[1]||'';
-      fetch('/api/belial/stickers',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:f.name,data:b64})})
+      fetch('/api/belial/stickers',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:f.name,data:b64,persona:blStickerPersona})})
        .then(function(r){return r.json()})
        .then(function(j){if(j.ok){okN++;if(note)note.textContent='已上传「'+j.name+'」'}else{failN++;toast(j.message||'上传失败')}})
        .catch(function(e){failN++;toast('上传失败:'+e.message)})
@@ -1204,57 +1592,150 @@ const server = createServer(async (req, res) => {
       return json(res, 200, { ok: true, message: messages.join(';'), tieba: await groupsWithTieba().catch(() => null) });
     }
 
-    // 银河皇帝模式(2026-10-26):① 分群开关 ② 表情包库(列表/看图/上传/删除)
-    // 开关直接写 belial/state.json —— monitor 每次回复前现读,点一下立即生效,不用重启。
+    // 人格面板(2026-10-26 银河皇帝,2026-10-29 加脚刷周):① 分群开关 ② 每群人 格 ③ 表情包库
+    // 开关/人格直接写 belial/state.json —— monitor 每次回复前现读,点一下立即生效,不用重启。
     if (path === '/api/belial' && req.method === 'POST') {
-      const { groupId, on } = await readBody(req);
-      if (typeof on !== 'boolean') return json(res, 400, { message: '缺少 on(布尔值)' });
-      const g = String(groupId ?? '*').trim() || '*';
-      if (g !== '*' && !/^\d{4,12}$/.test(g)) return json(res, 400, { message: '群号不合法' });
-      const r = belialSetOn(g, on);
-      if (!r.ok) return json(res, 400, { message: r.message || '设置失败' });
-      const where = g === '*' ? '全部群' : ((await groupsWithBelial().catch(() => ({ groups: [] })))
-        .groups.find(x => x.groupId === g)?.name || `群 ${g}`);
+      const { groupId, on, prob, auto, autoMax, autoMin, persona } = await readBody(req);
+      const messages = [];
+      if (auto !== undefined) {
+        if (typeof auto !== 'boolean') return json(res, 400, { message: 'auto 必须是布尔值' });
+        const ra = belialSetNonAtAuto(auto);
+        if (!ra.ok) return json(res, 400, { message: ra.message || '自动模式设置失败' });
+        messages.push(auto ? '非@接话已切到自动模式(按群聊频次)' : '非@接话已切回滑杆固定概率');
+      }
+      if (autoMax !== undefined || autoMin !== undefined) {
+        const rl = belialSetAutoProbs({ max: autoMax, min: autoMin });
+        if (!rl.ok) return json(res, 400, { message: rl.message || '自动上下限设置失败' });
+        messages.push(`自动上下限已改为 ${Math.round(rl.max * 100)}% / ${Math.round(rl.min * 100)}%`);
+      }
+      if (prob !== undefined) {
+        const rp = belialSetNonAtProb(prob);
+        if (!rp.ok) return json(res, 400, { message: rp.message || '概率设置失败' });
+        messages.push(`非@接话概率已改为 ${Math.round(rp.prob * 100)}%`);
+      }
+      if (persona !== undefined) {
+        const g = String(groupId ?? '').trim();
+        if (!g) return json(res, 400, { message: '缺少 groupId' });
+        if (!PERSONA_IDS.includes(persona)) return json(res, 400, { message: `未知人格:${persona}` });
+        const r = belialSetPersona(g, persona);
+        if (!r.ok) return json(res, 400, { message: r.message || '设置失败' });
+        const cardOk = await applyPersonaCard(g, persona);
+        if (!cardOk) scheduleApplyCard(g, persona);
+        const where = (await groupsWithBelial().catch(() => ({ groups: [] })))
+          .groups.find(x => x.groupId === g)?.name || `群 ${g}`;
+        messages.push(`${where}已切到「${PERSONA_LABELS[persona] || persona}」并开启${cardOk ? ',群名片已同步' : '(群名片暂时没切成,已排队重试;QQ 对改名片有频率限制)'}`);
+      } else if (groupId !== undefined && on !== undefined) {
+        if (typeof on !== 'boolean') return json(res, 400, { message: '缺少 on(布尔值)' });
+        const g = String(groupId ?? '*').trim() || '*';
+        if (g !== '*' && !/^\d{4,12}$/.test(g)) return json(res, 400, { message: '群号不合法' });
+        const r = belialSetOn(g, on);
+        if (!r.ok) return json(res, 400, { message: r.message || '设置失败' });
+        if (on) {
+          if (g === '*') {
+            const rows = (await groupsWithBelial().catch(() => ({ groups: [] }))).groups || [];
+            for (const row of rows) await applyPersonaCard(row.groupId, row.persona);
+          } else {
+            await applyPersonaCard(g, belialPersonaOf(g));
+          }
+        } else if (g === '*') {
+          // 全部群关闭:逐个恢复记录过的原名片(没记录过的群不动)
+          for (const gid of Object.keys(belialAll().cards || {})) {
+            const ok = await restorePersonaCard(gid);
+            if (!ok) scheduleRestoreCard(gid);
+          }
+        } else {
+          const ok = await restorePersonaCard(g);
+          if (!ok) scheduleRestoreCard(g);
+        }
+        const where = g === '*' ? '全部群' : ((await groupsWithBelial().catch(() => ({ groups: [] })))
+          .groups.find(x => x.groupId === g)?.name || `群 ${g}`);
+        messages.push(`${where}的人格模式已${on ? '开启' : '关闭'}`);
+      }
+      if (!messages.length) return json(res, 400, { message: '没给要改的东西(groupId/on、persona 或 prob)' });
       return json(res, 200, {
         ok: true,
-        message: `${where}的${BELIAL_CN}已${on ? '开启' : '关闭'}`,
+        message: messages.join(';'),
         belial: await groupsWithBelial().catch(() => null),
       });
     }
+    if (path === '/api/persona/memory' && req.method === 'POST') {
+      const { persona, action, text, id, kind } = await readBody(req);
+      if (!PERSONA_IDS.includes(persona)) return json(res, 400, { message: `未知人格:${persona}` });
+      const seed = persona === JSZ_ID ? JSZ_SEED_MEMORIES : [];
+      let r;
+      if (action === 'add') r = personaAddMemory(persona, text, { kind: kind || 'fact', seed });
+      else if (action === 'edit') r = personaUpdateMemory(persona, id, text, { seed });
+      else if (action === 'delete') r = personaDeleteMemory(persona, id, { seed });
+      else return json(res, 400, { message: 'action 只能是 add / edit / delete' });
+      return json(res, r.ok ? 200 : 400, {
+        ...r,
+        message: r.ok ? (r.duplicate ? '已经记过了' : (action === 'add' ? '已加入记忆库' : action === 'edit' ? '已改好' : '已删除')) : (r.message || '操作失败'),
+        memories: personaListMemories(persona, { seed, includeSeed: true }),
+      });
+    }
+    if (path === '/api/belial/voice' && req.method === 'POST') {
+      const { voice } = await readBody(req);
+      const r = setVoiceMode(voice);
+      return json(res, r.ok ? 200 : 400, {
+        ...r,
+        voiceMode: readVoiceMode(),
+        message: r.ok ? `默认声线已切到${voiceModeLabel(voice)}` : (r.message || '切换失败'),
+      });
+    }
     if (path === '/api/belial/stickers' && req.method === 'GET') {
-      return json(res, 200, { ok: true, stickers: belialStickers(), maxBytes: BELIAL_MAX_STICKER });
+      const api = stickerApiFor(url.searchParams.get('persona'));
+      return json(res, 200, { ok: true, persona: api.id, stickers: api.catalog(), maxBytes: api.maxBytes });
     }
     if (path === '/api/belial/stickers' && req.method === 'POST') {
       // 上传走 JSON(base64):前端 FileReader 读成 dataURL,这里拆掉前缀再按文件头校验。
       // 12MB 的请求体上限足够 5MB 的原图(base64 约 6.7MB),再大就拒绝。
       const body = await readBody(req, 12 * 1024 * 1024);
+      const api = stickerApiFor(body.persona);
       const data = String(body.data || '');
       if (!data) return json(res, 400, { message: '没有收到文件内容' });
       let buf;
       try { buf = Buffer.from(data.replace(/^data:[^;]+;base64,/, ''), 'base64'); }
       catch { return json(res, 400, { message: '文件内容不是合法的 base64' }); }
-      const r = belialAddSticker(buf, String(body.name || ''));
+      const r = api.add(buf, String(body.name || ''));
       return json(res, r.ok ? 200 : 400, {
         ...r,
+        persona: api.id,
         message: r.ok ? `已上传「${r.name}」` : (r.message || '上传失败'),
-        stickers: belialStickers(),
+        stickers: api.catalog(),
+      });
+    }
+    if (path === '/api/belial/stickers/autoname' && req.method === 'POST') {
+      const body = await readBody(req);
+      const api = stickerApiFor(body.persona);
+      const limit = Math.min(10, Math.max(1, Number(body.limit || 5)));
+      const r = await autonameStickers({ limit, force: !!body.force, stickerApi: api });
+      return json(res, 200, {
+        ...r,
+        persona: api.id,
+        stickers: api.catalog(),
+        message: r.total
+          ? `AI 命名:成功 ${r.done} / 失败 ${r.failed}`
+          : '没有未命名的 up_ 表情包',
       });
     }
     if (path === '/api/belial/stickers/delete' && req.method === 'POST') {
-      const { name } = await readBody(req);
-      const r = belialDeleteSticker(String(name || ''));
+      const { name, persona } = await readBody(req);
+      const api = stickerApiFor(persona);
+      const r = api.remove(String(name || ''));
       return json(res, r.ok ? 200 : 400, {
         ...r,
+        persona: api.id,
         message: r.ok ? `已删除「${r.name}」` : (r.message || '删除失败'),
-        stickers: belialStickers(),
+        stickers: api.catalog(),
       });
     }
     if (path === '/api/belial/sticker' && req.method === 'GET') {
-      // 给运维台 <img> 用。只认 stickers/ 下的图片文件,路径穿越在 belialStickerPath 里挡掉了。
+      // 给运维台 <img> 用。只认该人格 stickers/ 下的图片文件,路径穿越在 stickerPath 里挡掉了。
+      const api = stickerApiFor(url.searchParams.get('persona'));
       const name = url.searchParams.get('name') || '';
-      const p = belialStickerPath(name);
+      const p = api.path(name);
       if (!p) return json(res, 404, { message: '没有这张表情包' });
-      const mime = belialStickerMime(name);
+      const mime = api.mime(name);
       let buf;
       try { buf = readFileSync(p); } catch { return json(res, 500, { message: '读取表情包失败' }); }
       res.writeHead(200, {
