@@ -18,6 +18,8 @@ agent/aichat/tone.json
 # 联网搜索次数记账
 agent/search_stats.json
 agent/*.log
+# SYSTEM 控制台审计日志(谁在哪个群发了什么命令,运行时数据)
+agent/admin_audit.jsonl
 agent/kuangshen/quotes.json
 agent/kuangshen/blacklist.json
 agent/kuangshen/pending.json
@@ -48,9 +50,19 @@ agent/modes.json
 # 贴吧模式的分群开关(运行时状态:运维台/群里随时切,首启以 TIEBA_ENABLED 为初值)
 agent/tieba/state.json
 
-# 银河皇帝模式的分群开关与运维台上传的表情包(种子表情包入库,上传的不入库)
+# 银河皇帝模式的分群开关 / 运维台上传的表情包 / 语音缓存(种子表情包入库,上传与缓存不入库)
 agent/belial/state.json
+agent/belial/voice_state.json
+agent/belial/sticker_meta.json
 agent/belial/stickers/up_*
+agent/belial/voice_cache/
+
+# 脚刷周模式(2026-10-29):表情包库的运行时元数据/上传图;种子图入库,开关与贝利亚共用 state.json
+agent/jiaoshuazhou/sticker_meta.json
+agent/jiaoshuazhou/stickers/up_*
+
+# 人格记忆库(2026-10-29):群里模型自己增删的长期记忆/风格调整,运行时数据不入库
+agent/persona/memory.json
 
 # 游戏王环境饼图(2026-10-26):贴吧抓取缓存 / 统计结果 / 生成的 PNG / 代表卡索引
 # 全部可重建;缓存目录里的 pages/threads 会随使用变大,不入库

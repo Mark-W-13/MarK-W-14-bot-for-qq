@@ -1,10 +1,10 @@
-﻿# sync-server.ps1 — 把本仓库的「服务器端代码」同步到线上 Ubuntu 服务器并重启服务。
+# sync-server.ps1 — 把本仓库的「服务器端代码」同步到线上 Ubuntu 服务器并重启服务。
 #
 # 用户 2026-10-26 定:以后改完服务器端代码就自动跑这个,不要每次都问。
 #   powershell -ExecutionPolicy Bypass -File sync-server.ps1
 #
 # 只同步**代码与静态数据**(agent/*.mjs、表情包种子图、qq_faces.json、README/.gitignore);
-# 运行时状态一律不碰:inbox/processed/features/modes/tone/tieba state/belial state/
+# 运行时状态一律不碰:inbox/processed/features/modes/tone/tieba state/belial state(含人格开关/群名片记录)/
 # 卡库/卡图/每日一卡/统计……这些留在服务器上,不会被本地覆盖。
 #
 # 做的事:备份服务器现有代码 → 打包上传 → 远端语法检查 → 重启 mc-agent/opsweb → 验证。
@@ -21,16 +21,29 @@ $items = @(
   'agent/env.mjs',
   'agent/modes.mjs',
   'agent/monitor.mjs',
+  'agent/admin.mjs',
+  'agent/ADMIN.md',
   'agent/opsweb.mjs',
   'agent/aichat/aichat.mjs',
   'agent/aichat/tone.mjs',
   'agent/aichat/websearch.mjs',
   'agent/aichat/qq_faces.json',
   'agent/belial/belial.mjs',
+  'agent/belial/autoname.mjs',
   'agent/belial/deepsearch.mjs',
   'agent/belial/stickersearch.mjs',
   'agent/belial/tools.mjs',
+  'agent/belial/voice.mjs',
+  'agent/belial/voice_ref',
   'agent/belial/stickers',
+  'agent/persona/stickerlib.mjs',
+  'agent/persona/memory.mjs',
+  'agent/persona/memory_cli.mjs',
+  'agent/persona/sibyl.mjs',
+  'agent/persona/sibyl_seed.mjs',
+  'agent/persona/sibyl_ygo_seed.mjs',
+  'agent/jiaoshuazhou/jiaoshuazhou.mjs',
+  'agent/jiaoshuazhou/stickers',
   'agent/tieba/tieba.mjs',
   'agent/hs/hs.mjs',
   'agent/hs/hs_meta.mjs',
@@ -59,12 +72,12 @@ $remoteTgz = "/tmp/$leaf"
 $backup = "~/backups/mc_agent_code_$stamp.tgz"
 
 Write-Host "== 1/6 打包服务器端代码 ==" -ForegroundColor Cyan
-tar -czf $localTgz --exclude='agent/belial/state.json' --exclude='agent/belial/stickers/up_*' @existing
+tar -czf $localTgz --exclude='agent/belial/state.json' --exclude='agent/belial/stickers/up_*' --exclude='agent/belial/sticker_meta.json' --exclude='agent/jiaoshuazhou/sticker_meta.json' --exclude='agent/jiaoshuazhou/stickers/up_*' @existing
 if ($LASTEXITCODE -ne 0) { throw "tar 打包失败(exit $LASTEXITCODE)" }
 
 Write-Host "== 2/6 备份服务器现有代码 ==" -ForegroundColor Cyan
 # 备份里也包含即将覆盖的文件;新功能目录在服务器上可能还不存在,失败忽略。
-ssh @SshOpts $Server "mkdir -p ~/backups && tar czf $backup -C $RemoteDir $($existing -join ' ') 2>/dev/null || true"
+ssh @SshOpts $Server "mkdir -p ~/backups && tar czf $backup -C $RemoteDir $($existing -join ' ') || true"
 if ($LASTEXITCODE -ne 0) { Write-Host "备份失败(继续同步): $LASTEXITCODE" -ForegroundColor DarkYellow }
 Write-Host "备份路径: $backup (服务器上)" -ForegroundColor DarkGray
 
@@ -76,16 +89,16 @@ ssh @SshOpts $Server "cd $RemoteDir && tar xzf $remoteTgz && rm -f $remoteTgz &&
 if ($LASTEXITCODE -ne 0) { throw "远端解包失败(exit $LASTEXITCODE)" }
 
 Write-Host "== 4/6 远端语法检查 ==" -ForegroundColor Cyan
-$check = ssh @SshOpts $Server "$Node --check ~/mc_agent/agent/monitor.mjs && $Node --check ~/mc_agent/agent/opsweb.mjs && $Node --check ~/mc_agent/agent/belial/belial.mjs && $Node --check ~/mc_agent/agent/aichat/aichat.mjs && $Node --check ~/mc_agent/agent/ygometa/meta.mjs && $Node --check ~/mc_agent/agent/ygometa/pie.mjs && $Node --check ~/mc_agent/agent/ygometa/web/server.mjs && echo syntax-ok"
+$check = ssh @SshOpts $Server "$Node --check ~/mc_agent/agent/monitor.mjs && $Node --check ~/mc_agent/agent/admin.mjs && $Node --check ~/mc_agent/agent/opsweb.mjs && $Node --check ~/mc_agent/agent/belial/belial.mjs && $Node --check ~/mc_agent/agent/jiaoshuazhou/jiaoshuazhou.mjs && $Node --check ~/mc_agent/agent/persona/stickerlib.mjs && $Node --check ~/mc_agent/agent/persona/memory.mjs && $Node --check ~/mc_agent/agent/aichat/aichat.mjs && $Node --check ~/mc_agent/agent/ygometa/meta.mjs && $Node --check ~/mc_agent/agent/ygometa/pie.mjs && $Node --check ~/mc_agent/agent/ygometa/web/server.mjs && echo syntax-ok"
 if ($LASTEXITCODE -ne 0 -or $check -notmatch 'syntax-ok') {
   Write-Host "语法检查失败,回滚服务器代码(服务未重启) ..." -ForegroundColor Red
-  ssh @SshOpts $Server "cd $RemoteDir && tar xzf $backup 2>/dev/null || true"
+  ssh @SshOpts $Server "cd $RemoteDir && tar xzf $backup || true"
   throw "语法检查失败,已尝试回滚:$check"
 }
 Write-Host "语法检查通过" -ForegroundColor DarkGray
 
 Write-Host "== 5/6 重启 mc-agent / opsweb ==" -ForegroundColor Cyan
-ssh @SshOpts $Server 'systemctl --user restart mc-agent.service opsweb.service; systemctl --user try-restart ygoweb.service 2>/dev/null || true; sleep 4; systemctl --user is-active mc-agent opsweb'
+ssh @SshOpts $Server 'systemctl --user restart mc-agent.service opsweb.service; systemctl --user try-restart ygoweb.service || true; sleep 4; systemctl --user is-active mc-agent opsweb'
 if ($LASTEXITCODE -ne 0) { throw "服务重启或状态检查失败(exit $LASTEXITCODE)" }
 
 Write-Host "== 6/6 验证 ==" -ForegroundColor Cyan
@@ -96,14 +109,20 @@ for ($i = 0; $i -lt 5; $i++) {
   Start-Sleep -Seconds 2
 }
 Write-Host "opsweb HTTP: $http" -ForegroundColor DarkGray
-$stickers = (ssh @SshOpts $Server "ls ~/mc_agent/agent/belial/stickers 2>/dev/null | wc -l").Trim()
+$stickers = (ssh @SshOpts $Server "ls ~/mc_agent/agent/belial/stickers | wc -l").Trim()
 Write-Host "贝利亚表情包: $stickers 张" -ForegroundColor DarkGray
-$pane = ssh @SshOpts $Server "tmux capture-pane -p -t mc -S -120 2>/dev/null | grep -a '银河皇帝模式=' | tail -1"
+$jstickers = (ssh @SshOpts $Server "ls ~/mc_agent/agent/jiaoshuazhou/stickers | wc -l").Trim()
+Write-Host "脚刷周表情包: $jstickers 张" -ForegroundColor DarkGray
+$pane = ssh @SshOpts $Server "tmux capture-pane -p -t mc -S -120 | grep -a '银河皇帝模式=' | tail -1"
 if ($pane) { Write-Host "monitor 横幅: $($pane.Trim())" -ForegroundColor DarkGray }
 else { Write-Host "没抓到 monitor 横幅(可能还在启动;可以看 tmux 面板确认)" -ForegroundColor DarkYellow }
-$err = ssh @SshOpts $Server "tmux capture-pane -p -t mc -S -120 2>/dev/null | grep -aE 'does not provide an export|Cannot find module|ERR_MODULE_NOT_FOUND|SyntaxError' | tail -3"
+$sys = ssh @SshOpts $Server "tmux capture-pane -p -t mc -S -120 | grep -a 'SYSTEM 控制台' | tail -1"
+if ($sys) { Write-Host "SYSTEM 控制台: $($sys.Trim())" -ForegroundColor DarkGray }
+else { Write-Host "没抓到 SYSTEM 控制台横幅(可能还在启动)" -ForegroundColor DarkYellow }
+$err = ssh @SshOpts $Server "tmux capture-pane -p -t mc -S -120 | grep -aE 'does not provide an export|Cannot find module|ERR_MODULE_NOT_FOUND|SyntaxError' | tail -3"
 if ($err) { Write-Host "⚠ monitor 面板出现模块/语法错误,请立即看日志:" -ForegroundColor Red; Write-Host $err -ForegroundColor Red }
 
 Write-Host ""
 Write-Host "同步完成。备份在服务器: $backup" -ForegroundColor Green
 Write-Host ('回滚: ssh ' + $Server + ' "cd ~/mc_agent && tar xzf ' + $backup + ' && systemctl --user restart mc-agent opsweb"') -ForegroundColor DarkGray
+
