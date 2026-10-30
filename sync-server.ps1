@@ -7,8 +7,9 @@
 # 运行时状态一律不碰:inbox/processed/features/modes/tone/tieba state/belial state(含人格开关/群名片记录)/
 # 卡库/卡图/每日一卡/统计……这些留在服务器上,不会被本地覆盖。
 #
-# 做的事:备份服务器现有代码 → 打包上传 → 远端语法检查 → 重启 mc-agent/opsweb → 验证。
-# 失败时:语法检查不过会回滚备份;服务重启后只做告警,不自动回滚(避免把线上二次弄挂)。
+# 做的事:备份服务器现有代码(只留最近 1 份)→ 打包上传 → 远端语法检查 → 重启 mc-agent/opsweb → 验证。
+# 失败时:语法检查不过会回滚这份备份;服务重启后只做告警,不自动回滚(避免把线上二次弄挂)。
+# 要回到更早的版本用远端 git:git checkout <commit> 后再跑本脚本覆盖线上代码。
 
 $ErrorActionPreference = 'Stop'
 $Server = 'w-13@192.144.153.94'
@@ -80,6 +81,9 @@ Write-Host "== 2/6 备份服务器现有代码 ==" -ForegroundColor Cyan
 ssh @SshOpts $Server "mkdir -p ~/backups && tar czf $backup -C $RemoteDir $($existing -join ' ') || true"
 if ($LASTEXITCODE -ne 0) { Write-Host "备份失败(继续同步): $LASTEXITCODE" -ForegroundColor DarkYellow }
 Write-Host "备份路径: $backup (服务器上)" -ForegroundColor DarkGray
+# 只留最近 1 份:回溯以远端 git 为准(每批改动都已提交推送),本地备份只当同步失败时的即时保险,
+# 不再累积(2026-10-30 清掉了 150 份、645MB 的历史备份)。
+ssh @SshOpts $Server "ls -1t ~/backups/mc_agent_code_*.tgz 2>/dev/null | tail -n +2 | xargs -r rm -f" | Out-Null
 
 Write-Host "== 3/6 上传并解包 ==" -ForegroundColor Cyan
 scp @SshOpts $localTgz "${Server}:$remoteTgz"
