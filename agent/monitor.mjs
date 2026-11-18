@@ -114,6 +114,9 @@ import {
 // 用来测联网搜索 / 表情包 / 语音这几个接口。**不套**仓库里写的人设与档位(史官/贝利亚/贴吧/tone 都不生效)。
 // `system` 本身是消息分流标记:进模型前被消费掉,正文里不会出现;鉴权与审计在 admin.mjs。
 import { isAdminUser, isAdminGroup, parseAdminCommand, handleAdminCommand, ADMIN_QQ } from './admin.mjs';
+// MC 天梯(2026-11-18):绑定 / 历史查询。走官方竞技场接口(api.moecube.com 同源入口),
+// 回复正文+分数折线图一条消息发出去;具体解析/接口/画图都在 mycard/arena.mjs。
+import { parseArenaCommand, isArenaCommandText, processArenaCommand } from './mycard/arena.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -2456,6 +2459,7 @@ export async function tiebaShouldReply(j, { rand = Math.random, log_ = true } = 
 export function isKeywordMessage(j) {
   const text = (j.message || []).map(s => s.type === 'text' ? (s.data?.text || '') : `[${s.type}]`).join('');
   const mode = modeOf(j.group_id);
+  if (isArenaCommandText(text)) return true;                   // 绑定 / 历史(MC 天梯)
   if (isHelpRequest(text)) return true;
   if (parseModeCommand(text).triggered) return true;
   if (belialParseCmd(text).triggered) return true;             // 「银河皇帝」自己也不接(走分流器)
@@ -2477,6 +2481,42 @@ export function isKeywordMessage(j) {
   }
   if (new RegExp(`${CARD_TRIGGER}[\\s\u3000]`).test(text)) return true;      // 效果 X(游戏王/炉石共用)
   if (new RegExp(`${CARD_IMG_TRIGGER}[\\s\u3000]`).test(text)) return true;  // 卡图 X
+  return false;
+}
+
+/**
+ * 2026-11-18:关键词功能不再要求先 @ 机器人。
+ * 只认「整句开头就是触发词」的写法(触发词后可以是空/空白/`[at]`),避免群友闲聊里
+ * 随便提到「历史」「效果」也被当成指令;闲聊仍然必须 @。
+ */
+export function isNonAtCommandText(text) {
+  const t = String(text || '')
+    .replace(/\[[a-z_]+(?::[^\]]*)?\]/gi, ' ')
+    .replace(/\u3000/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!t) return false;
+  if (isArenaCommandText(t)) return true;                       // 绑定 / 历史(含 7月历史 等模糊写法)
+  if (/^(?:\/help|帮助)(?:\s|$|[!！。.~～?？])/i.test(t)) return true;
+  if (/^(?:mode|模式)/i.test(t) && parseModeCommand(t).triggered) return true;
+  if (/^贴吧模式/.test(t) && parseTiebaCmd(t).triggered) return true;
+  if (/^(?:银河皇帝|贝利亚|脚刷周)/.test(t)
+    && (belialParseCmd(t).triggered || jszParseCmd(t).triggered)) return true;
+  const starts = [
+    TRIGGER_KEYWORD, DAILY_KEYWORD, KUANGSHEN_TRIGGER, SHIT_AI_TRIGGER, SHIT_TRIGGER,
+    RULING_FULL_TRIGGER, RULING_TRIGGER, CARD_IMG_TRIGGER, CARD_TRIGGER,
+    DECK_TRIGGER, HS_DECK_TRIGGER, HS_RECO_TRIGGER, META_TRIGGER,
+  ];
+  const noArg = new Set([TRIGGER_KEYWORD, DAILY_KEYWORD, KUANGSHEN_TRIGGER, SHIT_TRIGGER, SHIT_AI_TRIGGER, META_TRIGGER]);
+  for (const w of starts) {
+    if (!w) continue;
+    if (t.startsWith(w)) {
+      const rest = t.slice(w.length);
+      if (!rest || /^[\s\u3000]/.test(rest)) return true;
+      if (noArg.has(w) && /^[!！。.~～?？]+$/.test(rest)) return true;
+    }
+  }
+  if (/^近期环境(?:\s|$)/.test(t)) return true;
   return false;
 }
 
@@ -2708,6 +2748,13 @@ async function sendReply(entry, message) {
     : typeof message === 'string'
       ? [{ type: 'text', data: { text: noLead(message) } }]
       : [message];
+  // 2026-11-18:不 @ 机器人触发关键词功能的消息(entry.noAt),回复也不 @ 任何人。
+  const prefix = entry.noAt ? [] : [
+    { type: 'at', data: { qq: String(entry.user_id) } },
+    // @ 段后补一个空格:2026-10-26 用户反馈,没有空格时 QQ 不会把 @ 真解析成 mention
+    // (显示成普通文本)。空格是独立 text 段,不会进正文、也不会像换行那样多出空行。
+    { type: 'text', data: { text: ' ' } },
+  ];
   if (DRY_RUN) {
     const first = segs.find(s => s.type === 'text')?.data?.text || '(图片)';
     log(`  [DRY_RUN] 不发送: ${first.split('\n')[0].slice(0, 50)} ...`, '', C.yellow);
@@ -2717,10 +2764,7 @@ async function sendReply(entry, message) {
   const r = await api('send_group_msg', {
     group_id: entry.group_id,
     message: [
-      { type: 'at', data: { qq: String(entry.user_id) } },
-      // @ 段后补一个空格:2026-10-26 用户反馈,没有空格时 QQ 不会把 @ 真解析成 mention
-      // (显示成普通文本)。空格是独立 text 段,不会进正文、也不会像换行那样多出空行。
-      { type: 'text', data: { text: ' ' } },
+      ...prefix,
       ...segs,
     ],
   });
@@ -3431,9 +3475,11 @@ export function buildHelpText(mode = 'ygo', groupId = '') {
   //   (groupId 参数保留:以前这行给贴吧模式写过一段提示,现在虽然不用了,签名不改免得调用方跟着动。)
   const common = `
 ${TRIGGER_KEYWORD} — 以史记体文言文总结最近群聊
+绑定 MC用户名 — 绑定你的 MC 账号,如「绑定 影之诗好玩」
+历史 [时间] [MC用户名/@用户] — 查 MC 天梯月战绩和分数曲线,如「历史」「历史 7月」「7月历史」
 ${HELP_CMD} — 看这份说明${kuangshen}${shit}${ai}`;
   if (mode === 'hs') {
-    return `【赛博史官·使用说明 · 炉石传说模式】@我 + 以下指令即可。
+    return `【赛博史官·使用说明 · 炉石传说模式】直接发以下指令即可（闲聊仍需 @我）。
 (本群现在是炉石模式;要玩「效果 青眼白龙」那套游戏王功能,发「mode 游戏王」切回去)
 
 ${HS_CARD_TRIGGER} [卡名] — 查炉石卡牌,回效果文本+卡图,如「${HS_CARD_TRIGGER} 火球术」
@@ -3443,7 +3489,7 @@ ${HS_RECO_TRIGGER} [标准/狂野] [职业或卡组名] — 当前环境热门�
 ${DAILY_KEYWORD} — 抽今日之卡(炉石卡,同一天同一张)
 ${common}`;
   }
-  return `【赛博史官·使用说明】@我 + 以下指令即可。
+  return `【赛博史官·使用说明】直接发以下指令即可（闲聊仍需 @我）。
 (现在是游戏王模式;要玩炉石那套,发「mode 炉石」)
 
 ${TRIGGER_KEYWORD} — 以史记体文言文总结最近群聊
@@ -3679,6 +3725,14 @@ export async function processEntry(entry) {
     await processTiebaSwitch(entry, tiebaCmd);
     return;
   }
+  // MC 天梯:绑定 / 历史(2026-11-18;关键词功能不再要求 @)
+  const arenaCmd = parseArenaCommand(text);
+  if (arenaCmd) {
+    log('▶ 处理', `${entry.group_name} ${entry.noAt ? '' : '@'}${entry.nickname} seq=${entry.seq} [MC天梯:${arenaCmd.kind}]`, C.cyan);
+    await processArenaCommand(entry, arenaCmd, { sendReply, log });
+    appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
+    return;
+  }
   if (text.includes(TRIGGER_KEYWORD)) {
     log('▶ 处理', `${entry.group_name} @${entry.nickname} seq=${entry.seq} [史记总结]`, C.cyan);
     return processHistory(entry);
@@ -3802,6 +3856,12 @@ export async function processEntry(entry) {
       await processHsRecommend(entry, extractCardQuery(entry, HS_RECO_TRIGGER).raw);
       return;
     }
+  }
+  // 没 @ 我、只靠关键词进来的消息不能落到 AI 闲聊:它没 @ 任何人,闲聊会变成自说自话。
+  if (entry.noAt) {
+    log('⏭ 跳过', `seq=${entry.seq} 关键词消息没有命中任何功能: ${text.slice(0, 30)}`, C.dim);
+    appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
+    return;
   }
   // 兜底:没命中任何指令的 @ → 交给 AI 闲聊(面板 3 键 / opsweb 可热关)
   if (FEAT.ai && AI_API_KEY) {
@@ -4017,7 +4077,7 @@ function makeEntry(j) {
 async function catchUpMissed() {
   const why = wsWasDown ? '断线重连' : '启动';
   wsWasDown = false;
-  log(`WS ${why},补收 2 分钟内错过的 @消息 ...`, '', C.cyan);
+  log(`WS ${why},补收 2 分钟内错过的 @/关键词消息 ...`, '', C.cyan);
   const groups = [...groupLastSeen.keys()];
   try { // 也覆盖从未实时收到过消息的群
     const { data } = await api('get_group_list');
@@ -4035,9 +4095,12 @@ async function catchUpMissed() {
         const seq = m.message_seq ?? m.message_id;
         if (lastSeq !== undefined && seq === lastSeq) break; // 已见过的最后一条,再往前都是旧的
         if ((m.time || 0) < cutoff) continue;
-        if (!isMentioningBot(m)) continue;
+        const ct = (m.message || []).map(s => s.type === 'text' ? (s.data?.text || '') : '').join('').trim();
+        const mentioned = isMentioningBot(m);
+        if (!mentioned && !isNonAtCommandText(ct)) continue;
         const entry = makeEntry(m);
         if (!entry) continue;
+        if (!mentioned) entry.noAt = true;
         appendFileSync(INBOX, JSON.stringify(entry) + '\n');
         missed++;
         log(`  ↺ 补收 [${entry.group_name || gid}] ${entry.nickname}: ${entry.text.slice(0, 40)}`, '', C.cyan);
@@ -4061,7 +4124,7 @@ function connect() {
   let delay = RECONNECT_BASE_MS;
   ws.onopen = () => {
     delay = RECONNECT_BASE_MS;
-    log('WS 已连接,等待 @消息 ... (q=退出 Q=退出并停SnowLuma)', '', C.green);
+    log('WS 已连接,等待 @/关键词消息 ... (q=退出 Q=退出并停SnowLuma)', '', C.green);
     catchUpMissed();
   };
   ws.onmessage = (ev) => {
@@ -4112,27 +4175,40 @@ function connect() {
           if (q) log('📝 框神语录入库:', q.text.replace(/\n/g, ' ').slice(0, 40), C.dim);
         } catch (e) { log('框神语录入库失败:', e.message, C.red); }
       }
+      // 2026-11-18:关键词功能不再要求 @。先在 WS 层认出「无 @ 关键词指令」,
+      // 这类消息不让贴吧/银河皇帝自动接话抢走,直接进 inbox 走分流器。
+      const msgText = (j.message || []).map(s => s.type === 'text' ? (s.data?.text || '') : '').join('').trim();
+      const nonAtKeyword = j.message_type === 'group' && String(j.user_id) !== BOT_ID
+        && !mentionsBotRaw(j) && isNonAtCommandText(msgText);
       // 贴吧模式(2026-09-28):**不 @ 也接话**。银河皇帝开着的群改由银河皇帝按 40% 接,
       // 两个模式不抢同一条:贝利亚群不再走贴吧鱼。
       const belialHere = j.message_type === 'group' && belialOn(j.group_id) && !!AI_API_KEY && !!FEAT.ai;
-      if (belialHere) {
-        if (!mentionsBotRaw(j)) {
-          belialOnMessage(j).catch(e => log('银河皇帝非@处理失败:', e.message, C.red));
+      if (!nonAtKeyword) {
+        if (belialHere) {
+          if (!mentionsBotRaw(j)) {
+            belialOnMessage(j).catch(e => log('银河皇帝非@处理失败:', e.message, C.red));
+          }
+        } else {
+          try { tiebaOnMessage(j); } catch (e) { log('贴吧模式处理失败:', e.message, C.red); }
         }
-      } else {
-        try { tiebaOnMessage(j); } catch (e) { log('贴吧模式处理失败:', e.message, C.red); }
       }
       // 群聊表情包:只记最近表情的元数据,不自动下载;模型要存时再调 save_group_sticker
       try { rememberGroupStickers(j); } catch (e) { log('群表情记录失败:', e.message, C.yellow); }
     }
-    if (j.post_type !== 'message' || !isMentioningBot(j)) return;
+    if (j.post_type !== 'message') return;
+    const mentioned = isMentioningBot(j);
+    const msgText = (j.message || []).map(s => s.type === 'text' ? (s.data?.text || '') : '').join('').trim();
+    const nonAtKeyword = j.message_type === 'group' && String(j.user_id) !== BOT_ID
+      && !mentioned && isNonAtCommandText(msgText);
+    if (!mentioned && !nonAtKeyword) return;
     const seq = j.message_seq ?? j.message_id;
     if (!seq) return;
     groupLastSeen.set(j.group_id, seq);
     const entry = makeEntry(j);
     if (!entry) return;
+    if (!mentioned) entry.noAt = true;
     appendFileSync(INBOX, JSON.stringify(entry) + '\n');
-    log(`★ @请求 [${entry.group_name}] ${entry.nickname}: ${entry.text.slice(0, 40)}`, '', C.cyan);
+    log(`★ ${nonAtKeyword ? '关键词' : '@请求'} [${entry.group_name}] ${entry.nickname}: ${entry.text.slice(0, 40)}`, '', nonAtKeyword ? C.green : C.cyan);
     processQueue(); // 立即处理
   };
   ws.onclose = () => {

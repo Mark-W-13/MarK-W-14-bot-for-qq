@@ -76,3 +76,5 @@ agent/shitpost/seed_memory.json
 
 # 服务器部署位的屎库/样本(随数据迁移,不入库)
 data/
+
+agent/mycard/bindings.json
