@@ -8,7 +8,7 @@
 //   · 已验证:Edge 合成 MP3 → OneBot record(base64) → SnowLuma 自动转 SILK → QQ 语音发送成功。
 //
 // 给模型的接口在 tools.mjs(list_voices / send_voice);模型自己选 voice + 说 text。
-import './../env.mjs';
+import './../../env.mjs';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync, unlinkSync } from 'node:fs';

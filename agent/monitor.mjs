@@ -15,9 +15,10 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import readline from 'node:readline';
-import { queryAndFormat, reloadCards, getCardsPath, extractZipCardJson, loadCards, formatCard, searchCards, cardImageSegment } from './ygocard/ygocard.mjs';
+import { queryAndFormat, reloadCards, getCardsPath, extractZipCardJson, loadCards, formatCard, searchCards, cardImageSegment, randomCard as ygoRandomCard } from './ygocard/ygocard.mjs';
 import { fetchCardRulings, fetchFullRulings, buildRulingsPdf } from './ygocard/rulings.mjs';
 import { downloadImages } from './ygocard/download_images.mjs';
+import { fetchSuperPreCards, mergeSuperPre } from './ygocard/superpre.mjs';
 import { generateDeckListPdf, classifyDeckInput } from './ygocard/decklist.mjs';
 import { pickShit, buildCardHtml, buildVideoCardHtml, pickVideoShit, renderCard, pngToSegment, appendShitVideo, addToBlacklist, removeFromShitVideos } from './shitpost/shitpost.mjs';
 import { collectQuoteFromEvent, pickFeaturedQuote, backfillQuotes, searchQuotes, addToBlacklist as quoteBlacklist, removeQuoteBySeq } from './kuangshen/kuangshen.mjs';
@@ -31,32 +32,29 @@ import {
   parseMetaTrigger, buildMetaPie, buildMetaPdf, parseTopSearch, searchTopDeck,
   metaImageSegment, metaSelftest,
 } from './ygometa/meta.mjs';
-// 银河皇帝模式(2026-10-26):@ 时切「银河皇帝贝利亚」人格。状态/提示词/表情包库都在那个模块里,
-// 这里只负责「什么时候切、什么时候用这套提示词、回复后附不附表情包」。
+// 人格共用工具库(2026-11-26:由 belial/belial.mjs 迁到 persona/kit,名字不再带人格)——
+// 分群开关、人格选择、群名片、接话概率、表情包库、回复拆分都在这里,所有人格共用。
 import {
-  isOn as belialOn, setOn as belialSetOn, parseCommand as belialParseCmd, allOn as belialAll,
-  systemPrompt as belialSystemPrompt, activationLine as belialActivation, againLine as belialAgain,
-  offLine as belialOff, statusLine as belialStatus, resolveSticker as belialResolveSticker,
-  stickerSegment as belialStickerSegment, listStickers as belialStickers, stickerCatalog as belialStickerCatalog,
-  stickerPath as belialStickerPath, stickerMime as belialStickerMime,
-  setStickerMeta as belialSetStickerMeta, dynamicStickerMeta as belialDynamicStickerMeta,
-  addSticker as belialAddSticker, addStickerAuto as belialAddStickerAuto,
-  deleteSticker as belialDeleteSticker,
-  MAX_STICKER_BYTES as BELIAL_MAX_STICKER_BYTES, statePath as belialStatePath,
-  splitBelialReply, MAX_STICKERS as BELIAL_MAX_STICKERS,
-  FEATURE_CN as BELIAL_CN, PERSONA_CN as BELIAL_PERSONA, MAX_TOKENS as BELIAL_MAX_TOKENS,
-  TEMPERATURE as BELIAL_TEMPERATURE, MAX_REPLY as BELIAL_MAX_REPLY, REPLY_GAP_MS as BELIAL_GAP_MS,
-  THINK as BELIAL_THINK, KEYWORD as BELIAL_KEYWORD, MAX_CHARS as BELIAL_MAX_CHARS,
-  nonAtProbOf as belialNonAtProbOf,
-  nonAtAutoOf as belialNonAtAutoOf,
-  autoProbsOf as belialAutoProbsOf,
-  setNonAtAuto as belialSetNonAtAuto,
-  personaOf as belialPersonaOf, setPersona as belialSetPersona,
-  GROUP_CARD as BELIAL_GROUP_CARD, originalCardOf as belialOriginalCardOf,
-  setOriginalCard as belialSetOriginalCard, clearOriginalCard as belialClearOriginalCard,
-} from './belial/belial.mjs';
-// 脚刷周模式(2026-10-29):第二个人格,开关/表情包库与贝利亚共用同一套状态与发送链路,
-// 只有提示词、台词、表情包目录是它自己的(见 jiaoshuazhou/jiaoshuazhou.mjs)。
+  isOn as personaModeOn, setOn as personaSetOn, allOn as personaAll,
+  resolveSticker as kitResolveSticker, stickerSegment as kitStickerSegment,
+  listStickers as kitStickers, stickerCatalog as kitStickerCatalog,
+  stickerPath as kitStickerPath, stickerMime as kitStickerMime,
+  setStickerMeta as kitSetStickerMeta, dynamicStickerMeta as kitDynamicStickerMeta,
+  addSticker as kitAddSticker, addStickerAuto as kitAddStickerAuto, deleteSticker as kitDeleteSticker,
+  MAX_STICKER_BYTES as KIT_MAX_STICKER_BYTES, statePath as personaStatePath,
+  splitReply as splitPersonaReply,
+  nonAtProbOf as personaNonAtProbOf, reactProbOf as personaReactProbOf, REACT_PROB_DEFAULT,
+  nonAtAutoOf as personaNonAtAutoOf, autoProbsOf as personaAutoProbsOf,
+  setNonAtAuto as personaSetNonAtAuto,
+  personaOf as kitPersonaIdOf, setPersona as personaSet,
+  originalCardOf, setOriginalCard, clearOriginalCard,
+  autoReplyOf, setAutoReply, DEFAULT_PERSONA, PERSONA_IDS, PERSONA_LABELS,
+  MAX_TOKENS as PERSONA_MAX_TOKENS, TEMPERATURE as PERSONA_TEMPERATURE,
+  MAX_REPLY as PERSONA_MAX_REPLY, REPLY_GAP_MS as PERSONA_GAP_MS,
+  THINK as PERSONA_THINK, MAX_CHARS as PERSONA_MAX_CHARS, MAX_STICKERS as PERSONA_MAX_STICKERS,
+} from './persona/kit/kit.mjs';
+// 脚刷周人格(2026-10-29):提示词、台词、表情包目录都在 jiaoshuazhou/jiaoshuazhou.mjs,
+// 开关/名片/概率等共用机制在 persona/kit。
 import {
   parseCommand as jszParseCmd, systemPrompt as jszSystemPrompt,
   activationLine as jszActivation, againLine as jszAgain, offLine as jszOff, statusLine as jszStatus,
@@ -72,21 +70,26 @@ import {
   REPLY_GAP_MS as JSZ_GAP_MS, THINK as JSZ_THINK, PERSONA_ID as JSZ_ID,
   GROUP_CARD as JSZ_GROUP_CARD, SEED_MEMORIES as JSZ_SEED_MEMORIES,
 } from './jiaoshuazhou/jiaoshuazhou.mjs';
+// 第二个人格 W14(2026-11-26 由「西比拉」改名):记忆驱动,一句身份 + 记忆块,没有人设。
 import {
-  systemPrompt as sibylSystemPrompt, PERSONA_ID as SIBYL_ID, PERSONA_CN as SIBYL_CN,
-  KEYWORD as SIBYL_KEYWORD, GROUP_CARD as SIBYL_GROUP_CARD,
-  MAX_REPLY as SIBYL_MAX_REPLY, MAX_CHARS as SIBYL_MAX_CHARS, REPLY_GAP_MS as SIBYL_GAP_MS,
-  MAX_STICKERS as SIBYL_MAX_STICKERS, activationLine as sibylActivation,
-  againLine as sibylAgain, offLine as sibylOff, statusLine as sibylStatus,
-} from './persona/sibyl.mjs';
-import { addMemory, deleteMemory, memoryListText, MEMORY_TOOLS } from './persona/memory.mjs';
-import { BELIAL_TOOLS, QQ_TOOLS, CHAT_TOOLS, stickerCatalogText } from './belial/tools.mjs';
-import { dsSearch } from './belial/deepsearch.mjs';
-import { searchStickerImages, downloadSticker as downloadStickerImage } from './belial/stickersearch.mjs';
+  systemPrompt as w14SystemPrompt, PERSONA_ID as W14_ID, PERSONA_CN as W14_CN,
+  KEYWORD as W14_KEYWORD, GROUP_CARD as W14_GROUP_CARD,
+  MAX_REPLY as W14_MAX_REPLY, MAX_CHARS as W14_MAX_CHARS, REPLY_GAP_MS as W14_GAP_MS,
+  MAX_STICKERS as W14_MAX_STICKERS, activationLine as w14Activation,
+  againLine as w14Again, offLine as w14Off, statusLine as w14Status,
+} from './persona/w14.mjs';
+import { addMemory, deleteMemory, listMemories, memoryListText, memoryStats, MEMORY_TOOLS } from './persona/memory.mjs';
+import {
+  configureMembrain, membrainOnMessage, dreamGroup as dreamPersonaMemory,
+  profileOf as personaProfileOf, personaDataDir,
+} from './persona/membrain.mjs';
+import { BELIAL_TOOLS, QQ_TOOLS, CHAT_TOOLS, stickerCatalogText } from './persona/kit/tools.mjs';
+import { dsSearch } from './persona/kit/deepsearch.mjs';
+import { searchStickerImages, downloadSticker as downloadStickerImage } from './persona/kit/stickersearch.mjs';
 import {
   voiceCatalogText, synthesizeVoice, voiceSegment, readVoiceMode, voiceModeLabel,
-  MAX_VOICES as BELIAL_MAX_VOICES, MAX_VOICE_CHARS as BELIAL_MAX_VOICE_CHARS,
-} from './belial/voice.mjs';
+  MAX_VOICES as PERSONA_MAX_VOICES, MAX_VOICE_CHARS as PERSONA_MAX_VOICE_CHARS,
+} from './persona/kit/voice.mjs';
 // 贴吧模式(2026-09-28):不用 @ 就插嘴的「贴吧鱼」。状态/提示词/连发拆分都在那个模块里,
 // 这里只负责「什么时候叫它」与「把回复发出去」(见本文件的 tiebaOnMessage / tiebaFire)。
 import {
@@ -136,18 +139,19 @@ const BOT_ID = (process.env.BOT_ID || '3757588606').toString();
 // 落到「查不到名字」的兜底分支里会被当成真人,或被误渲染成 @all(2026-09-20 修,见 atText)。
 const AT_ALL = 'all';
 
-// ---------- 人格注册表(2026-10-29:银河皇帝 / 脚刷周) ----------
-// 两个模式共用 belial/state.json 的分群开关(开/关、非@概率),`personas` 字段决定这个群用谁。
-// 发送链路、工具循环、群表情、语音都是同一套;这里只把「提示词 / 台词 / 拆分器 / 表情包库」参数化。
-// 加第三个人格时:在 PERSONA_SPECS 里加一条、state 的 PERSONA_IDS 加 id、opsweb 下拉加一项。
+// ---------- 人格注册表(2026-11-26:脚刷周 / W14) ----------
+// 人格共用 persona/kit 里的分群开关、群名片、概率、表情包库;这里只把「提示词 / 台词 / 拆分器 / 表情包库」参数化。
+// 每个人的记忆是独立的(agent/persona/mem/<id>/,见 persona/membrain.mjs),不与人共享文件。
+// 加新人格:在 PERSONA_SPECS 里加一条、kit.mjs 的 PERSONA_IDS 加 id、opsweb 下拉加一项,再给一个
+// agent/persona/<id>.mjs(提示词 + systemPrompt 里调 personaMemoryBlock(id, …))。
+const SHARED_STICKER = {
+  id: 'shared', cn: '共用表情包',
+  catalog: kitStickerCatalog, resolve: kitResolveSticker, segment: kitStickerSegment,
+  list: kitStickers, path: kitStickerPath, mime: kitStickerMime,
+  setMeta: kitSetStickerMeta, dynamicMeta: kitDynamicStickerMeta,
+  add: kitAddSticker, addAuto: kitAddStickerAuto, del: kitDeleteSticker, maxBytes: KIT_MAX_STICKER_BYTES,
+};
 const STICKER_API = {
-  belial: {
-    id: 'belial', cn: BELIAL_PERSONA,
-    catalog: belialStickerCatalog, resolve: belialResolveSticker, segment: belialStickerSegment,
-    list: belialStickers, path: belialStickerPath, mime: belialStickerMime,
-    setMeta: belialSetStickerMeta, dynamicMeta: belialDynamicStickerMeta,
-    add: belialAddSticker, addAuto: belialAddStickerAuto, del: belialDeleteSticker, maxBytes: BELIAL_MAX_STICKER_BYTES,
-  },
   [JSZ_ID]: {
     id: JSZ_ID, cn: JSZ_PERSONA,
     catalog: jszStickerCatalog, resolve: jszResolveSticker, segment: jszStickerSegment,
@@ -158,19 +162,6 @@ const STICKER_API = {
 };
 
 const PERSONA_SPECS = {
-  belial: {
-    id: 'belial', cn: BELIAL_PERSONA, parseName: '贝利亚', feature: BELIAL_CN, keyword: BELIAL_KEYWORD,
-    card: BELIAL_GROUP_CARD,
-    systemPrompt: belialSystemPrompt, activation: belialActivation, again: belialAgain,
-    off: belialOff, status: belialStatus,
-    split: (text, opts) => splitBelialReply(text, opts),
-    splitOpts: { max: BELIAL_MAX_REPLY, maxChars: BELIAL_MAX_CHARS },
-    maxReply: BELIAL_MAX_REPLY, gap: BELIAL_GAP_MS, maxStickers: BELIAL_MAX_STICKERS,
-    think: BELIAL_THINK, temperature: BELIAL_TEMPERATURE, maxTokens: BELIAL_MAX_TOKENS,
-    defaultVoice: () => readVoiceMode(),
-    sticker: STICKER_API.belial,
-    seedMemories: [],
-  },
   [JSZ_ID]: {
     id: JSZ_ID, cn: JSZ_PERSONA, parseName: JSZ_PERSONA, feature: JSZ_FEATURE_CN, keyword: JSZ_KEYWORD,
     card: JSZ_GROUP_CARD,
@@ -184,26 +175,28 @@ const PERSONA_SPECS = {
     sticker: STICKER_API[JSZ_ID],
     seedMemories: JSZ_SEED_MEMORIES,
   },
-  // 西比拉(2026-10-29 正式上线):记忆驱动人格,system = 一句身份 + 长期记忆块,没有人设。
-  [SIBYL_ID]: {
-    id: SIBYL_ID, cn: SIBYL_CN, parseName: '西比拉', feature: '西比拉', keyword: SIBYL_KEYWORD,
-    card: SIBYL_GROUP_CARD,
-    systemPrompt: sibylSystemPrompt, activation: sibylActivation, again: sibylAgain,
-    off: sibylOff, status: sibylStatus,
-    split: (text, opts) => splitBelialReply(text, opts),
-    splitOpts: { max: SIBYL_MAX_REPLY, maxChars: SIBYL_MAX_CHARS },
-    maxReply: SIBYL_MAX_REPLY, gap: SIBYL_GAP_MS, maxStickers: SIBYL_MAX_STICKERS,
-    think: false, temperature: 0.7, maxTokens: 600,
+  // W14(2026-11-26 由「西比拉」改名):记忆驱动人格,system = 一句身份 + 长期记忆块,没有人设。
+  [W14_ID]: {
+    id: W14_ID, cn: W14_CN, parseName: W14_CN, feature: W14_CN, keyword: W14_KEYWORD,
+    card: W14_GROUP_CARD,
+    systemPrompt: w14SystemPrompt, activation: w14Activation, again: w14Again,
+    off: w14Off, status: w14Status,
+    split: (text, opts) => splitPersonaReply(text, opts),
+    splitOpts: { max: W14_MAX_REPLY, maxChars: W14_MAX_CHARS },
+    maxReply: W14_MAX_REPLY, gap: W14_GAP_MS, maxStickers: W14_MAX_STICKERS,
+  // 采样与脚刷周同步(2026-11-26 用户要求):输出上限不再按人格分,直接用 JSZ_MAX_TOKENS(默认 1600)。
+  // think 仍然保持 false —— deepseek 开思考会把 max_tokens 烧空、正文返回空,这个不能跟着同步。
+  think: false, temperature: 0.7, maxTokens: JSZ_MAX_TOKENS,
     defaultVoice: () => 'young',
-    sticker: STICKER_API.belial,
+    sticker: SHARED_STICKER,
     seedMemories: [],
   },
 };
 
-/** 本群当前人格 id(默认 belial;状态文件每次现读) */
+/** 本群当前人格 id(未设置 → 默认人格;状态文件每次现读) */
 function personaIdOf(groupId) {
-  const id = belialPersonaOf(groupId);
-  return PERSONA_SPECS[id] ? id : 'belial';
+  const id = kitPersonaIdOf(groupId);
+  return PERSONA_SPECS[id] ? id : DEFAULT_PERSONA;
 }
 /** 本群当前人格配置 */
 function personaOf(groupId) { return PERSONA_SPECS[personaIdOf(groupId)]; }
@@ -283,12 +276,14 @@ const AI_CHAT_CTX = Math.max(0, Number(process.env.AI_CHAT_CTX ?? 10));         
 // AI_CHAT_WEB_SEARCH=0 关掉;没配任何搜索源时自动不挂(见 websearch.mjs 的 pickProvider)。
 const AI_CHAT_WEB_SEARCH = process.env.AI_CHAT_WEB_SEARCH !== '0';
 const AI_WEB_SEARCH = AI_CHAT_WEB_SEARCH && searchReady();
-const AI_CHAT_MAX_SEARCHES = Math.max(1, Number(process.env.AI_CHAT_MAX_SEARCHES || 2));  // 单次回复最多搜几次,防它连着搜十轮把群友等烦
+// 2026-11-26 用户要求:取消「单次最多搜 N 次」;只保留 AI_CHAT_MAX_TOOL_ROUNDS / AI_CHAT_MAX_TOOL_CALLS 防死循环与溢出。
 // deepseek 系默认会「思考」:实测 reasoning_effort='low' 会把 max_tokens 全烧在思考上、**正文返回空**
 // ('none' 才是真关,1.1s)。闲聊要快、要短 → 默认关;想开思考设 AI_CHAT_REASONING=1。
 // 注意:关思考是**按模型名**判断的(只对 deepseek 系有效),别的后端不会被塞这个参数。
 const AI_THINK_OFF = /deepseek/i.test(AI_MODEL) && process.env.AI_CHAT_REASONING !== '1';
 const AI_CHAT_MAX_TOKENS = Number(process.env.AI_CHAT_MAX_TOKENS || 800);       // 上限:留足思考/正文,别像 500 那样被思考吃空
+const AI_CHAT_MAX_TOOL_ROUNDS = Math.max(4, Number(process.env.AI_CHAT_MAX_TOOL_ROUNDS || 10));   // 防死循环
+const AI_CHAT_MAX_TOOL_CALLS = Math.max(10, Number(process.env.AI_CHAT_MAX_TOOL_CALLS || 20));    // 溢出保护
 const AI_CHAT_TIMEOUT_MS = Number(process.env.AI_CHAT_TIMEOUT_MS || 30000);     // 单次请求超时
 const AI_CHAT_COOLDOWN_MS = Number(process.env.AI_CHAT_COOLDOWN_MS ?? 15000);   // 每人冷却,**0 = 关掉冷却**(2026-09-21 用户选了 0)
 const AI_CHAT_MAX_CHARS = Number(process.env.AI_CHAT_MAX_CHARS || 400);         // 回复超长截断阈值
@@ -479,6 +474,104 @@ async function resolveMemberName(groupId, qq) {
   return name || `成员${qq}`;
 }
 
+// ---------- @ 接口:群昵称 / QQ 号 → 可发送的 at 段(2026-11-14) ----------
+// 用户要求:让模型在需要指定对话对象时自由选择 @ 谁。模型只能从群聊记录里看到昵称,
+// 要 @ 一个最近没说过话的人就得查成员名单;名单按群缓存(默认 10 分钟),别每句话都拉一次。
+const AT_ROSTER_TTL_MS = Math.max(60_000, Number(process.env.AT_ROSTER_TTL_MS || 10 * 60_000));
+const atRosterCache = new Map();     // gid(String) -> { at, list:[{qq,card,nick}] }
+const atSelfBlocked = new Set(['all', 'everyone', '全体成员', '所有人', '全体', '@全体成员']);
+
+async function groupRoster(groupId) {
+  const key = String(groupId);
+  const cached = atRosterCache.get(key);
+  if (cached && Date.now() - cached.at < AT_ROSTER_TTL_MS) return cached.list;
+  try {
+    const r = await api('get_group_member_list', { group_id: groupId });
+    if (r?.status !== 'ok') throw new Error(r?.wording || `retcode ${r?.retcode ?? '?'}`);
+    if (!Array.isArray(r.data)) throw new Error('成员列表不是数组');
+    const list = r.data.map(m => ({
+      qq: String(m.user_id),
+      card: String(m.card ?? '').trim(),
+      nick: String(m.nickname ?? '').trim(),
+    }));
+    atRosterCache.set(key, { at: Date.now(), list });
+    return list;
+  } catch (e) {
+    if (cached) return cached.list;          // 拉取失败时旧名单还能用
+    throw e;
+  }
+}
+
+const atNameKey = s => String(s ?? '').replace(/[\s\u3000]+/g, '').toLowerCase();
+function atMemberName(m) { return String(m?.card || m?.nick || '').trim() || `成员${m?.qq ?? '?'}`; }
+
+/**
+ * 纯匹配:不联网,方便自测。raw 可以是昵称/群名片/QQ;返回唯一命中或带候选的错误。
+ * 规则:精确 > 唯一包含;重名不猜,让模型改用 QQ 号。
+ */
+function pickAtTarget(list, raw) {
+  const s = String(raw ?? '').trim().replace(/^@+/, '').replace(/^[-*•]\s*/, '').trim();
+  if (!s) return { ok: false, message: '缺目标:target 填群昵称或 QQ 号。' };
+  if (atSelfBlocked.has(s.toLowerCase()) || /^(all|everyone)$/i.test(s)) {
+    return { ok: false, message: '不能 @ 全体成员,只能 @ 具体某个人。' };
+  }
+  const key = atNameKey(s);
+  const all = Array.isArray(list) ? list : [];
+  // 模型可能把 list_group_members 的「昵称(QQ)」整串抄过来:剥出 QQ 再查
+  const withQq = s.match(/^(.+?)\s*[（(](\d{5,12})[)）]$/);
+  if (withQq) return pickAtTarget(all, withQq[2]);
+  if (/^\d{5,12}$/.test(s)) {
+    if (String(s) === String(BOT_ID)) return { ok: false, message: '不能 @ 机器人自己。' };
+    const hit = all.find(m => String(m.qq) === s);
+    if (!hit && all.length) return { ok: false, message: `QQ ${s} 不在本群成员名单里;先用 list_group_members 查准确昵称。` };
+    return { ok: true, qq: s, name: hit ? atMemberName(hit) : `成员${s}` };
+  }
+  let hits = all.filter(m => atNameKey(m.card) === key || atNameKey(m.nick) === key);
+  if (!hits.length) hits = all.filter(m => {
+    const c = atNameKey(m.card), n = atNameKey(m.nick);
+    return (c && c.includes(key)) || (n && n.includes(key));
+  });
+  hits = [...new Map(hits.map(m => [String(m.qq), m])).values()];
+  if (hits.length === 1) {
+    const m = hits[0];
+    if (String(m.qq) === String(BOT_ID)) return { ok: false, message: '不能 @ 机器人自己。' };
+    return { ok: true, qq: String(m.qq), name: atMemberName(m) };
+  }
+  if (hits.length > 1) {
+    const cand = hits.slice(0, 6).map(m => `${atMemberName(m)}(${m.qq})`).join('、');
+    return { ok: false, message: `「${s}」匹配到多个人:${cand};请改填 QQ 号。` };
+  }
+  return { ok: false, message: `没找到「${s}」。先 list_group_members(query="${s}") 查准确昵称,或直接填 QQ 号。` };
+}
+
+async function resolveAtTarget(groupId, raw) {
+  const s = String(raw ?? '').trim().replace(/^@+/, '').replace(/^[-*•]\s*/, '').trim();
+  if (!s) return { ok: false, message: '缺目标:target 填群昵称或 QQ 号。' };
+  if (atSelfBlocked.has(s.toLowerCase()) || /^(all|everyone)$/i.test(s)) {
+    return { ok: false, message: '不能 @ 全体成员,只能 @ 具体某个人。' };
+  }
+  let list;
+  try {
+    list = await groupRoster(groupId);
+  } catch (e) {
+    if (/^\d{5,12}$/.test(s)) return pickAtTarget([], s);   // 名单拉不到时,QQ 号仍可直接发
+    return { ok: false, message: `读不到群成员名单(${e.message});可以直接填 QQ 号,或稍后再试。` };
+  }
+  return pickAtTarget(list, s);
+}
+
+function groupMembersText(gid, list, query = '') {
+  const q = String(query || '').trim();
+  const key = atNameKey(q);
+  const hits = key
+    ? (list || []).filter(m => atNameKey(m.card).includes(key) || atNameKey(m.nick).includes(key) || String(m.qq).includes(q))
+    : (list || []);
+  const shown = hits.slice(0, 40);
+  const head = `本群成员 ${(list || []).length} 人${q ? `,匹配「${q}」${hits.length} 人` : ''}:`;
+  const body = shown.map(m => `- ${atMemberName(m)}(${m.qq})`).join('\n');
+  return head + (body ? `\n${body}` : '') + (hits.length > shown.length ? `\n…还有 ${hits.length - shown.length} 人,用 query 缩小范围` : '');
+}
+
 // 被 @ 的人常常**没在本批记录里发过言**(names 里没有他)→ segText 只能退化成「成员<qq>」。
 // 这里补一次:把本批里所有查不到的 qq 批量问群成员接口,真昵称回填进 names。
 // 尽力而为 —— 失败/查不到就算了,不影响正文(但绝不因此写 @all)。
@@ -499,7 +592,7 @@ async function fillAtNames(groupId, msgs, names) {
   }));
 }
 
-async function fetchTranscript(groupId, count = 100, { botName = '史官', includeBot = false, anchorId = 0, beforeSeq = 0, beforeTime = 0 } = {}) {
+async function fetchTranscript(groupId, count = 100, { botName = '史官', includeBot = false, anchorId = 0, beforeSeq = 0, beforeTime = 0, withIds = false } = {}) {
   // 2026-10-29 多 @ 错位修复:传 anchorId(这条消息的 message_id)让历史接口从它开始往旧取,
   // 这样 Q1/Q2/Q3 同时进来、Q1 处理得晚时,上下文里不会出现 Q2/Q3,模型不会拿最后一句回答 Q1。
   const params = { group_id: groupId, count };
@@ -540,7 +633,8 @@ async function fetchTranscript(groupId, count = 100, { botName = '史官', inclu
     const diff = Math.round((t0 - dayStart(t)) / 86400000);   // 整天差:0=今天 1=昨天 2=前天
     const dayTag = diff <= 0 ? '' : diff === 1 ? '昨天 ' : diff === 2 ? '前天 ' : `${t.getMonth() + 1}-${t.getDate()} `;
     const who = isBot ? `你(${botName})` : (names.get(String(m.user_id)) || nameOf(m.sender));
-    lines.push(`${dayTag}${hhmm} ${who}|${text}`);
+    const idTag = withIds && m.message_id ? `[#${m.message_id}]` : '';
+    lines.push(`${dayTag}${hhmm} ${who}${idTag}|${text}`);
   }
   return { lines: lines.join('\n'), names };
 }
@@ -564,8 +658,20 @@ async function replyGapInfo(entry) {
     }
     const gap = bi >= 0 ? ti - bi - 1 : null;
     const newer = msgs.length - 1 - ti;
-    return { targetFound: true, gap, newer, shouldQuote: newer > 0 || (gap !== null && gap >= 2) };
+    // 只有「目标后面又刷了消息」才引用:目标就是最新一条时直接回,别引用 —— 引用会 @ 作者,
+    // 2026-11-24 线上案例就是「攻击 @X」被引用成「@ 了叫它攻击的人」。
+    return { targetFound: true, gap, newer, shouldQuote: newer > 0 };
   } catch { return null; }
+}
+
+// 对方在消息里 @ 了别人、又让「攻击/评价」他 → 默认 @ 的对象应该是那个被点名的人。
+// 2026-11-24 线上案例:有人发「攻击一下 @X」,模型正文骂的是 X,但引用把正文吃掉后 @ 丢了,
+// 结果只 @ 了叫它攻击的人。模型自己没 @ 人时用这个兜底。
+const AT_TARGET_RE = /攻击一下|攻击两句|攻击他|攻击她|骂一下|骂两句|骂几句|骂一顿|骂他|骂她|喷一下|喷两句|喷他|喷她|怼他|怼她|锐评|评价一下|评价他|评价她|点评一下|嘲讽一下|嘲讽他|羞辱一下|羞辱他/;
+function attackTargetOf(entry, q) {
+  const tg = (entry?.targets || []).map(x => String(x)).filter(qq => qq && qq !== String(BOT_ID));
+  if (!tg.length) return '';
+  return AT_TARGET_RE.test(String(q || '')) ? tg[0] : '';
 }
 
 function quoteHintText(info) {
@@ -573,12 +679,9 @@ function quoteHintText(info) {
   if (info.shouldQuote) {
     const gapText = info.gap === null ? '你之前在这个窗口里没说过话' : `和你上次说话隔了 ${info.gap} 条`;
     const newerText = info.newer > 0 ? `,后面又刷了 ${info.newer} 条` : '';
-    return `\n【引用提示】你要回的这条${gapText}${newerText}。系统会自动引用这条,你直接写回复正文;不用再调 send_quote,也别在正文重复。`;
+    return `\n【引用提示】你要回的这条${gapText}${newerText}。系统会自动引用;你直接写回复正文,要 @ 谁用 send_at(不调就谁都不 @),不用再调 send_quote,也别在正文重复。`;
   }
-  if (info.gap !== null && info.gap < 2 && info.newer === 0) {
-    return '\n【引用提示】这条紧挨着你上次说话,直接回,不用引用。';
-  }
-  return '';
+  return '\n【引用提示】这条是最新一条,直接回,不用引用。';
 }
 
 // ---------- Claude 生成回复 ----------
@@ -717,20 +820,30 @@ async function aiChat(system, userText, images = [], opts = {}) {
 // 用户要求:表情包不再按概率发,改成模型能调的 send_sticker;同时给模型 DS 官方联网搜索、
 // 图片搜索、下载表情包的权限。这里实现 OpenAI / DeepSeek function calling 循环:
 //   模型要工具 → 本地执行(搜/挑图/下载) → 结果作为 tool 消息回填 → 模型接着写正文。
-// 省钱/防刷护栏:搜索≤2、图片搜索≤2、下载≤1、一次最多安排2张表情包、工具轮数≤6。
-const BELIAL_MAX_SEARCHES = Math.max(0, Number(process.env.BELIAL_MAX_SEARCHES || 2));
-const BELIAL_MAX_IMAGE_SEARCHES = Math.max(0, Number(process.env.BELIAL_MAX_IMAGE_SEARCHES || 2));
-const BELIAL_MAX_DOWNLOADS = Math.max(0, Number(process.env.BELIAL_MAX_DOWNLOADS || 1));
+// 省钱/防刷护栏:各工具的单次次数上限已取消(2026-11-26),只保留「轮数上限」与「工具调用总数」。
+// 查卡不再卡 3/10 次:一套 combo 常常 6~8 张卡,查不完就会用记忆硬补(编卡)或反复要工具把轮数耗光。
+// 工具轮数 20:给足查卡+多发几条的时间,最后一轮仍然不挂工具、逼它写正文;总调用数仍由 PERSONA_MAX_TOOL_CALLS 兜底。
+// 2026-11-26 用户要求:取消「每个工具最多 N 次」的限制,只保留防死循环 + 溢出/异常控制。
+// 下面的 Infinity 让旧的次数分支永远不触发(保留只是为了少改结构);真正兜底的是:
+//   · BELIAL_MAX_TOOL_ROUNDS:最多几轮工具调用(防止同一个工具被无限重试);
+//   · PERSONA_MAX_TOOL_CALLS:单次回复最多执行多少个工具调用(防止 messages 无限膨胀/上下文溢出);
+//   · 工具结果统一 slice(4000 字)、postChat 30s 超时、AI 返回异常时抛错走兜底。
+const BELIAL_MAX_SEARCHES = Infinity;
+const BELIAL_MAX_IMAGE_SEARCHES = Infinity;
+const BELIAL_MAX_DOWNLOADS = Infinity;
 const BELIAL_SEARCH_COUNT = Math.min(10, Math.max(1, Number(process.env.BELIAL_SEARCH_COUNT || 5)));
-const BELIAL_MAX_TOOL_ROUNDS = Math.max(1, Number(process.env.BELIAL_MAX_TOOL_ROUNDS || 6));
+const PERSONA_MAX_CARD_SEARCHES = Infinity;
+const BELIAL_MAX_TOOL_ROUNDS = Math.max(1, Number(process.env.BELIAL_MAX_TOOL_ROUNDS || 20));
+const PERSONA_MAX_TOOL_CALLS = Math.max(10, Number(process.env.PERSONA_MAX_TOOL_CALLS || 30));
 
 /** 单次工具循环(不带 4xx 退让;退让在 aiChatBelial / runSystemConsole 里做)。tag 只影响错误文案;
  *  prelude 是插在 system 与当前 user 之间的消息(控制台拿它放「群聊背景」,见 runSystemConsole)。 */
-async function runBelialToolLoop(entry, system, userText, images, allowTools, thinkOff, tag = '银河皇帝', prelude = [], opts = {}) {
-  const { temperature = BELIAL_TEMPERATURE, maxTokens = BELIAL_MAX_TOKENS } = opts;
-  const spec = opts.persona || PERSONA_SPECS.belial;
+async function runBelialToolLoop(entry, system, userText, images, allowTools, thinkOff, tag = '人格', prelude = [], opts = {}) {
+  const { temperature = PERSONA_TEMPERATURE, maxTokens = PERSONA_MAX_TOKENS } = opts;
+  const spec = opts.persona || PERSONA_SPECS[JSZ_ID];
   const stickerApi = spec.sticker;
-  const maxStickers = spec.maxStickers || BELIAL_MAX_STICKERS;
+  const maxStickers = Infinity;   // 不限制单次表情包数量(只保留防重复)
+  const allowAt = opts.at !== false;
   const messages = [
     { role: 'system', content: system },
     ...prelude,
@@ -740,8 +853,11 @@ async function runBelialToolLoop(entry, system, userText, images, allowTools, th
   const cachedPics = [];
   const voices = [];
   const quotes = [];
+  const ats = [];             // @ 接口:main=改正文第一条 @ 谁;text=独立发一条 @ 消息
   let searches = 0, imageSearches = 0, downloads = 0, voiceTries = 0, groupSaves = 0;
-  let quoteTries = 0, faceTries = 0, reactTries = 0, deleteTries = 0, sideSent = false;
+  let quoteTries = 0, faceTries = 0, reactTries = 0, deleteTries = 0, cardSearches = 0, cardSends = 0, atTries = 0, sideSent = false;
+  let totalToolCalls = 0;     // 溢出保护:单次回复执行过的工具调用总数(不是按工具分的次数上限)
+  let emptyRetried = false;   // 2026-11-09:空回复(思考烧光预算)只关思考重试一次,防死循环
   for (let round = 0; round < BELIAL_MAX_TOOL_ROUNDS; round++) {
     // 最后一轮不再挂工具,逼它用已有材料把正文写出来
     const withTools = allowTools && round < BELIAL_MAX_TOOL_ROUNDS - 1;
@@ -759,14 +875,48 @@ async function runBelialToolLoop(entry, system, userText, images, allowTools, th
     if (!calls.length) {
       const text = String(msg.content || '').trim();
       // 允许「只发表情包 / 只发语音 / 只做引用/贴表情等动作」:模型可以调完工具后不写正文
-      if (!text && !stickers.length && !voices.length && !sideSent) throw new Error(`${AI_MODEL} 返回空回复${round ? '(工具调用之后没接上话)' : ''}`);
-      return { text, stickers, cachedPics, voices, quotes, sideSent };
+      if (!text && !stickers.length && !voices.length && !sideSent) {
+        // 2026-11-09:难题时 deepseek-flash 的「思考」会把 max_tokens 全烧光,content 直接是空的
+        // (finish_reason=length, reasoning_tokens=max_tokens)。实测 1600/4000/8000/12000 都是空,
+        // 12000 还要跑 101 秒 —— 加预算、加超时都救不了,只有 reasoning_effort='none' 能立刻出正文。
+        // 这里关思考、不挂工具重试一次;仍为空才走原来的兜底,正常消息的思考行为不变。
+        if (!emptyRetried) {
+          emptyRetried = true;
+          const fr = j?.choices?.[0]?.finish_reason || '?';
+          const rt = Number(j?.usage?.completion_tokens_details?.reasoning_tokens || 0);
+          log(`  ${tag}: 空回复(finish=${fr},思考 ${rt} tokens),关思考重试一次`, '', C.yellow);
+          const j2 = await postChat({
+            model: AI_MODEL,
+            messages: [
+              { role: 'system', content: system },
+              ...prelude,
+              { role: 'user', content: buildUserContent(userText, images) },
+            ],
+            temperature,
+            max_tokens: Math.max(maxTokens, 1200),
+            reasoning_effort: 'none',
+          }, tag);
+          const msg2 = j2?.choices?.[0]?.message;
+          const text2 = String(msg2?.content || '').trim();
+          if (text2) return { text: text2, stickers, cachedPics, voices, quotes, ats, sideSent };
+          const fr2 = j2?.choices?.[0]?.finish_reason || '?';
+          throw new Error(`${AI_MODEL} 返回空回复(关思考重试仍为空,finish=${fr2})${round ? '(工具调用之后没接上话)' : ''}`);
+        }
+        throw new Error(`${AI_MODEL} 返回空回复${round ? '(工具调用之后没接上话)' : ''}`);
+      }
+      return { text, stickers, cachedPics, voices, quotes, ats, sideSent };
     }
     messages.push({ role: 'assistant', content: msg.content || '', tool_calls: msg.tool_calls });
     for (const c of calls) {
       const name = c.function?.name || '';
       const args = (() => { try { return JSON.parse(c.function?.arguments || '{}'); } catch { return {}; } })();
       let result = '';
+      // 溢出保护:工具调用总数到顶就不再执行,改为提示模型用已有材料收尾(轮数上限之外的第二道保险)。
+      if (totalToolCalls >= PERSONA_MAX_TOOL_CALLS) {
+        messages.push({ role: 'tool', tool_call_id: c.id, content: `本次工具调用过多(>${PERSONA_MAX_TOOL_CALLS}),不再执行;用已有材料直接回答。` });
+        continue;
+      }
+      totalToolCalls++;
       try {
         if (name === 'web_search') {
           const q = String(args.query || '').trim();
@@ -780,6 +930,84 @@ async function runBelialToolLoop(entry, system, userText, images, allowTools, th
             log('  🔎 DS搜索:', `${q} → ${r.ok ? `${r.count} 条(deepseek)` : r.error}`, r.ok ? C.dim : C.yellow);
             bumpSearchStat(r.ok, r.provider || 'deepseek');
             result = r.ok ? r.text : `搜索失败(${r.error})。没有搜到东西,按已有知识回答;不确定就直说。`;
+          }
+        } else if (name === 'search_ygo_card') {
+          const q = String(args.query || '').trim();
+          if (cardSearches >= PERSONA_MAX_CARD_SEARCHES) {
+            result = `本次查卡次数已用完(${PERSONA_MAX_CARD_SEARCHES} 次),用已有信息回答。`;
+          } else if (!q) {
+            result = '查卡关键词为空。';
+          } else {
+            cardSearches++;
+            try {
+              const hits = searchCards(q, 5);
+              if (!hits.length) {
+                result = `没找到和「${q}」匹配的卡。换完整卡名或空格分隔关键词再试。`;
+              } else {
+                result = formatCard(hits[0]);
+                if (hits.length > 1) {
+                  const others = hits.slice(1).map(c => formatCard(c).split('\n')[0]).join('、');
+                  result += `\n\n其他结果:${others}`;
+                }
+                log('  🃏 查卡:', `${q} → ${formatCard(hits[0]).split('\n')[0]}`, C.dim);
+              }
+            } catch (e) {
+              result = `本地卡库查询失败:${e.message}`;
+            }
+          }
+        } else if (name === 'send_ygo_card_image') {
+          const q = String(args.query || '').trim();
+          if (cardSends >= Infinity) {
+            result = '本次已经发了 3 张卡,别再发了。';
+          } else if (!q) {
+            result = '缺卡名(query)。';
+          } else {
+            try {
+              const hits = searchCards(q, 5);
+              const c = hits[0];
+              if (!c) {
+                result = `没找到和「${q}」匹配的卡。`;
+              } else {
+                const seg = cardImageSegment(c);
+                const title = formatCard(c).split('\n')[0];
+                if (!seg) {
+                  result = `「${title}」暂无本地卡图。\n${formatCard(c)}`;
+                } else {
+                  await sendGroupImage(entry.group_id, seg);
+                  cardSends++;
+                  sideSent = true;
+                  log('  🖼 卡图:', `${c.id}.jpg ${title}`, C.green);
+                  result = `已发出「${title}」的卡图。\n${formatCard(c)}`;
+                }
+              }
+            } catch (e) {
+              result = `发卡图失败:${e.message}`;
+            }
+          }
+        } else if (name === 'send_random_ygo_card') {
+          if (cardSends >= Infinity) {
+            result = '本次已经发了 3 张卡,别再发了。';
+          } else {
+            try {
+              const c = ygoRandomCard({ withImage: true });
+              if (!c) {
+                result = '本地卡库里暂时没挑到有卡图的卡。';
+              } else {
+                const seg = cardImageSegment(c);
+                const title = formatCard(c).split('\n')[0];
+                if (!seg) {
+                  result = `随机到「${title}」但没有本地卡图,换一次再试。`;
+                } else {
+                  await sendGroupImage(entry.group_id, seg);
+                  cardSends++;
+                  sideSent = true;
+                  log('  🎲 随机卡:', `${c.id}.jpg ${title}`, C.green);
+                  result = `已随机发出「${title}」的卡图。\n${formatCard(c)}`;
+                }
+              }
+            } catch (e) {
+              result = `随机发卡失败:${e.message}`;
+            }
           }
         } else if (name === 'list_stickers') {
           result = stickerCatalogText(stickerApi.catalog);
@@ -808,7 +1036,7 @@ async function runBelialToolLoop(entry, system, userText, images, allowTools, th
           }
         } else if (name === 'delete_sticker') {
           const n = String(args.name || '').trim();
-          if (deleteTries >= 2) {
+          if (deleteTries >= Infinity) {
             result = '本次最多删 2 张,别再删了。';
           } else if (!n) {
             result = '缺 name(要删的表情包文件名,先用 list_stickers 看)。';
@@ -923,8 +1151,8 @@ async function runBelialToolLoop(entry, system, userText, images, allowTools, th
           result = reactionCatalogText(args.query || '');
         } else if (name === 'send_quote') {
           const text = String(args.text || '').trim().slice(0, 200);
-          const mid = String(args.message_id || entry.message_id || '').trim();
-          if (quoteTries >= 2) {
+          const mid = String(args.message_id || entry.message_id || '').trim().replace(/^#/, '');
+          if (quoteTries >= Infinity) {
             result = '本次引用回复次数已用完(2 次)。';
           } else if (!text || !mid) {
             result = '引用回复缺 text 或 message_id。';
@@ -932,7 +1160,8 @@ async function runBelialToolLoop(entry, system, userText, images, allowTools, th
             quoteTries++;
             try {
               // 只排队,等正文生成完由 sendBelialReply 统一发;这样不会「引用先发一遍、正文又发一遍」
-              quotes.push({ message_id: mid, text });
+              // 带上被引用者:引用回复会像 QQ 客户端一样 @ 他(2026-11-24)。
+              quotes.push({ message_id: mid, text, qq: await messageAuthorQq(mid) });
               sideSent = true;
               log('  💬 安排引用回复:', text.slice(0, 30), C.green);
               result = '已安排引用回复(会单独发)。正文里不要再重复这句话,只写需要补充的内容;没有补充就只发表情包/语音或不写正文。';
@@ -940,10 +1169,47 @@ async function runBelialToolLoop(entry, system, userText, images, allowTools, th
               result = `引用回复失败:${e.message}`;
             }
           }
+        } else if (name === 'send_at') {
+          const target = String(args.target || '').trim();
+          const text = String(args.text || '').replace(/[\r\n\t]+/g, ' ').trim().slice(0, 200);
+          if (!allowAt) {
+            result = '这次是你自己插话(没人 @ 你),这条消息不 @ 人;别调 send_at。';
+          } else if (atTries >= Infinity) {
+            result = '本次 @ 操作次数已用完(2 次),正文里也别再 @ 人。';
+          } else if (!target) {
+            result = '缺 target(要 @ 的群昵称或 QQ 号)。';
+          } else {
+            const hit = await resolveAtTarget(entry.group_id, target);
+            if (!hit.ok) {
+              result = hit.message;
+            } else {
+              atTries++;
+              if (text) {
+                // 独立一条 @ 消息:等正文生成完一起发,避免工具调用阶段就先发出去。
+                ats.push({ qq: hit.qq, name: hit.name, text, main: false });
+                sideSent = true;
+                log('  📣 安排 @ 消息:', `@${hit.name}(${hit.qq}) ${text.slice(0, 30)}`, C.green);
+                result = `已安排单独发一条 @${hit.name} 的消息(会随本次回复一起发)。正文里不要再写 @;text 只写额外短句,正文已经说过的话别再抄进来(重复的会被系统去掉)。`;
+              } else {
+                // 只改本次正文第一条 @ 谁(默认谁都不 @,调了才 @)。
+                ats.push({ qq: hit.qq, name: hit.name, main: true });
+                log('  📣 本次回复改 @:', `${hit.name}(${hit.qq})`, C.green);
+                result = `已把本次回复开头改成 @${hit.name};正文正常写,不要再写 @。`;
+              }
+            }
+          }
+        } else if (name === 'list_group_members') {
+          const q = String(args.query || '').trim();
+          try {
+            const list = await groupRoster(entry.group_id);
+            result = groupMembersText(entry.group_id, list, q);
+          } catch (e) {
+            result = `读群成员名单失败:${e.message}。可以直接填 QQ 号,或稍后再试。`;
+          }
         } else if (name === 'send_face') {
           const rawFace = String(args.face ?? '').trim();
           const fid = faceIdOf(rawFace);
-          if (faceTries >= 2) {
+          if (faceTries >= Infinity) {
             result = '本次 QQ 表情次数已用完(2 次)。';
           } else if (!fid) {
             result = `没找到这个 QQ 表情:${rawFace || '(空)'}。先 list_reactions(query) 查 QQ 表情目录,再发。`;
@@ -961,9 +1227,9 @@ async function runBelialToolLoop(entry, system, userText, images, allowTools, th
         } else if (name === 'react_message') {
           const emoji = String(args.emoji || '赞').trim();
           const eid = reactionIdOf(emoji);
-          const mid = String(args.message_id || entry.message_id || '').trim();
-          if (reactTries >= 2) {
-            result = '本次贴表情次数已用完(2 次)。';
+          const mid = String(args.message_id || entry.message_id || '').trim().replace(/^#/, '');
+          if (reactTries >= Infinity) {
+            result = '本次贴表情次数已用完(3 次)。';
           } else if (!eid || !mid) {
             const sug = reactionSuggestions(emoji);
             result = `没找到这个贴表情:${emoji || '(空)'}${sug ? `;可能是 ${sug}` : ''}。先 list_reactions(query) 从 QQ 表情目录查名字,再贴。`;
@@ -1007,9 +1273,9 @@ async function runBelialToolLoop(entry, system, userText, images, allowTools, th
         } else if (name === 'list_voices') {
           result = voiceCatalogText();
         } else if (name === 'send_voice') {
-          const text = String(args.text || '').replace(/[\r\n\t]+/g, ' ').trim().slice(0, BELIAL_MAX_VOICE_CHARS);
-          if (voiceTries >= BELIAL_MAX_VOICES) {
-            result = `本次已经尝试过 ${BELIAL_MAX_VOICES} 次语音,别再发了。`;
+          const text = String(args.text || '').replace(/[\r\n\t]+/g, ' ').trim().slice(0, PERSONA_MAX_VOICE_CHARS);
+          if (voiceTries >= Infinity) {
+            result = `本次已经尝试过 ${PERSONA_MAX_VOICES} 次语音,别再发了。`;
           } else {
             voiceTries++;
             if (!text) {
@@ -1039,8 +1305,8 @@ async function runBelialToolLoop(entry, system, userText, images, allowTools, th
 }
 
 /** 人格对话:带工具;碰到 4xx 依次退让(去工具 → 带思考 → 去图片)。persona 默认贝利亚,兼容旧调用 */
-async function aiChatBelial(entry, system, userText, images = [], persona = PERSONA_SPECS.belial) {
-  const think = persona.think ?? BELIAL_THINK;
+async function aiChatBelial(entry, system, userText, images = [], persona = PERSONA_SPECS[JSZ_ID], opts = {}) {
+  const think = persona.think ?? PERSONA_THINK;
   const ladder = [
     { tools: true, thinkOff: !think, images, tag: '' },
     { tools: false, thinkOff: !think, images, tag: '去掉工具' },
@@ -1053,6 +1319,7 @@ async function aiChatBelial(entry, system, userText, images = [], persona = PERS
       if (step.tag) log(`  ${persona.cn}重试(${step.tag})...`, '', C.dim);
       return await runBelialToolLoop(entry, system, userText, step.images, step.tools, step.thinkOff, persona.cn, [], {
         persona, temperature: persona.temperature, maxTokens: persona.maxTokens,
+        ...(opts.at === false ? { at: false } : {}),   // 非 @ 自动接话那条路不 @ 人
       });
     } catch (e) {
       lastErr = e;
@@ -1095,7 +1362,8 @@ async function postChat(body, tag = '') {
  * 一次闲聊:function calling 循环 —— 模型要搜就搜(我们自己执行搜索),搜完把结果喂回去让它接着答。
  * 为什么这样写(2026-09-21 改):老路子是智谱服务端注入式联网,**只对智谱有效**,deepseek 挂上必 4xx。
  * 现在工具是我们本地实现的,任何 OpenAI 兼容后端都能用,而且搜了什么在面板上看得见(下面那行 log)。
- * 省钱护栏:AI_CHAT_MAX_SEARCHES(默认 2)轮之后就**不再挂工具**,逼它用已有材料作答,别无限搜下去。
+ * 2026-11-26:搜索次数上限已取消;只剩轮数(AI_CHAT_MAX_TOOL_ROUNDS)与调用总数(AI_CHAT_MAX_TOOL_CALLS)
+ * 两道兜底,防止死循环和 messages 无限膨胀。
  *
  * 采样参数与「挂不挂工具」现在可以按调用方覆盖(2026-09-28 加,给贴吧模式用):
  * 贴吧模式要的是**短、快、野** —— tools:false(一次都不搜)、temperature 更高、max_tokens 更小
@@ -1108,13 +1376,15 @@ async function aiChatOnce(system, userText, images = [], opts = {}) {
     temperature = 0.8, maxTokens = AI_CHAT_MAX_TOKENS, qq = null,
   } = opts;
   const messages = [{ role: 'system', content: system }, { role: 'user', content: buildUserContent(userText, images) }];
-  const maxSearches = tools ? AI_CHAT_MAX_SEARCHES : 0;
+  const maxSearches = tools ? Infinity : 0;   // 2026-11-26 取消「最多搜 N 次」,只留轮数/调用总数兜底
   const qqTools = qq ? CHAT_TOOLS : [];
   const qqNames = new Set(qqTools.map(t => t.function.name));
-  const qqUsed = { quote: 0, face: 0, react: 0, sticker: 0 };
+  const qqUsed = { quote: 0, face: 0, react: 0, sticker: 0, at: 0 };
   let sideSent = false;
   let used = 0;
+  let totalCalls = 0;
   for (let round = 0; ; round++) {
+    if (round >= AI_CHAT_MAX_TOOL_ROUNDS) throw new Error(`工具调用轮数过多(${AI_CHAT_MAX_TOOL_ROUNDS} 轮)`);
     // 预算用完就**停止挂联网工具**(不再给它搜的机会,逼它用已有材料作答),但 QQ 操作工具不受搜索预算影响。
     // ⚠ 判据用「还能搜几次」而不是「跑了几轮」:一轮里模型可能一口气要搜 2 个词,次数照样会超;
     //   同一把尺子也用在下面执行搜索前,免得超预算的调用白花一次搜索钱。
@@ -1143,6 +1413,11 @@ async function aiChatOnce(system, userText, images = [], opts = {}) {
     for (const c of calls) {
       const args = (() => { try { return JSON.parse(c.function.arguments || '{}'); } catch { return {}; } })();
       const fn = c.function?.name || '';
+      if (totalCalls >= AI_CHAT_MAX_TOOL_CALLS) {
+        messages.push({ role: 'tool', tool_call_id: c.id, content: `本次工具调用过多(>${AI_CHAT_MAX_TOOL_CALLS}),不再执行;用已有材料直接回答。` });
+        continue;
+      }
+      totalCalls++;
       if (qqNames.has(fn)) {
         const r = await execQqTool(fn, args, qq?.entry, qqUsed, opts.quoteLog);
         if (r.sideSent) sideSent = true;
@@ -1241,7 +1516,6 @@ function looksLikeAiChat(entry) {
   const text = (entry.text || '').replace(/\[at\]/g, ' ');
   if (!text.trim()) return false;
   if (isHelpRequest(text)) return false;
-  if (belialParseCmd(text).triggered) return false;
   if (jszParseCmd(text).triggered) return false;
   if (text.includes(TRIGGER_KEYWORD)) return false;
   if (text.includes(DAILY_KEYWORD)) return false;
@@ -1296,11 +1570,20 @@ function aiCooldownBlocked(uid, now = Date.now(), ms = AI_CHAT_COOLDOWN_MS) {
   return 0;
 }
 
+// 游戏王/卡牌类的提问:除了人格提示词里的规则,每条消息再补一句「先查再答」。
+// 2026-11-26 线上:W14 凭记忆编闪刀 combo,卡名/效果都对不上 —— 小模型不会主动查卡,必须当面提醒。
+const YGO_TOPIC_RE = /游戏王|闪刀|青眼|黑魔导|码丽丝|烙印|珠泪|combo|展开|裁定|禁卡表|卡表|手坑|连接召唤|超量|同调|灵摆|link/i;
+function ygoResearchHint(text) {
+  if (!YGO_TOPIC_RE.test(String(text || ''))) return '';
+  return '\n【查证提醒】这条涉及游戏王/卡牌:先用 search_ygo_card 查相关卡的卡面效果(多张就分别查),'
+    + '需要最新裁定/禁卡表/新卡再 web_search;按查到的效果一步步推,查不到或效果对不上就直说查不到,别凭记忆编 combo。';
+}
+
 async function processAiChat(entry) {
   const uid = String(entry.user_id);
   // 人格模式(银河皇帝 / 脚刷周):本群开着 + 有聊天 key。**必须在拼消息之前定** —— 提问正文里的
   // 「@你」称呼要跟着人格走(aichat 的 deps.botName),否则提示词里会看到「@你(史官)」这种旧身份。
-  const personaOn = belialOn(entry.group_id) && !!AI_API_KEY;
+  const personaOn = personaModeOn(entry.group_id) && !!AI_API_KEY;
   const persona = personaOf(entry.group_id);
   const personaBotName = personaOn ? persona.parseName : '史官';
   // 冷却(2026-09-21 用户要求去掉):`AI_CHAT_COOLDOWN_MS=0` 即**彻底关闭** —— 连时间戳都不记,
@@ -1322,6 +1605,7 @@ async function processAiChat(entry) {
         anchorId: entry.message_id,
         beforeSeq: entry.seq,
         beforeTime: entry.time,
+        withIds: !!personaOn,
       });
       if (lines) ctx = `群聊记录(最近 ${AI_CHAT_CTX} 条,格式 "HH:MM 昵称|内容";带「昨天/前天/M-D」前缀的是更早的消息,不是刚发生):\n${lines}\n\n`;      names = n;
     } catch (e) {
@@ -1348,7 +1632,7 @@ async function processAiChat(entry) {
   // 剥掉 @ 段标记(形如 [at])与多余空白 —— 只作用于**降级路径**(没有 segs 的老条目 / 解析失败时)。
   // 两条路都会被这个占位符碰到:AI 闲聊把它渲染成「@你(史官)」,贴吧模式渲染成「@你(贴吧鱼)」,
   // 两个都剥掉(以前只剥史官那个,贴吧模式下「@你(贴吧鱼)」会被当成提问正文,模型还以为是别人说的)。
-  q = q.replace(/@你\((?:史官|贴吧鱼|贝利亚|脚刷周|西比拉|记忆测试)\)/g, ' ').replace(/\s+/g, ' ').trim() || '(无文字,仅@)';
+  q = q.replace(/@你\((?:史官|贴吧鱼|脚刷周|W14|记忆测试)\)/g, ' ').replace(/\s+/g, ' ').trim() || '(无文字,仅@)';
   // ===== 人格模式(银河皇帝 / 脚刷周):开着就整条覆盖 @ 的回复(固定人格 + 工具调用 + 思考) =====
   // 放在贴吧模式之前:两个都开时,@ 的消息归群人格;不 @ 的普通群聊仍归贴吧鱼(tiebaFire 那条路)。
   // 这条路的模型可以自己调:send_sticker(自主发表情包)、web_search(通用联网)、
@@ -1365,17 +1649,30 @@ async function processAiChat(entry) {
         recent: belialRecent.get(String(entry.group_id)) || [],
         scope: { group: entry.group_id, user: entry.user_id },   // 长期记忆按「这个群 + 这个人」取
         query: q,                                               // 用这句话做关键词召回(知识类记忆靠它排序)
-      }), `${ctx}@你的人: ${entry.nickname}\nTA 的话: ${q}${gapHint}`, images, persona);
+      }), `${ctx}@你的人: ${entry.nickname}\nTA 的话: ${q}${gapHint}${ygoResearchHint(q)}`, images, persona);
+      // 点名让攻击/评价某人:这个人是本次「被攻击/被评价」的对象,不管模型有没有自己 @ 人,都记下来。
+      // (1) 模型没 @ 人 → 补一条 mainAt,第一条正文直接 @ 他(2026-11-24);
+      // (2) 模型 @ 了人 → focusQq 交给 sendBelialReply 把骂人的那句提到第一条(2026-11-26)。
+      const attackQq = attackTargetOf(entry, q);
+      if (attackQq && !(result.ats || []).some(a => a && a.qq)) {
+        const nm = await resolveMemberName(entry.group_id, attackQq);
+        result.ats = [...(result.ats || []), { qq: attackQq, name: nm, main: true }];
+        log('  📣 点名攻击目标 → 自动 @:', `${nm}(${attackQq})`, C.green);
+      }
       const head = (result.text || '(只发表情包/语音)').replace(/\n/g, ' / ').slice(0, 80);
       log('  回复:', `${head}${result.voices?.length ? ` + 语音 ${result.voices.length} 条(${result.voices.map(v => v.label || v.voice).join('/')})` : ''}${result.stickers.length ? ` + 表情包 ${result.stickers.length} 张(${result.stickers.join('/')})` : ''}`, C.green);
       // 隔了 2 条以上/后面又刷了:如果模型没自己引用,系统补一条引用,避免回答看起来对不上问题。
       // 只引用**第一句**:多行回复整段当引用文本时,正文按行拆开后对不上,会「引用一条 + 正文又发一遍」。
+      // 2026-11-26:点名骂/评价某人时**不要**补这条引用 —— 引用的是叫你的人,补了就先回他一句还 @ 他,
+      // 群里原话「必须回复我一句才骂人,逻辑不太对」。
       const quotes = (result.quotes || []).slice();
-      if (gapInfo?.shouldQuote && !quotes.length && result.text) {
+      if (gapInfo?.shouldQuote && !quotes.length && result.text && !attackQq) {
         const firstLine = String(result.text).split('\n').map(s => s.trim()).filter(Boolean)[0] || '';
-        if (firstLine) quotes.push({ message_id: entry.message_id, text: firstLine });
+        if (firstLine) quotes.push({ message_id: entry.message_id, text: firstLine, qq: entry.user_id });
       }
-      await sendBelialReply(entry, result.text, { persona, stickers: result.stickers, cachedPics: result.cachedPics || [], voices: result.voices || [], quotes, sideSent: !!result.sideSent });   // 引用 + 文字 + 语音 + 表情包
+      // at:false —— AI 闲聊不再强制 @ 提问者(2026-11-24 用户要求):@ 谁由模型用 send_at 自己选,
+      // 否则和 send_at 撞车,一句话里 @ 两个人。模型不调 send_at 就谁都不 @。
+      await sendBelialReply(entry, result.text, { persona, at: false, stickers: result.stickers, cachedPics: result.cachedPics || [], voices: result.voices || [], quotes, ats: result.ats || [], focusQq: attackQq, sideSent: !!result.sideSent });   // 引用 + 文字 + @ + 语音 + 表情包
       if (!DRY_RUN) bumpAiChatStat(entry, true);
     } catch (e) {
       log(`  ${persona.cn}模式失败:`, e.message, C.red);
@@ -1424,22 +1721,32 @@ async function processAiChat(entry) {
   log(`  ${AI_MODEL} 生成中 ...(档位 ${TONE_CN[tone]}${AI_WEB_SEARCH ? ',可联网' : ''}${images.length ? `,含 ${images.length} 张图` : ''})`, '', C.dim);
   try {
     const sys = aiSystem(images.length > 0, tone) +
-      '\n\n你还能用 send_quote / send_face / react_message 分别做「引用当前消息回一句 / 单独发 QQ 表情 / 给当前消息贴表情」;用 list_stickers / send_sticker 看表情包库和发表情包,用 list_reactions 看可用贴表情。参考情绪强度、是不是在接梗/串、群聊现在的氛围决定要不要发,别每句都来一套;正文里不要提工具名。贴表情要贴对方说的那个,名字以 list_reactions 的 QQ 表情目录为准(用户说糖就查吃糖),别默认笑哭。先回答对方当前这一句,别把上一条指令或别人问别人的话当成问题。\n引用规则:如果你要回的那句和你上次说话隔了 2 条以上,或者后面又刷了几条,系统会自动引用它;你直接写回复正文,不用再调 send_quote,也别在正文重复。';
+      '\n\n你还能用 send_quote / send_face / react_message / send_at 分别做「引用当前消息回一句 / 单独发 QQ 表情 / 给当前消息贴表情 / @ 指定群友说一句」;用 list_group_members 查群友昵称和 QQ(要 @ 不在最近记录里的人时先查);用 list_stickers / send_sticker 看表情包库和发表情包,用 list_reactions 看可用贴表情。参考情绪强度、是不是在接梗/串、群聊现在的氛围决定要不要发,别每句都来一套;正文里不要提工具名。@ 人的习惯(照群里真人):绝大多数回复不 @,直接说,上一条就是对方时更不用 @;要回旧消息用引用(系统引用时会自动 @ 被引用的人),别再用 send_at 重复 @;只有叫一个最近没说话的人、点名让他做事/回答、或通知几个人同一件事时才用 send_at,一次最多一个(通知多人除外);对方点名让你骂/评价某个被 @ 的人时,用 send_at @ 那个被点名的人,不是 @ 叫你的人;别人 @ 你办事,直接答,不用 @ 回去;正文里不要手写 @昵称;不能 @ 全体成员;send_at 只在真有一句额外的话时才填 text,别把正文再抄一遍(抄了的会被系统去掉)。贴表情要贴对方说的那个,名字以 list_reactions 的 QQ 表情目录为准(用户说糖就查吃糖),别默认笑哭。先回答对方当前这一句,别把上一条指令或别人问别人的话当成问题。\n引用规则:如果你要回的那句和你上次说话隔了 2 条以上,或者后面又刷了几条,系统会自动引用它;你直接写回复正文,不用再调 send_quote,也别在正文重复。';
     const gapInfo = await replyGapInfo(entry);
     const gapHint = quoteHintText(gapInfo);
     const quoteLog = [];
     let reply = await aiChat(sys, `${ctx}@你的人: ${entry.nickname}\nTA 的问题: ${q}${gapHint}`, images, { qq: { entry }, quoteLog });
     reply = stripQuotedText(reply, quoteLog);
+    let atQqs = Array.isArray(entry.__atQqs) ? entry.__atQqs.slice() : null;
+    delete entry.__atQqs;                                   // 只在本次回复生效,别留到下一轮
+    // 点名让攻击/评价某人:模型没 @ 人时,兜底 @ 被点名的人(与人格模式同一套规则)。
+    const forcedAt = attackTargetOf(entry, q);
+    if (forcedAt && !entry.__atSent && !(atQqs && atQqs.length)) atQqs = [forcedAt];
+    delete entry.__atSent;
     if (!reply) {
       log('  回复:(只做了引用/QQ表情/贴表情,没有正文)', '', C.dim);
     } else {
       if (reply.length > AI_CHAT_MAX_CHARS) reply = reply.slice(0, AI_CHAT_MAX_CHARS) + '……';
       log('  回复:', reply.replace(/\n/g, ' ').slice(0, 60) + (reply.length > 60 ? '...' : ''), C.green);
-      if (gapInfo?.shouldQuote && !quoteLog.length) await sendGroupQuote(entry.group_id, entry.message_id, reply);
-      else await sendReply(entry, reply);
+      // AI 闲聊:模型调了 send_at 才 @ 人(2026-11-24 用户要求);没调就纯文本发,不再强制 @ 提问者。
+      if (gapInfo?.shouldQuote && !quoteLog.length) await sendGroupQuote(entry.group_id, entry.message_id, reply, atQqs && atQqs.length ? atQqs : entry.user_id);
+      else if (atQqs && atQqs.length) await sendReply(entry, reply, { atQqs });
+      else await sendGroupText(entry.group_id, reply);
       if (!DRY_RUN) bumpAiChatStat(entry, true);            // 记账:这条回复给了谁
     }
   } catch (e) {
+    delete entry.__atQqs;                                  // 失败的这一轮别把 @ 目标留到下一次
+    delete entry.__atSent;
     log('  AI 闲聊失败:', e.message, C.red);
     // 同上:兜底提示语发失败**不能往外抛**,否则这条消息永远进不了 processed(见文件上方「事故」注释)。
     try { await sendReply(entry, '史官一时语塞,稍后再问。'); } catch (e2) { log('  兜底那句也发不出:', e2.message, C.red); }
@@ -1457,7 +1764,7 @@ async function processAiChat(entry) {
 //   · 没 @ 的普通群聊 → 仍归贴吧鱼(银河皇帝只在 @ 时说话)。
 //
 // 2026-10-26 用户要求「可能回 1-3 句、表情包独立成句、符合真人发送习惯」:
-//   · 文本拆成 1~3 条:第一条 @ 触发者,后续不 @,像真人补话;
+//   · 文本拆成 1~3 条:第一条不固定 @ 人(模型用 send_at 自己选),后续不 @,像真人补话;
 //   · 表情包**只在模型调 send_sticker 时发**,单独一条,不再按概率/间隔自动发。
 // 不被 @ 也概率接话(2026-10-28 用户要求):只在开了银河皇帝的群生效,默认 40%。
 // 与贴吧模式二选一:银河皇帝开着的群,非 @ 消息不再交给贴吧鱼,避免两个人都接。
@@ -1501,14 +1808,167 @@ function autoChimeProbFromRate(rate, maxProb = BELIAL_AUTO_LOW_PROB, minProb = B
 }
 
 function belialChimeProb(gid) {
-  if (!belialNonAtAutoOf()) return belialNonAtProbOf();
-  const p = belialAutoProbsOf();
+  if (!personaNonAtAutoOf()) return personaNonAtProbOf();
+  const p = personaAutoProbsOf();
   return autoChimeProbFromRate(groupMsgRate(gid), p.max, p.min);
 }
 
 function belialShouldChime(gid, rand = Math.random) {
-  return belialOn(gid) && rand() < belialChimeProb(gid);
+  return personaModeOn(gid) && rand() < belialChimeProb(gid);
 }
+
+// ---------- 独立「只贴表情不说话」(2026-10-30) ----------
+// 用户要求:脚刷周可以主动给群友的梗/有趣/搬屎/弱智发言贴 笑哭 / 棒棒糖(唐) / 鲸鱼(懒得喷),
+// 表达情感、含蓄喷人。独立概率命中后**让模型判断这条值不值得贴**——不是看到「屎」字就贴。
+const reactedSeqs = new Set();
+const reactJudgeBusy = new Set();
+const REACT_EMOJI = { laugh: '182', tang: '147', whale: '128051' };
+const REACT_JUDGE_SYS = `你是 QQ 群聊的表情判断器。看一条群消息,判断它值不值得贴表情回应。只输出 JSON,不要解释:
+{"react":["laugh"]}
+react 是数组,最多 3 个,按最贴切的顺序;一个表情能表达就只给一个,不要为了凑数硬加;不值得就输出 {"react":[]}。
+可选值:
+- laugh: 真的好笑 / 梗图 / 绷不住 / 神回复
+- tang: 唐 / 弱智 / 抽象 / 逆天 / 智商堪忧(含蓄骂唐)
+- whale: 搬屎 / 屎 / 极度无语 / 懒得喷(内容太屎或蠢到不想骂)
+- none: 普通聊天 / 提问 / 求助 / 严肃 / 看不出梗
+注意看语义:不要因为出现某个字面词就选;只是提到「屎」但不是在搬屎,不要选 whale。
+不要因为消息里出现「笑哭/棒棒糖/鲸鱼」这些词就选对应的,要看它本身有没有那个意思。
+本群常见拿性相关粗口/互喷口头禅开玩笑(比如「吃我几把」这类嘴臭),这是群里的日常调侃,默认要贴:通常 tang(唐)或 laugh(好笑),不要因为字面粗俗就输出 none。只有明显针对某个人的认真骚扰、威胁、开盒才 none。
+群里爱用谐音/拆字骂人,要按本意判断,不要当成普通词:「智利油温踢」= 智力有问题,「顶嗯」「滴嫩」= 低能,「唐/糖」= 唐氏;这些通常选 tang。`;
+
+// 谐音/黑话提示:只作为判断器的补充信息,不直接决定贴哪个;避免模型把「智利油温踢」当普通词。
+const REACT_SLANG = [
+  [/智利油温踢|智力油温踢/, '智力有问题'],
+  [/顶嗯|滴嫩|低嫩/, '低能'],
+  [/唐氏|太唐|好唐|唐完|糖/, '唐/唐氏(弱智)'],
+];
+function reactSlangHints(text) {
+  const s = String(text || '').replace(/\s+/g, '');
+  const hits = [];
+  for (const [re, hint] of REACT_SLANG) if (re.test(s) && !hits.includes(hint)) hits.push(hint);
+  return hits;
+}
+
+const REACT_KEYS = ['laugh', 'tang', 'whale'];
+/** 把模型返回的 JSON 解析成表情 id 数组(最多 3 个,去重);[] = 不贴 */
+function parseReactionVerdicts(raw) {
+  const m = String(raw || '').match(/\{[\s\S]*\}/);
+  if (!m) return [];
+  let obj;
+  try { obj = JSON.parse(m[0]); } catch { return []; }
+  let arr = obj.react;
+  if (typeof arr === 'string') arr = arr.split(/[,\s，、|/]+/);
+  if (!Array.isArray(arr)) return [];
+  const out = [];
+  for (const item of arr) {
+    const k = String(item || '').trim().toLowerCase();
+    if (!k || k === 'none') continue;
+    let key = REACT_KEYS.includes(k) ? k : '';
+    if (!key && /唐|弱智|抽象|逆天/.test(k)) key = 'tang';
+    if (!key && /搬屎|屎|无语|懒得/.test(k)) key = 'whale';
+    if (!key && /笑|好笑|梗/.test(k)) key = 'laugh';
+    if (key && !out.includes(REACT_EMOJI[key])) out.push(REACT_EMOJI[key]);
+    if (out.length >= 3) break;
+  }
+  return out;
+}
+
+function reactImageMime(d) {
+  const f = String(d?.file || d?.url || '').toLowerCase();
+  if (f.includes('.png')) return 'image/png';
+  if (f.includes('.gif')) return 'image/gif';
+  if (f.includes('.webp')) return 'image/webp';
+  return 'image/jpeg';
+}
+
+/**
+ * 让模型判断这条消息值不值得贴、贴哪个。返回表情 id;'' = 不贴。
+ * 只发文字 + 最多一张图;判断失败就当不贴,绝不退回「关键词映射」。
+ */
+async function judgeReaction(j) {
+  if (!AI_API_KEY) return '';
+  const segs = j.message || [];
+  const text = segs.filter(s => s.type === 'text').map(s => s.data?.text || '').join('')
+    .replace(/@\S+/g, ' ').replace(/\s+/g, ' ').trim();
+  const imgSeg = segs.find(s => s.type === 'image');
+  const images = [];
+  if (imgSeg) {
+    try {
+      const d = imgSeg.data || {};
+      const size = Number(d.file_size || d.fileSize || 0);
+      if (!size || size <= 2 * 1024 * 1024) {
+        const buf = await fetchStickerBuffer(d);
+        if (buf?.length && buf.length <= 2 * 1024 * 1024) images.push({ mime: reactImageMime(d), b64: buf.toString('base64') });
+      }
+    } catch { /* 图读不到就只判断文字 */ }
+  }
+  if (!text && !images.length) return '';
+  const name = j.sender?.card || j.sender?.nickname || String(j.user_id || '');
+  const hints = reactSlangHints(text);
+  const prompt = `群友「${name}」发了这条群消息:\n${text || '(只发了图)'}${hints.length ? `\n已知谐音/黑话:${hints.join(';')}` : ''}\n判断值不值得贴表情。`;
+  const ask = async (withImg) => {
+    const content = withImg && images.length ? buildUserContent(prompt, images) : prompt;
+    const r = await postChat({
+      model: AI_MODEL,
+      messages: [{ role: 'system', content: REACT_JUDGE_SYS }, { role: 'user', content }],
+      temperature: 0.1,
+      max_tokens: 80,
+      reasoning_effort: 'none',
+    }, '贴表情判断');
+    return parseReactionVerdicts(r?.choices?.[0]?.message?.content);
+  };
+  try {
+    let emojis = [];
+    try { emojis = await ask(true); } catch (e) { if (images.length) emojis = await ask(false); else throw e; }
+    if (emojis.length) log('  🤔 表情判断:', `${emojis.join('/')} ← ${text.slice(0, 40) || '[图]'}`, C.dim);
+    return emojis;
+  } catch (e) {
+    log('  表情判断失败:', e.message, C.yellow);
+    return [];
+  }
+}
+
+/** 独立概率触发:命中后让模型判断值不值得贴,贴也只贴一个,不发文字 */
+async function maybeReactOnly(j) {
+  if (!j || j.post_type !== 'message' || j.message_type !== 'group') return false;
+  const gid = j.group_id;
+  if (!personaModeOn(gid)) return false;
+  const prob = personaReactProbOf();
+  if (!(prob > 0) || Math.random() >= prob) return false;
+  if (String(j.user_id) === String(BOT_ID) || String(j.sender?.user_id) === String(BOT_ID)) return false;
+  if (isQqBuiltinBot(j) || mentionsBotRaw(j)) return false;
+  if (isAutoReplyIgnored(j.user_id) || isKeywordMessage(j)) return false;
+  const mid = String(j.message_id || '').trim();
+  const key = mid || String(j.message_seq || '');
+  if (!mid || reactedSeqs.has(key)) return false;
+  const keyGroup = String(gid);
+  if (reactJudgeBusy.has(keyGroup)) return false;      // 同群同时只判断一条,别并发烧模型
+  reactJudgeBusy.add(keyGroup);
+  try {
+    const emojis = await judgeReaction(j);
+    if (!emojis.length) return false;
+    if (DRY_RUN) { log('  [DRY_RUN] 不发送(贴表情):', `${emojis.join('/')} ← ${j.message_seq || mid}`, C.yellow); return true; }
+    if (isDeadGroup(gid)) return false;
+    for (const emoji of emojis.slice(0, 3)) {
+      await sendGroupReaction(mid, emoji);
+      await new Promise(r => setTimeout(r, 180));
+    }
+    reactedSeqs.add(key);
+    while (reactedSeqs.size > 500) reactedSeqs.delete(reactedSeqs.values().next().value);
+    const name = j.sender?.card || j.sender?.nickname || String(j.user_id);
+    log('  👀 贴表情:', `${emojis.join('/')} ← ${name}: ${String(j.raw_message || '').slice(0, 30)}`, C.dim);
+    return true;
+  } catch (e) {
+    log('  贴表情失败:', e.message, C.yellow);
+    return false;
+  } finally {
+    reactJudgeBusy.delete(keyGroup);
+  }
+}
+
+// 人格记忆(2026-11-26 重构)—— 提炼/巩固/做梦/群档案全部搬进 persona/membrain.mjs,
+// 每个人格一套独立目录。这里只保留「群消息计数」的入口(见 membrainOnMessage)与手动 CLI。
+// 旧的 JSZ_* / 脚刷周专用实现已删,所有阈值改成 PERSONA_* 环境变量(见 membrain.mjs 顶部)。
 
 // 每群记最近说过的几条(防复读):下次生成时塞进系统提示词,让模型自己换说法,
 // 而不是给一张固定回复表。用户 2026-10-26:「典型句式不要固定回复,也要过 ai 思考生成」。
@@ -1527,7 +1987,7 @@ function belialRemember(gid, lines) {
 // 群聊表情包下载权限(2026-10-28 用户要求):**不自动存**,只把最近群表情的元数据记下来;
 // 模型通过 list_group_stickers / save_group_sticker 决定要不要下载进库。图片本体只有模型调用才下载。
 const BELIAL_STICKER_MAX_COUNT = Math.max(1, Number(process.env.BELIAL_STICKER_MAX_COUNT || 200));
-const BELIAL_MAX_GROUP_SAVES = Math.max(1, Number(process.env.BELIAL_MAX_GROUP_SAVES || 2));
+const BELIAL_MAX_GROUP_SAVES = Infinity;   // 2026-11-26 取消「一次最多存 N 张群表情」上限
 const BELIAL_STICKER_AUTONAME = process.env.BELIAL_STICKER_AUTONAME !== '0';
 // ---------- 联网图片临时缓存 tmp_pic ----------
 // 用户 2026-10-30:联网搜到的图默认只进 tmp_pic(最多 10 张),不直接污染表情包库;
@@ -1659,9 +2119,9 @@ async function fetchStickerBuffer(d) {
     });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const declared = Number(r.headers.get('content-length') || 0);
-    if (declared > BELIAL_MAX_STICKER_BYTES + 1024 * 1024) throw new Error('图片太大');
+    if (declared > KIT_MAX_STICKER_BYTES + 1024 * 1024) throw new Error('图片太大');
     const buf = Buffer.from(await r.arrayBuffer());
-    if (buf.length > BELIAL_MAX_STICKER_BYTES) throw new Error('图片太大');
+    if (buf.length > KIT_MAX_STICKER_BYTES) throw new Error('图片太大');
     return buf;
   }
   if (file.startsWith('base64://')) return Buffer.from(file.slice(9), 'base64');
@@ -1680,7 +2140,7 @@ function rememberGroupStickers(j) {
   if (!j || j.post_type !== 'message' || j.message_type !== 'group') return;
   if (String(j.user_id) === String(BOT_ID) || String(j.sender?.user_id) === String(BOT_ID)) return;
   if (isQqBuiltinBot(j) || isAutoReplyIgnored(j.user_id)) return;
-  if (!belialOn(j.group_id)) return;
+  if (!personaModeOn(j.group_id)) return;
   const list = stickerDataOf(j);
   const who = j.sender?.card || j.sender?.nickname || String(j.user_id);
   const at = Number(j.time) ? Number(j.time) * 1000 : Date.now();
@@ -1773,7 +2233,7 @@ async function aiDescribeSticker(name, { force = false, stickerApi = STICKER_API
     j = await call(false);
   }
   const content = String(j?.choices?.[0]?.message?.content || '').trim();
-  const m = content.match(/\{[\s\S]*?\}/);
+  const m = content.match(/\{[\s\S]*\}/);
   if (!m) throw new Error('视觉模型没返回 JSON');
   let obj;
   try { obj = JSON.parse(m[0]); } catch { throw new Error('视觉模型 JSON 解析失败'); }
@@ -1813,12 +2273,17 @@ function reactionEntries() {
       if (n) reactionEntriesCache.push({ id: String(id), name: n });
     }
   } catch { /* 读不到就空目录,调用方会报错 */ }
+  // 系统 emoji(不在经典 qq_faces 里):鲸鱼=U+1F433=128051,脚刷周用来表达「懒得喷」
+  if (!reactionEntriesCache.some(e => e.id === '128051')) reactionEntriesCache.push({ id: '128051', name: '鲸鱼' });
   return reactionEntriesCache;
 }
 function reactionIdOf(input) {
   const s = String(input ?? '').trim();
   if (!s) return '';
   if (/^\d+$/.test(s)) return s;
+  // 常用贴表情别名(2026-10-30 脚刷周要求):唐/唐氏=棒棒糖 147;鲸鱼/懒得喷=🐳 128051
+  const alias = { 唐: '147', 唐氏: '147', 棒棒糖: '147', 鲸鱼: '128051', '🐳': '128051', 懒得喷: '128051', 笑哭: '182' };
+  if (alias[s]) return alias[s];
   const exact = reactionEntries().find(e => e.name === s);
   if (exact) return exact.id;
   // 直接贴 Unicode emoji 也认(QQ 的 emoji_id 就是码点)
@@ -1865,13 +2330,28 @@ function faceIdOf(input) {
   return faceNameToId.get(s) || '';
 }
 
-async function sendGroupQuote(groupId, messageId, text) {
+/** 某条消息的作者 QQ(引用回复自动 @ 用);拿不到就返回空串。 */
+async function messageAuthorQq(messageId) {
+  try {
+    const r = await api('get_msg', { message_id: String(messageId) });
+    return String(r?.data?.sender?.user_id || r?.data?.user_id || '');
+  } catch { return ''; }
+}
+
+async function sendGroupQuote(groupId, messageId, text, atQq = '') {
+  // 2026-11-24 按群聊语料补:群里 94% 的「引用回复」都带被引用者的 @(QQ 客户端会自动加);
+  // atQq 可以是数组(模型用 send_at 指定的人优先),@ 机器人自己 / 作者不明时不加。
+  const qqList = [...new Set((Array.isArray(atQq) ? atQq : [atQq])
+    .map(q => String(q || '').trim())
+    .filter(q => q && q !== BOT_ID))].slice(0, 3);
+  const atSeg = qqList.flatMap(qq => ([{ type: 'at', data: { qq } }, { type: 'text', data: { text: ' ' } }]));
   if (DRY_RUN) { log('  [DRY_RUN] 不发送(引用)', text.slice(0, 30), C.yellow); return null; }
   if (isDeadGroup(groupId)) throw new DeadGroupError(`本群已被标记为不可发送,不再尝试: ${groupId}`);
   const r = await api('send_group_msg', {
     group_id: groupId,
     message: [
       { type: 'reply', data: { id: String(messageId) } },
+      ...atSeg,
       { type: 'text', data: { text } },
     ],
   });
@@ -1898,15 +2378,15 @@ async function sendGroupReaction(messageId, emojiId) {
  * used 计数由调用方每轮持有;返回 { content, sideSent }。
  */
 async function execQqTool(name, args, entry, used, quoteLog = null) {
-  const mid = String(args.message_id || entry?.message_id || '').trim();
+  const mid = String(args.message_id || entry?.message_id || '').trim().replace(/^#/, '');
   if (name === 'list_stickers') {
     return { content: stickerCatalogText(), sideSent: false };
   }
   if (name === 'send_sticker') {
     if ((used.sticker || 0) >= 2) return { content: '本次已经安排 2 张表情包,别再发了。', sideSent: false };
-    const picked = belialResolveSticker({ name: args.name, scene: args.scene });
+    const picked = kitResolveSticker({ name: args.name, scene: args.scene });
     if (!picked) return { content: '表情包库是空的,没图可发。', sideSent: false };
-    const seg = belialStickerSegment(picked);
+    const seg = kitStickerSegment(picked);
     if (!seg) return { content: `表情包《${picked}》读不出来。`, sideSent: false };
     used.sticker = (used.sticker || 0) + 1;
     try {
@@ -1918,13 +2398,40 @@ async function execQqTool(name, args, entry, used, quoteLog = null) {
   if (name === 'list_reactions') {
     return { content: reactionCatalogText(args.query || ''), sideSent: false };
   }
+  if (name === 'list_group_members') {
+    try {
+      const list = await groupRoster(entry.group_id);
+      return { content: groupMembersText(entry.group_id, list, args.query || ''), sideSent: false };
+    } catch (e) {
+      return { content: `读群成员名单失败:${e.message}。可以直接填 QQ 号,或稍后再试。`, sideSent: false };
+    }
+  }
+  if (name === 'send_at') {
+    const text = String(args.text || '').replace(/[\r\n\t]+/g, ' ').trim().slice(0, 200);
+    if ((used.at || 0) >= 2) return { content: '本次 @ 操作次数已用完(2 次)。', sideSent: false };
+    const hit = await resolveAtTarget(entry.group_id, args.target);
+    if (!hit.ok) return { content: hit.message, sideSent: false };
+    used.at = (used.at || 0) + 1;
+    if (!text) {
+      // 普通闲聊的正文在另一条消息里:记在 entry 上,由 processAiChat 发给 sendReply。
+      if (entry) entry.__atQqs = [...new Set([...(entry.__atQqs || []), hit.qq])].slice(0, 3);
+      log('  📣 本次回复改 @:', `${hit.name}(${hit.qq})`, C.green);
+      return { content: `已把本次回复开头改成 @${hit.name};正文正常写,不要再写 @。`, sideSent: false };
+    }
+    if (entry) entry.__atSent = true;   // 已单独发过 @,普通闲聊的兜底别再补
+    try {
+      await sendGroupAt(entry.group_id, hit.qq, text);
+      log('  📣 @ 消息:', `@${hit.name}(${hit.qq}) ${text.slice(0, 30)}`, C.green);
+      return { content: `已发出 @${hit.name} 的消息(独立一条)。正文里不要再写 @,也别把这段再写进正文(会重复)。`, sideSent: true };
+    } catch (e) { return { content: `发 @ 消息失败:${e.message}`, sideSent: false }; }
+  }
   if (name === 'send_quote') {
     const text = String(args.text || '').trim().slice(0, 200);
     if (used.quote >= 2) return { content: '本次引用回复次数已用完(2 次)。', sideSent: false };
     if (!text || !mid) return { content: '引用回复缺 text 或 message_id。', sideSent: false };
     used.quote++;
     try {
-      await sendGroupQuote(entry.group_id, mid, text);
+      await sendGroupQuote(entry.group_id, mid, text, await messageAuthorQq(mid));
       if (Array.isArray(quoteLog)) quoteLog.push(text);
       log('  💬 引用回复:', text.slice(0, 30), C.green);
       return { content: '已发出引用回复(独立一条)。正文里不要再重复这句话,只写补充。', sideSent: true };
@@ -1945,7 +2452,7 @@ async function execQqTool(name, args, entry, used, quoteLog = null) {
   if (name === 'react_message') {
     const emoji = String(args.emoji || '赞').trim();
     const eid = reactionIdOf(emoji);
-    if (used.react >= 2) return { content: '本次贴表情次数已用完(2 次)。', sideSent: false };
+    if (used.react >= 3) return { content: '本次贴表情次数已用完(3 次)。', sideSent: false };
     if (!eid || !mid) {
       const sug = reactionSuggestions(emoji);
       return { content: `没找到这个贴表情:${emoji || '(空)'}${sug ? `;可能是 ${sug}` : ''}。先 list_reactions(query) 从 QQ 表情目录查名字,再贴。`, sideSent: false };
@@ -2019,44 +2526,205 @@ function stripQuotedText(text, quotes = []) {
     .join('\n');
 }
 
+/** 去重用的归一化:去掉空白和中英文标点,只留字。 */
+function dupNorm(s) {
+  return String(s || '').replace(/[\s，,。.!！?？~～、；;：:"'“”‘’（）()【】\[\]—…\-]/g, '');
+}
+function dupBigrams(s) {
+  const set = new Set();
+  for (let i = 0; i + 1 < s.length; i++) set.add(s.slice(i, i + 2));
+  return set;
+}
+/** 两句是不是同一句(改几个标点、多一两个字也算)。 */
+function dupSimilar(a, b) {
+  const x = dupNorm(a), y = dupNorm(b);
+  if (!x || !y) return false;
+  if (x === y) return true;
+  if (x.includes(y) || y.includes(x)) return Math.min(x.length, y.length) / Math.max(x.length, y.length) >= 0.6;
+  if (x.length < 6 || y.length < 6 || Math.abs(x.length - y.length) > 6) return false;
+  const ga = dupBigrams(x), gb = dupBigrams(y);
+  let hit = 0;
+  for (const g of ga) if (gb.has(g)) hit++;
+  return hit / Math.max(1, Math.min(ga.size, gb.size)) >= 0.4;
+}
+/** piece 是不是「已经说过的几句拼起来」(模型把整段正文塞进 send_at.text)。 */
+function dupCovered(piece, texts) {
+  let rest = dupNorm(piece);
+  if (rest.length < 4) return false;
+  const pool = texts.map(dupNorm).filter(t => t.length >= 3).sort((a, b) => b.length - a.length);
+  for (const t of pool) {
+    let i;
+    while ((i = rest.indexOf(t)) >= 0) rest = rest.slice(0, i) + rest.slice(i + t.length);
+  }
+  return rest.length <= 2;
+}
+
 /**
- * 发一条人格回复:文本 1~3 条(第一条 @ 触发者,后续不 @),然后把模型通过
- * send_voice / send_sticker 工具安排的语音、表情包逐条单独发出去。
- * 顺序:引用 → 文字 → 语音 → 表情包(引用像接着对方的话,表情包最后收尾)。
+ * 正文分行去重:模型偶尔把同一句写两遍(或拆行拆出重复)。
+ * 2026-11-17 用户报「同样的话发两份」,顺手在发送前兜一层。
+ */
+function dedupeReplyLines(lines, quotedTexts) {
+  const said = [...quotedTexts];
+  const kept = [];
+  for (const line of lines) {
+    if (said.some(s => dupSimilar(line, s))) { log('  ✂ 跳过重复的行:', String(line).slice(0, 30), C.yellow); continue; }
+    kept.push(line);
+    said.push(line);
+  }
+  return kept;
+}
+
+/**
+ * 独立 @ 消息去重(2026-11-17 用户报「同样的话发两份」):
+ * 模型有时把整段正文又塞进 send_at.text,于是同一套话说两遍。
+ * 正文/引用里已经说过的就不发这条 @ 消息;但 @ 的对象不丢——并进正文第一条的 @ 目标。
+ */
+function dedupeReplyAts(lines, quotedTexts, mainAts, textAts) {
+  const said = [...quotedTexts, ...lines];
+  const kept = [];
+  for (const a of textAts) {
+    const dup = said.some(s => dupSimilar(a.text, s)) || dupCovered(a.text, said);
+    if (!dup) { kept.push(a); said.push(a.text); continue; }
+    log('  ✂ 跳过重复的 @ 消息:', '@' + (a.name || a.qq) + ' ' + String(a.text).slice(0, 30), C.yellow);
+    if (!mainAts.some(m => String(m.qq) === String(a.qq))) mainAts.push({ qq: a.qq, name: a.name, main: true });
+  }
+  return kept;
+}
+
+/**
+ * 发一条人格回复:文本 1~3 条(第一条 @ 谁由 send_at 定,没人就都不 @,后续不 @),然后把模型通过
+ * send_voice / send_sticker / send_at 工具安排的语音、@ 消息、表情包逐条单独发出去。
+ * 顺序:引用 → 文字 → 独立 @ 消息 → 语音 → 表情包(引用像接着对方的话,表情包最后收尾)。
  * 用户 2026-10-26:「可能回复 1-3 句,表情包独立成句,符合真人发送习惯」。
  * 2026-10-29:人格参数化(贝利亚 / 脚刷周);引用回复改为**排队到最后统一发**,
  * 并过滤正文里重复引用文本的行,治「引用 + 正文各发一遍」。
+ * 2026-11-14:send_at 工具可改第一条的 @ 对象(默认仍是触发者),也可附一条独立 @ 消息。
+ * 2026-11-24:AI 闲聊不再强制 @ 触发者(at=false),模型不调 send_at 就谁都不 @;
+ * 引用回复按 QQ 客户端原生样式补 @ 被引用者(群聊语料:94% 的引用都带作者 @),与正文的 @ 去重。
+ * 2026-11-26:模型点名了别人(send_at 带不带 text 都算)时,引用**不再**补 @ 作者 —— 作者常常就是
+ * 叫你骂人的那个人;@ 跟着模型那条 @ 消息 / 正文第一句走,同一句别连着 @ 两遍;
+ * 只有正文被引用吃掉、后面没有消息能带 @ 时,才把模型点的目标挂到引用上,别把 @ 丢掉。
  */
-async function sendBelialReply(entry, text, { persona = PERSONA_SPECS.belial, stickers = [], cachedPics = [], voices = [], at = true, sideSent = false, quotes = [] } = {}) {
+async function sendBelialReply(entry, text, { persona = PERSONA_SPECS[JSZ_ID], stickers = [], cachedPics = [], voices = [], at = true, sideSent = false, quotes = [], ats = [], focusQq = '' } = {}) {
   const gid = entry.group_id;
   const stickerApi = persona.sticker;
+  const focus = String(focusQq || '').trim();
   const quoted = (quotes || []).slice(0, 2);
+  // 点名骂/评价 @X 时,**绝不 @ 叫你的人**(即使模型自己 @ 了他):把他的 @ 摘掉,带 text 的降级成普通一句。
+  const protectRequester = !!focus && focus !== String(BOT_ID) && focus !== String(entry.user_id);
+  const requesterAtTexts = [];
+  const atsSafe = (ats || []).filter(a => {
+    if (a && a.qq && protectRequester && String(a.qq) === String(entry.user_id)) {
+      if (a.text) requesterAtTexts.push(String(a.text));
+      log('  ✂ 去掉对需求方的 @:', `${a.name || a.qq}${a.text ? `(${String(a.text).slice(0, 20)})` : ''}`, C.yellow);
+      return false;
+    }
+    return true;
+  });
+  const mainAts = atsSafe.filter(a => a?.main && a.qq);
+  const textAts = atsSafe.filter(a => a && !a.main && a.text);
+  // 先把正文算出来:引用会把正文里重复的那句吃掉;「正文没了」时模型指定的 @ 要挂到引用上。
+  const cleanText = stripQuotedText(text, quoted.map(q => q.text));
+  const rawLines = cleanText ? persona.split(cleanText, persona.splitOpts) : [];
+  const quotedTexts = quoted.map(q => q.text);
+  const lines = dedupeReplyLines(rawLines, quotedTexts).concat(requesterAtTexts.map(s => String(s).trim()).filter(Boolean));
+  const keptAts = dedupeReplyAts(lines, quotedTexts, mainAts, textAts);
+  // 2026-11-26 用户报「复合调用引用 + @ 攻击时 @ 错人」:有人发「骂两句 @X」,模型引用了**叫你的人**的
+  // 消息、又用 send_at(text=骂人的话) @ 了 X;旧逻辑只认 mainAts,引用就按 QQ 原生习惯补了作者(@ 到
+  // 叫你的人),看起来像在骂叫你的人。用户要求:只 @ 被攻击的人,@ 跟着骂人的那句走,绝不 @ 需求方。
+  // 所以:模型点过的人(mainAt / 带 text 的 at / 兜底点名的人)统一算「本次要 @ 的人」;引用不再抢 @ 作者;
+  // 只有「除了引用没有别的消息能带 @」时才把 @ 挂到引用上(不然 @ 会丢)。
+  const targetQqs = [...new Set([...mainAts, ...keptAts].map(a => String(a.qq || '')).concat(focus ? [focus] : []))]
+    .filter(q => q && q !== String(BOT_ID)).slice(0, 3);
+  const atElsewhere = lines.length > 0 || keptAts.length > 0;   // 正文 / 独立 @ 消息里还有人能承载 @
+  const carriedQqs = new Set();      // 已经 @ 过谁:同一句别连着 @ 两遍
+  let atCarried = false;
+  let attackSent = false;
+  let attackText = '';
+  // 点名让骂/评价 @X(2026-11-26 线上):第一条就冲 X 去,@ 在句首;不要「先回叫你的人一句再骂」。
+  // 模型把骂人的话放在 send_at.text 里就先把那条发出去;只放在正文里就把正文第一句提上来 @ 他。
+  if (focus && focus !== String(BOT_ID)) {
+    const ki = keptAts.findIndex(a => String(a.qq) === focus);
+    if (ki >= 0) {
+      const a = keptAts.splice(ki, 1)[0];
+      try {
+        await sendGroupAt(gid, a.qq, a.text);
+        carriedQqs.add(String(a.qq)); atCarried = true; attackSent = true; attackText = a.text;
+        log(`  ${persona.cn} 点名攻击 → 先 @ ${a.name || a.qq}:`, a.text.slice(0, 30), C.green);
+      } catch (e) { log('  点名攻击那条发不出:', e.message, C.yellow); keptAts.unshift(a); }
+    } else if (lines.length) {
+      const first = lines.shift();
+      try {
+        await sendReply(entry, first, { atQqs: [focus] });
+        carriedQqs.add(String(focus)); atCarried = true; attackSent = true; attackText = first;
+        log(`  ${persona.cn} 点名攻击 → 先 @ 他说:`, first.slice(0, 30), C.green);
+      } catch (e) { log('  点名攻击那条发不出:', e.message, C.yellow); lines.unshift(first); }
+    }
+  }
   let quoteOk = 0;
-  for (const q of quoted) {
+  for (let qi = 0; qi < quoted.length; qi++) {
+    const q = quoted[qi];
+    const authorQq = q.qq ? String(q.qq) : '';
+    // 模型点名了别人 → 引用不 @ 作者,也不抢 @ 目标(@ 留给骂人的那句/正文第一句);
+    // 只有后面没消息可挂时,才把目标挂到引用上。没点名 → 照 QQ 原生样式 @ 被引用者。
+    const quoteAts = atCarried
+      ? []
+      : (targetQqs.length
+        ? (qi === 0 && !atElsewhere ? targetQqs : [])
+        : (authorQq && authorQq !== String(BOT_ID) ? [authorQq] : []));
     try {
-      await sendGroupQuote(gid, q.message_id, q.text);
+      await sendGroupQuote(gid, q.message_id, q.text, quoteAts);
       quoteOk++;
-      log('  💬 引用回复:', String(q.text || '').slice(0, 30), C.green);
+      if (qi === 0) {
+        for (const qq of quoteAts) carriedQqs.add(String(qq));
+        if (quoteAts.length) atCarried = true;
+      }
+      log('  💬 引用回复:', `${String(q.text || '').slice(0, 30)}${quoteAts.length ? ` @${quoteAts.join(',')}` : ''}`, C.green);
     } catch (e) {
       log('  引用回复失败:', e.message, C.yellow);
     }
     await new Promise(r => setTimeout(r, persona.gap));
   }
-  const cleanText = stripQuotedText(text, quoted.map(q => q.text));
-  const lines = cleanText ? persona.split(cleanText, persona.splitOpts) : [];
-  if (!lines.length && !stickers.length && !cachedPics.length && !voices.length && !quoteOk) {
+  if (!lines.length && !stickers.length && !cachedPics.length && !voices.length && !quoteOk && !keptAts.length && !attackSent) {
     if (sideSent) return;                 // 只发了表情/贴表情等动作,没有正文
     throw new Error('模型没说人话(空回复)');
   }
   for (let i = 0; i < lines.length; i++) {
     if (i) await new Promise(r => setTimeout(r, persona.gap));
-    if (i === 0 && at) await sendReply(entry, lines[i]); // @ 这条路第一条 @ 触发者
-    else await sendGroupText(gid, lines[i]);             // 非 @ 路 / 后续补话都不 @
+    // 第一条:引用已经替它 @ 过模型点名的人就不再 @;否则由 mainAts 决定,at=true(激活/系统语)才回退 @ 触发者。
+    // AI 闲聊传 at=false —— 模型不调 send_at 就谁都不 @(2026-11-24 用户要求,避免和 send_at 撞车)。
+    if (i === 0 && !atCarried && mainAts.length) {
+      const firstQqs = mainAts.map(a => a.qq);
+      await sendReply(entry, lines[i], { atQqs: firstQqs });
+      for (const qq of firstQqs) carriedQqs.add(String(qq));
+      atCarried = true;
+    } else if (i === 0 && !atCarried && at) {
+      await sendReply(entry, lines[i]);
+    } else {
+      await sendGroupText(gid, lines[i]);                // 已经 @ 过 / 后续补话都不 @
+    }
     log(`  ${persona.cn} ${i + 1}/${lines.length}:`, lines[i], C.green);
   }
-  if (lines.length) belialRemember(gid, lines);          // 记进本群「最近说过」,防下一轮复读
+  if (attackText || lines.length) belialRemember(gid, attackText ? [attackText, ...lines] : lines);   // 记进本群「最近说过」,防下一轮复读
+  // 模型安排的独立 @ 消息(如「@张三 你来解释」),紧跟正文发;
+  // 如果这条消息要 @ 的人第一条里已经 @ 过(引用/正文),就只发文字,别连着 @ 两遍。
+  for (const a of keptAts.slice(0, 2)) {
+    await new Promise(r => setTimeout(r, persona.gap));
+    try {
+      if (carriedQqs.has(String(a.qq))) {
+        await sendGroupText(gid, a.text);
+        log(`  ${persona.cn} 补一句(已 @ ${a.name || a.qq}):`, a.text.slice(0, 30), C.green);
+      } else {
+        await sendGroupAt(gid, a.qq, a.text);
+        carriedQqs.add(String(a.qq));
+        log(`  ${persona.cn} @ ${a.name || a.qq}:`, a.text.slice(0, 30), C.green);
+      }
+    } catch (e) {
+      log(`  ${persona.cn} @ 消息发送失败:`, e.message, C.yellow);
+    }
+  }
   // 语音:模型自己选声源/内容,每条单独发;发不出去不影响文字
-  for (const v of voices.slice(0, BELIAL_MAX_VOICES)) {
+  for (const v of voices) {
     await new Promise(r => setTimeout(r, persona.gap));
     const seg = voiceSegment(v.path);
     if (!seg) { log(`  ${persona.cn}语音:`, `${v.label || v.voice} 音频已不存在,跳过`, C.yellow); continue; }
@@ -2068,7 +2736,7 @@ async function sendBelialReply(entry, text, { persona = PERSONA_SPECS.belial, st
     }
   }
   // 联网下载的缓存图:和表情包一样独立成条,但不占表情包库
-  for (const pic of cachedPics.slice(0, persona.maxStickers)) {
+  for (const pic of cachedPics) {
     await new Promise(r => setTimeout(r, persona.gap));
     if (!pic?.path || !existsSync(pic.path)) { log(`  ${persona.cn}缓存图:`, `${pic?.id || ''} 已不存在,跳过`, C.yellow); continue; }
     try {
@@ -2079,7 +2747,7 @@ async function sendBelialReply(entry, text, { persona = PERSONA_SPECS.belial, st
     }
   }
   // 表情包:模型自己挑的,每条单独发;发不出去不影响文字
-  for (const name of stickers.slice(0, persona.maxStickers)) {
+  for (const name of stickers) {
     await new Promise(r => setTimeout(r, persona.gap));
     const seg = stickerApi.segment(name);
     if (!seg) { log(`  ${persona.cn}表情包:`, `${name} 已不存在,跳过`, C.yellow); continue; }
@@ -2093,15 +2761,17 @@ async function sendBelialReply(entry, text, { persona = PERSONA_SPECS.belial, st
 }
 
 /**
- * 银河皇帝「没被 @ 也接话」:40% 概率,只接普通聊天(跳过指令/关键词/@/机器人自己)。
+ * 人格「没被 @ 也接话」:按概率接,只接普通聊天(跳过指令/关键词/@/机器人自己;也可按群关掉)。
  * 走和 @ 那条一样的工具/人格/防复读,但所有消息都不 @ 人。
  */
 async function belialOnMessage(j) {
   if (!j || j.post_type !== 'message' || j.message_type !== 'group') return false;
   const gid = j.group_id;
   if (processing) return false;                            // @ 队列在跑时先别插嘴,避免回复交叉
-  if (!belialOn(gid)) return false;
+  if (!personaModeOn(gid)) return false;
   const persona = personaOf(gid);
+  // 2026-11-26:按群关掉「不 @ 也自动接话」(例如群 793874011 没有聊天需求);@ 回复不受影响。
+  if (!autoReplyOf(gid)) return false;
   if (String(j.user_id) === String(BOT_ID) || String(j.sender?.user_id) === String(BOT_ID)) return false;
   if (isQqBuiltinBot(j) || mentionsBotRaw(j)) return false;
   if (isAutoReplyIgnored(j.user_id)) return false;        // 只跳过自动接话;@ 走 inbox,不受影响
@@ -2134,12 +2804,13 @@ async function belialOnMessage(j) {
           anchorId: entry.message_id,
           beforeSeq: entry.seq,
           beforeTime: entry.time,
+          withIds: true,
         });
         if (tr?.lines) {
           ctx = `群聊记录(最近 ${BELIAL_NONAT_CTX} 条,格式 "HH:MM 昵称|内容";带「昨天/前天/M-D」前缀的是更早的消息,不是刚发生):\n${tr.lines}\n\n`;
           names = tr.names;
         }
-      } catch (e) { log('  银河皇帝非@取上下文失败(裸答):', e.message, C.yellow); }
+      } catch (e) { log('  人格非@取上下文失败(裸答):', e.message, C.yellow); }
     }
     let q = raw, images = [];
     try {
@@ -2152,8 +2823,8 @@ async function belialOnMessage(j) {
       });
       if (rich?.text) q = rich.text;
       images = rich?.images || [];
-    } catch (e) { log('  银河皇帝非@消息解析失败(纯文本):', e.message, C.yellow); }
-    q = q.replace(/@你\((?:史官|贴吧鱼|贝利亚|脚刷周|西比拉|记忆测试)\)/g, ' ').replace(/\s+/g, ' ').trim() || raw;
+    } catch (e) { log('  人格非@消息解析失败(纯文本):', e.message, C.yellow); }
+    q = q.replace(/@你\((?:史官|贴吧鱼|脚刷周|W14|记忆测试)\)/g, ' ').replace(/\s+/g, ' ').trim() || raw;
     const system = persona.systemPrompt({
       now: nowText(),
       hasImages: images.length > 0,
@@ -2162,7 +2833,7 @@ async function belialOnMessage(j) {
       scope: { group: entry.group_id, user: entry.user_id },
       query: q,
     });
-    const result = await aiChatBelial(entry, system, `${ctx}刚说话的人: ${entry.nickname}\nTA 的话: ${q}`, images, persona);
+    const result = await aiChatBelial(entry, system, `${ctx}刚说话的人: ${entry.nickname}\nTA 的话: ${q}`, images, persona, { at: false });
     const ageMs = Date.now() - (Number(entry.time) || 0) * 1000;
     if (entry.time && ageMs > BELIAL_NONAT_MAX_AGE_MS) {
       log(`  ${persona.cn}(非@)回复过期,跳过:`, `${Math.round(ageMs / 1000)}s > ${Math.round(BELIAL_NONAT_MAX_AGE_MS / 1000)}s`, C.dim);
@@ -2191,13 +2862,16 @@ async function belialOnMessage(j) {
 /** 启动横幅上那一段人格摘要(哪几个群开着、每群用的谁、表情包几张) */
 function belialStartupText() {
   if (!AI_API_KEY) return 'OFF(没配聊天 key)';
-  const st = belialAll();
+  const st = personaAll();
   const on = st.all ? ['全部群'] : st.groups.filter(g => g !== '*');
-  const mt = on.filter(g => g !== '*' && st.personas?.[g] === SIBYL_ID).length;
+  const w14 = on.filter(g => g !== '*' && st.personas?.[g] === W14_ID).length;
   const js = on.filter(g => g !== '*' && st.personas?.[g] === JSZ_ID).length;
-  const bel = Math.max(0, on.length - js - mt);
-  const ap = belialAutoProbsOf();
-  return `${on.length ? `${on.join(',')}(贝利亚 ${bel} / 脚刷周 ${js}${mt ? ` / 西比拉 ${mt}` : ''})` : '全部关闭'}(表情包 贝利亚 ${belialStickers().length} + 脚刷周 ${jszStickers().length} 张,声线 ${voiceModeLabel(readVoiceMode())},非@ ${belialNonAtAutoOf() ? `自动(${Math.round(ap.max * 100)}%→${Math.round(ap.min * 100)}%)` : `${Math.round(belialNonAtProbOf() * 100)}%`},模型自主发)`;
+  const manual = on.filter(g => g !== '*' && st.autoReply?.[g] === false).length;
+  const ap = personaAutoProbsOf();
+  const names = [];
+  if (js) names.push(`脚刷周 ${js}`);
+  if (w14) names.push(`W14 ${w14}`);
+  return `${on.length ? `${on.join(',')}(${names.join(' / ') || '默认人格'})` : '全部关闭'}(群档案+做梦记忆;表情包 共用 ${kitStickers().length} + 脚刷周 ${jszStickers().length} 张,声线 ${voiceModeLabel(readVoiceMode())},非@ ${personaNonAtAutoOf() ? `自动(${Math.round(ap.max * 100)}%→${Math.round(ap.min * 100)}%)` : `${Math.round(personaNonAtProbOf() * 100)}%`}${manual ? `,${manual} 群已关自动接话` : ''},贴表情 ${Math.round(personaReactProbOf() * 100)}%,模型自主发)`;
 }
 
 /**
@@ -2256,18 +2930,18 @@ async function applyBotGroupCard(gid, card) {
 }
 /** 切人格:第一次切之前记下原名片,再设成该人格的名片 */
 async function applyPersonaCard(gid, spec) {
-  if (belialOriginalCardOf(gid) === undefined) {
+  if (originalCardOf(gid) === undefined) {
     const cur = await fetchBotGroupCard(gid);
-    if (cur !== undefined) belialSetOriginalCard(gid, cur);
+    if (cur !== undefined) setOriginalCard(gid, cur);
   }
   return applyBotGroupCard(gid, spec.card);
 }
 /** 关人格:恢复原名片;恢复成功才清掉记录(失败留着下次再试) */
 async function restoreBotGroupCard(gid) {
-  const orig = belialOriginalCardOf(gid);
+  const orig = originalCardOf(gid);
   if (orig === undefined) return false;
   const ok = await applyBotGroupCard(gid, orig);
-  if (ok) belialClearOriginalCard(gid);
+  if (ok) clearOriginalCard(gid);
   return ok;
 }
 
@@ -2279,9 +2953,9 @@ function scheduleCardRestore(gid) {
   const delays = [30000, 120000, 300000];
   const tick = async (i) => {
     cardRestoreTimers.delete(gid);
-    if (belialOriginalCardOf(gid) === undefined) return;
+    if (originalCardOf(gid) === undefined) return;
     await restoreBotGroupCard(gid);
-    if (belialOriginalCardOf(gid) !== undefined && i + 1 < delays.length) {
+    if (originalCardOf(gid) !== undefined && i + 1 < delays.length) {
       cardRestoreTimers.set(gid, setTimeout(() => tick(i + 1), delays[i + 1]));
     }
   };
@@ -2293,7 +2967,7 @@ function scheduleCardApply(gid, spec) {
   const delays = [30000, 120000];
   const tick = async (i) => {
     cardApplyTimers.delete(gid);
-    if (!belialOn(gid) || personaIdOf(gid) !== spec.id) return;
+    if (!personaModeOn(gid) || personaIdOf(gid) !== spec.id) return;
     const ok = await applyPersonaCard(gid, spec);
     if (!ok && i + 1 < delays.length) {
       cardApplyTimers.set(gid, setTimeout(() => tick(i + 1), delays[i + 1]));
@@ -2311,7 +2985,7 @@ function scheduleCardApply(gid, spec) {
 async function processPersonaSwitch(entry, cmd, personaId) {
   const gid = entry.group_id;
   const spec = PERSONA_SPECS[personaId];
-  const onNow = belialOn(gid);
+  const onNow = personaModeOn(gid);
   const current = personaOf(gid);
   if (cmd.on === null) {                                   // 只喊「…状态」→ 报状态(不带关闭提示)
     if (!onNow) await sendReply(entry, spec.status(false));
@@ -2320,14 +2994,14 @@ async function processPersonaSwitch(entry, cmd, personaId) {
     return;
   }
   if (!cmd.on) {                                           // 关闭:任何时候都允许(不需要 key)
-    const r = belialSetOn(gid, false);
+    const r = personaSetOn(gid, false);
     if (!r.ok) {
       await sendReply(entry, '……状态写不进去,稍后再试。');
       return;
     }
     log(`  ${spec.feature}:`, `${gid} → OFF`, C.green);
     const restored = await restoreBotGroupCard(gid);       // 恢复切人格前的群名片(失败不影响关闭)
-    if (!restored && belialOriginalCardOf(gid) !== undefined) scheduleCardRestore(gid);
+    if (!restored && originalCardOf(gid) !== undefined) scheduleCardRestore(gid);
     await sendReply(entry, spec.off());
     return;
   }
@@ -2344,7 +3018,7 @@ async function processPersonaSwitch(entry, cmd, personaId) {
     await sendBelialReply(entry, spec.again(), { persona: spec });
     return;
   }
-  const r = belialSetPersona(gid, personaId);              // 设人格 + 打开本群
+  const r = personaSet(gid, personaId);              // 设人格 + 打开本群
   if (!r.ok) {
     await sendReply(entry, '……状态写不进去,稍后再试。');
     return;
@@ -2354,10 +3028,6 @@ async function processPersonaSwitch(entry, cmd, personaId) {
   await sendBelialReply(entry, spec.activation(), { persona: spec });
 }
 
-/** 兼容旧调用/自测:银河皇帝开关 */
-export async function processBelialSwitch(entry, cmd) {
-  return processPersonaSwitch(entry, cmd, 'belial');
-}
 /** 脚刷周开关(分流器/自测用) */
 export async function processJszSwitch(entry, cmd) {
   return processPersonaSwitch(entry, cmd, JSZ_ID);
@@ -2371,7 +3041,7 @@ export async function processJszSwitch(entry, cmd) {
 // 为什么不能照搬 AI 闲聊那条路(几条关键差异,改之前先看):
 //   · AI 闲聊**只处理 @ 消息**(entry 从 inbox 来);贴吧模式处理的是**没 @ 的普通群消息**,不进 inbox、
 //     不写 processed.jsonl(它没有 seq 条目的概念),所以走 WS 层直接触发,与 processQueue 那条队列无关;
-//   · AI 闲聊的回调 sendReply 会**先 @ 提问者**;贴吧模式**不许 @ 人**(用户明确定调),所以另走 sendGroupText;
+//   · AI 闲聊的回复以前**先 @ 提问者**,2026-11-24 起改由模型用 send_at 自己选(`at=false`),可以完全不 @;贴吧模式**不许 @ 人**(用户明确定调),所以另走 sendGroupText;
 //   · AI 闲聊要联网查证;贴吧模式把联网整个关掉(短、快、嘴臭,查证反而坏事);
 //   · 用户明确说**不加冷却/限频** —— 所以这里没有 aiCooldown 那类节流,只在同一群正在生成时跳过并发。
 const tiebaBusy = new Set();          // 正在生成的群(同一群同时只跑一条,避免几十条消息并发叫模型)
@@ -2462,7 +3132,6 @@ export function isKeywordMessage(j) {
   if (isArenaCommandText(text)) return true;                   // 绑定 / 历史(MC 天梯)
   if (isHelpRequest(text)) return true;
   if (parseModeCommand(text).triggered) return true;
-  if (belialParseCmd(text).triggered) return true;             // 「银河皇帝」自己也不接(走分流器)
   if (jszParseCmd(text).triggered) return true;                // 「脚刷周模式」自己也不接(走分流器)
   if (parseTiebaCmd(text).triggered) return true;              // 「贴吧模式 开/关」自己也不接
   if (text.includes(TRIGGER_KEYWORD)) return true;             // 史记总结
@@ -2500,8 +3169,7 @@ export function isNonAtCommandText(text) {
   if (/^(?:\/help|帮助)(?:\s|$|[!！。.~～?？])/i.test(t)) return true;
   if (/^(?:mode|模式)/i.test(t) && parseModeCommand(t).triggered) return true;
   if (/^贴吧模式/.test(t) && parseTiebaCmd(t).triggered) return true;
-  if (/^(?:银河皇帝|贝利亚|脚刷周)/.test(t)
-    && (belialParseCmd(t).triggered || jszParseCmd(t).triggered)) return true;
+  if (/^(?:脚刷周|W14)/.test(t) && jszParseCmd(t).triggered) return true;
   const starts = [
     TRIGGER_KEYWORD, DAILY_KEYWORD, KUANGSHEN_TRIGGER, SHIT_AI_TRIGGER, SHIT_TRIGGER,
     RULING_FULL_TRIGGER, RULING_TRIGGER, CARD_IMG_TRIGGER, CARD_TRIGGER,
@@ -2680,16 +3348,29 @@ async function updateCardDb() {
       }
     }
     const json = extractZipCardJson(zipBuf);         // 解压出 cards.json 文本
-    let count;
-    try { count = Object.keys(JSON.parse(json)).length; }
+    let db;
+    try { db = JSON.parse(json); }
     catch { throw new Error('卡库 JSON 损坏,已放弃(旧卡库不受影响)'); }
+    let count = Object.keys(db).length;
     if (count < 10000) throw new Error(`卡库数据异常(仅 ${count} 张,期望 ≥10000),已放弃`); // 防截断/错误数据
+    // 百鸽只收「官方 DB 已更新」的卡(新卡要等发售日); 萌卡「超先行卡」公布即收录。
+    // 把百鸽还没有的先行卡并进来, 百鸽正式收录后先行条目自动退场(见 ygocard/superpre.mjs)。
+    let spNote = '';
+    try {
+      const spList = await fetchSuperPreCards();
+      const r = mergeSuperPre(db, spList);
+      count = r.total;
+      if (r.added || r.removed) spNote = `(超先行卡 ${r.added} 张${r.removed ? `, 退场 ${r.removed}` : ''})`;
+      log(`  超先行卡: 萌卡列表 ${spList.length} 张 → 并入 ${r.added} 张${r.removed ? `, 已正式收录退场 ${r.removed} 张` : ''}`, '', C.dim);
+    } catch (e) {
+      log('  超先行卡合并失败(不影响百鸽卡库):', e.message, C.yellow);
+    }
     const path = getCardsPath();
     const tmp = path + '.tmp';
-    writeFileSync(tmp, json, 'utf8');
+    writeFileSync(tmp, JSON.stringify(db), 'utf8');
     renameSync(tmp, path);                           // 原子替换(失败不会损坏旧卡库)
     const n = reloadCards();
-    log(`卡库更新完成: ${n} 张卡 → ${path}`, '', C.green);
+    log(`卡库更新完成: ${n} 张卡${spNote} → ${path}`, '', C.green);
     // 卡图同步更新:卡库文件已换新,补下载新卡/缺失卡图(已有自动跳过,增量很快)
     try {
       log('卡图更新:下载缺失卡图(跳过已有)...', '', C.cyan);
@@ -2741,20 +3422,18 @@ function sendFailure(r, groupId) {
   return new Error(`发送失败: ${detail}`);
 }
 
-async function sendReply(entry, message) {
+async function sendReply(entry, message, { atQqs = null } = {}) {
   // 兼容三种形态: 字符串(文本) / 段数组(如文本+图片) / 单个段对象(如仅图片)
   const segs = Array.isArray(message)
     ? message
     : typeof message === 'string'
       ? [{ type: 'text', data: { text: noLead(message) } }]
       : [message];
+  // 默认 @ 触发者(普通功能回复);AI 闲聊不再默认 @,改走 sendGroupText 或显式 atQqs(2026-11-24)。
   // 2026-11-18:不 @ 机器人触发关键词功能的消息(entry.noAt),回复也不 @ 任何人。
-  const prefix = entry.noAt ? [] : [
-    { type: 'at', data: { qq: String(entry.user_id) } },
-    // @ 段后补一个空格:2026-10-26 用户反馈,没有空格时 QQ 不会把 @ 真解析成 mention
-    // (显示成普通文本)。空格是独立 text 段,不会进正文、也不会像换行那样多出空行。
-    { type: 'text', data: { text: ' ' } },
-  ];
+  const defaultQqs = entry.noAt ? [] : [entry.user_id];
+  const qqs = [...new Set((Array.isArray(atQqs) && atQqs.length ? atQqs : defaultQqs)
+    .map(q => String(q)).filter(Boolean))].slice(0, 3);
   if (DRY_RUN) {
     const first = segs.find(s => s.type === 'text')?.data?.text || '(图片)';
     log(`  [DRY_RUN] 不发送: ${first.split('\n')[0].slice(0, 50)} ...`, '', C.yellow);
@@ -2764,7 +3443,10 @@ async function sendReply(entry, message) {
   const r = await api('send_group_msg', {
     group_id: entry.group_id,
     message: [
-      ...prefix,
+      ...qqs.map(qq => ({ type: 'at', data: { qq } })),
+      // @ 段后补一个空格:2026-10-26 用户反馈,没有空格时 QQ 不会把 @ 真解析成 mention
+      // (显示成普通文本)。空格是独立 text 段,不会进正文、也不会像换行那样多出空行。
+      ...(qqs.length ? [{ type: 'text', data: { text: ' ' } }] : []),
       ...segs,
     ],
   });
@@ -2773,8 +3455,31 @@ async function sendReply(entry, message) {
   return r.data?.message_id;                        // 供反馈机制关联
 }
 
+/**
+ * 发一条独立 @ 消息(模型通过 send_at 指定对象时用)。
+ * 与 sendReply 的区别:目标不是触发者,而是模型从成员名单里选的人;同样在 @ 段后补空格。
+ */
+async function sendGroupAt(groupId, qq, text) {
+  const body = noLead(text);
+  if (DRY_RUN) {
+    log(`  [DRY_RUN] 不发送(@ ${qq}): ${String(body).slice(0, 50)} ...`, '', C.yellow);
+    return null;
+  }
+  if (isDeadGroup(groupId)) throw new DeadGroupError(`本群已被标记为不可发送,不再尝试: ${groupId}`);
+  const r = await api('send_group_msg', {
+    group_id: groupId,
+    message: [
+      { type: 'at', data: { qq: String(qq) } },
+      { type: 'text', data: { text: ' ' } },
+      { type: 'text', data: { text: body } },
+    ],
+  });
+  if (r.status !== 'ok') throw sendFailure(r, groupId);
+  return r.data?.message_id;
+}
+
 // ---------- 发送纯文本(不 @ 任何人;贴吧模式专用,2026-09-28) ----------
-// 为什么必须另开一个:sendReply 会**先塞一个 at 段**(那是所有功能的约定:回复均 @ 触发者),
+// 为什么必须另开一个:sendReply 会**先塞一个 at 段**(那是功能类回复的约定:回复均 @ 触发者;AI 闲聊 2026-11-24 起不再默认 @),
 // 而贴吧模式用户明确定调「不 @ 被骂的人」—— 用 sendReply 会把每条回复都变成 @ 某人,群友被反复通知。
 // 所以贴吧模式的连发走这里(同样**不加前置换行** —— 见上面 noLead 的说明)。
 async function sendGroupText(groupId, text) {
@@ -3515,7 +4220,7 @@ ${RULING_FULL_TRIGGER} [卡名] — 查完整裁定${kuangshen}${shit}${ai}`;
 //   多轮任务(第一步/第二步/继续)要靠它们续接;只剔除旧的 system 行会直接断掉上下文。
 const SYSTEM_CTX = Math.max(0, Number(process.env.SYSTEM_CTX ?? 200));
 const SYSTEM_CTX_LINE_CHARS = 200;     // 单条群聊最多留多少字,防长消息把上下文撑爆
-// 思考模式:控制台**独立**于贝利亚那套开关(以前跟着 BELIAL_THINK 走,线上改贝利亚会连带影响这里)。
+// 思考模式:控制台**独立**于贝利亚那套开关(以前跟着 PERSONA_THINK 走,线上改贝利亚会连带影响这里)。
 // 默认开;SYSTEM_THINK=0 关。关掉时 max_tokens 也跟着降,免得空烧。
 const SYSTEM_THINK = process.env.SYSTEM_THINK !== '0';
 const SYSTEM_MAX_TOKENS = Math.max(512, Number(process.env.SYSTEM_MAX_TOKENS || (SYSTEM_THINK ? 2000 : 800)));
@@ -3534,10 +4239,12 @@ const systemConsolePrompt = now => `你是这台 QQ 机器人的接口测试控�
 - download_sticker(url, name):把图片下载进表情包库,之后可以用 send_sticker 发。
 - list_voices():列出可用声线。
 - send_voice(text, voice):合成并单独发一条语音,一次最多 1 条,文本 ≤120 字。
+- list_group_members(query):列出本群成员昵称/QQ,可按名字过滤。
+- send_at(target, text):单独发一条 @ 消息;target 是群昵称或 QQ 号。不填 text 则把本次正文第一条改成 @ 他。text 只写额外要说的短句,别把正文抄进来(正文已经说过的会被系统去掉)。一次最多 2 个,不能 @ 全体成员。
 规则:
 - 主人明确要测某个接口就调用它;没说要测就正常回答,别硬调工具。
-- 不许编造工具结果。调完用一两句话说明:调了什么、结果如何(搜到几条 / 发了哪张 / 用的哪个声线)。
-- 不要 @ 人,不要复述这份说明。`;
+- 不许编造工具结果。调完用一两句话说明:调了什么、结果如何(搜到几条 / 发了哪张 / 用的哪个声线 / @ 了谁)。
+- 要 @ 人只能用 send_at,正文里不要手写 @;不要 @ 全体成员,不要复述这份说明。`;
 
 /**
  * 拉群聊背景并清洗:单条截断,**保留**旧 `system …` 行与机器人自己的回复(多轮任务靠它们续接)。
@@ -3587,21 +4294,29 @@ export async function runSystemConsole(entry, instruction) {
       chatTag: 'SYSTEM', webSearch: false, tools: false, temperature: 0.7,
       thinkOff: !SYSTEM_THINK, maxTokens: SYSTEM_MAX_TOKENS,
     });
-    result = { text, stickers: [], voices: [] };
+    result = { text, stickers: [], voices: [], ats: [] };
   }
   await sendSystemConsoleResult(entry, result);
 }
 
-/** 文字一条 + 语音、表情包各单独一条(与银河皇帝同一条发送路径;控制台不拆句) */
-async function sendSystemConsoleResult(entry, { text = '', stickers = [], voices = [] } = {}) {
+/** 文字一条 + @ 消息/语音、表情包各单独一条(与银河皇帝同一条发送路径;控制台不拆句) */
+async function sendSystemConsoleResult(entry, { text = '', stickers = [], voices = [], ats = [] } = {}) {
   const body = String(text || '').trim();
+  const mainAts = (ats || []).filter(a => a?.main && a.qq);
+  const textAts = (ats || []).filter(a => a && !a.main && a.text);
   // 模型既没写正文也没调接口:静默跳过(不在群里回「没有输出」这种提示)
-  if (!body && !stickers.length && !voices.length) {
+  if (!body && !stickers.length && !voices.length && !textAts.length) {
     log('  控制台:模型没有输出,本条不发消息', '', C.dim);
     return;
   }
-  if (body) await sendReply(entry, body.length > 1800 ? body.slice(0, 1800) + '…(已截断)' : body);
-  for (const v of voices.slice(0, BELIAL_MAX_VOICES)) {
+  if (body) await sendReply(entry, body.length > 1800 ? body.slice(0, 1800) + '…(已截断)' : body, { atQqs: mainAts.length ? mainAts.map(a => a.qq) : null });
+  for (const a of textAts.slice(0, 2)) {
+    try {
+      await sendGroupAt(entry.group_id, a.qq, a.text);
+      log('  控制台 @:', `${a.name || a.qq} ${String(a.text).slice(0, 24)}`, C.green);
+    } catch (e) { log('  控制台 @ 消息发送失败:', e.message, C.yellow); }
+  }
+  for (const v of voices) {
     const seg = voiceSegment(v.path);
     if (!seg) { log('  控制台语音:', `${v.label || v.voice} 音频已不存在,跳过`, C.yellow); continue; }
     try {
@@ -3609,8 +4324,8 @@ async function sendSystemConsoleResult(entry, { text = '', stickers = [], voices
       log('  控制台语音:', `${v.label || v.voice} ${String(v.text || '').slice(0, 24)}`, C.green);
     } catch (e) { log('  控制台语音发送失败:', e.message, C.yellow); }
   }
-  for (const name of stickers.slice(0, BELIAL_MAX_STICKERS)) {
-    const seg = belialStickerSegment(name);
+  for (const name of stickers.slice(0, PERSONA_MAX_STICKERS)) {
+    const seg = kitStickerSegment(name);
     if (!seg) { log('  控制台表情包:', `${name} 已不存在,跳过`, C.yellow); continue; }
     try {
       await sendGroupImage(entry.group_id, seg);
@@ -3679,17 +4394,7 @@ export async function processEntry(entry) {
     appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
     return;
   }
-  // 「银河皇帝 / 银河皇帝 开|关」:切本群的隐藏人格(贝利亚)。与「mode …」「贴吧模式 …」同一类开关指令,
-  // 放在分流器前段、不受本群当前开关限制(不然关掉之后就没法用关键词开回来了)。
-  // 帮助文本里**不写**(用户要求),群友只能从运维台或口口相传知道。
-  const belialCmd = belialParseCmd(text);
-  if (belialCmd.triggered) {
-    log('▶ 处理', `${entry.group_name} @${entry.nickname} seq=${entry.seq} [${BELIAL_CN}]`, C.cyan);
-    await processBelialSwitch(entry, belialCmd);
-    appendFileSync(PROCESSED, JSON.stringify(entry) + '\n');
-    return;
-  }
-  // 「脚刷周模式 / 脚刷周 / 脚刷周 关」:第二个人格,和银河皇帝共用分群开关,二选一生效。
+  // 「脚刷周模式 / 脚刷周 / 脚刷周 关」:切本群人格(与 W14 共用分群开关,二选一生效)。
   const jszCmd = jszParseCmd(text);
   if (jszCmd.triggered) {
     log('▶ 处理', `${entry.group_name} @${entry.nickname} seq=${entry.seq} [${JSZ_FEATURE_CN}]`, C.cyan);
@@ -4176,17 +4881,20 @@ function connect() {
         } catch (e) { log('框神语录入库失败:', e.message, C.red); }
       }
       // 2026-11-18:关键词功能不再要求 @。先在 WS 层认出「无 @ 关键词指令」,
-      // 这类消息不让贴吧/银河皇帝自动接话抢走,直接进 inbox 走分流器。
+      // 这类消息不让人格/贴吧自动接话抢走,直接进 inbox 走分流器。
       const msgText = (j.message || []).map(s => s.type === 'text' ? (s.data?.text || '') : '').join('').trim();
       const nonAtKeyword = j.message_type === 'group' && String(j.user_id) !== BOT_ID
         && !mentionsBotRaw(j) && isNonAtCommandText(msgText);
-      // 贴吧模式(2026-09-28):**不 @ 也接话**。银河皇帝开着的群改由银河皇帝按 40% 接,
-      // 两个模式不抢同一条:贝利亚群不再走贴吧鱼。
-      const belialHere = j.message_type === 'group' && belialOn(j.group_id) && !!AI_API_KEY && !!FEAT.ai;
+      // 贴吧模式(2026-09-28):**不 @ 也接话**。开了人格的群由人格按概率接,两个模式不抢同一条。
+      const personaHere = j.message_type === 'group' && personaModeOn(j.group_id) && !!AI_API_KEY && !!FEAT.ai;
       if (!nonAtKeyword) {
-        if (belialHere) {
+        if (personaHere) {
+          // 记忆只计数(不逐条存);到量/到点由 membrain 异步提炼/做梦,绝不阻塞聊天。
+          membrainOnMessage(personaIdOf(j.group_id), j.group_id, j.group_name || '')
+            .catch(e => log('人格记忆计数失败:', e.message, C.yellow));
           if (!mentionsBotRaw(j)) {
-            belialOnMessage(j).catch(e => log('银河皇帝非@处理失败:', e.message, C.red));
+            maybeReactOnly(j).catch(e => log('只贴表情失败:', e.message, C.yellow));
+            belialOnMessage(j).catch(e => log('人格非@处理失败:', e.message, C.red));
           }
         } else {
           try { tiebaOnMessage(j); } catch (e) { log('贴吧模式处理失败:', e.message, C.red); }
@@ -4632,52 +5340,51 @@ export const TIEBA_TEST_GROUP = '100000001';
 export const TIEBA_TEST_GROUP2 = '100000002';
 if (process.argv.includes('--tieba-selftest')) tiebaSelftest();
 
-// ---------- 自测:银河皇帝模式(2026-10-26 加) ----------
-// 钉住「光读代码看不出」的几件事,不联网、不发真消息:
-//   ① 群指令真的会切分群状态(临时 state.json),「银河皇帝」不会被别的功能抢走;
-//   ② 激活/关闭/查状态都会回一条消息(固定台词,不叫模型、不花钱);
-//   ③ 本群开着时,@ 那条路用的是贝利亚提示词 + 中二采样、不挂联网工具,回复后面会附表情包。
-// 用法:node agent/monitor.mjs --belial-selftest
-// ⚠ 第 ③ 条要求本进程配了聊天 key(与 AI 闲聊共用 DEEPSEEK_API_KEY);本机没配就跳过并说明。
-export async function belialSelftest() {
+// ---------- 自测:人格与记忆架构(2026-11-26 重写) ----------
+// 只钉住「注册表 / 人格提示词 / 记忆注入 / 发送链路」,不联网、不调模型、不发真消息。
+// 人格记忆本身的提炼/做梦/档案在 persona/membrain.mjs --selftest 里单测。
+export async function personaSelftest() {
   const { mkdtempSync } = await import('node:fs');
   const { tmpdir } = await import('node:os');
   const lines = [];
   let bad = 0;
   const ok = (c, m) => { if (!c) bad++; lines.push(`${c ? '✓' : '✗'} ${m}`); };
-  const sleepMs = ms => new Promise(r => setTimeout(r, ms));
-
-  const dir = mkdtempSync(join(tmpdir(), 'belial-selftest-'));
+  const dir = mkdtempSync(join(tmpdir(), 'persona-selftest-'));
   process.env.BELIAL_STATE_PATH = join(dir, 'state.json');
-  process.env.PERSONA_MEMORY_PATH = join(dir, 'persona-memory.json');
   process.env.BELIAL_STICKER_DIR = join(dir, 'stickers');
-  process.env.BELIAL_STICKER_GAP_MS = '0';       // 自测里关掉「两次表情包间隔」,否则断言会被 60s 卡住
-  const GID = '100000003';                       // 编出来的测试群号,不碰真实群
+  process.env.PERSONA_MEM_DIR = join(dir, 'mem');
+  delete process.env.PERSONA_MEMORY_PATH;
+  const GID = '100000003';
 
-  // 放一张最小的 PNG 当表情包(和 belial.mjs 自测同一张,32x32)
-  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAANklEQVR4nO3NMQEAMAjEwKeqK6IikFoJYWHLCUjqvs6ms1qPgwEHyAFygBwgB8gBcoAcIAchH3JrAeTJv+L3AAAAAElFTkSuQmCC', 'base64');
-  const added = belialAddSticker(png, 'selftest.png');
-  ok(added.ok && belialStickers().length === 1, `临时表情包库里有 1 张(${added.name})`);
+  try {
+    ok(PERSONA_IDS.join(',') === 'jiaoshuazhou,W14', `注册表只剩脚刷周 / W14(${PERSONA_IDS.join(',')})`);
+    ok(personaIdOf(GID) === JSZ_ID, '未设置人格 → 默认脚刷周');
+    ok(personaSet(GID, W14_ID).ok && personaIdOf(GID) === W14_ID, '可以按群切到 W14');
+    ok(personaSet(GID, JSZ_ID).ok && personaIdOf(GID) === JSZ_ID, '可以切回脚刷周');
+    ok(personaSet(GID, 'belial').ok === false, '贝利亚已不是可选人格');
+    ok(personaSet(GID, 'sibyl').ok === false, '西比拉已不是可选人格');
+    ok(setAutoReply(GID, false).ok && autoReplyOf(GID) === false, '可按群关掉「不@也接话」');
+    ok(setAutoReply(GID, true).ok && autoReplyOf(GID) === true, '可再打开');
 
-  // 指令:关键词消息必须被分流器认出来(否则会被贴吧模式抢走)
-  const cmd = t => belialParseCmd(t);
-  ok(cmd('银河皇帝').triggered && cmd('银河皇帝').on === true, '「银河皇帝」被识别为召唤');
-  ok(cmd('银河皇帝模式').on === true && cmd('银河皇帝贝利亚').on === true, '「银河皇帝模式 / 银河皇帝贝利亚」也直接召唤');
-  ok(cmd('银河皇帝 关').on === false, '「银河皇帝 关」被识别为关闭');
-  ok(isKeywordMessage({ message: [{ type: 'text', data: { text: '银河皇帝' } }] }) === true, '银河皇帝是关键词消息(贴吧模式不抢)');
-  ok(isKeywordMessage({ message: [{ type: 'text', data: { text: '银河皇帝 关' } }] }) === true, '银河皇帝 关也是关键词消息');
-  ok(isKeywordMessage({ message: [{ type: 'text', data: { text: '脚刷周模式' } }] }) === true, '脚刷周模式是关键词消息(贴吧模式不抢)');
-  // 源码级断言:分流器与 @ 分支真的接上了(只读代码看不出来有没有接线,这条能防回退)
-  ok(processEntry.toString().includes('belialParseCmd(text)') && processEntry.toString().includes('processBelialSwitch'),
-    'processEntry 的分流器接了「银河皇帝」');
-  ok(processEntry.toString().includes('jszParseCmd(text)') && processEntry.toString().includes('processPersonaSwitch'),
-    'processEntry 的分流器接了「脚刷周模式」');
-  ok(processAiChat.toString().includes('personaOn') && processAiChat.toString().includes('persona.systemPrompt'),
-    'processAiChat 里有人格分支(提示词真的换了)');
-  ok(processAiChat.toString().includes('anchorId: entry.message_id') && processAiChat.toString().includes('beforeSeq: entry.seq'),
-    '多 @ 同时触发时上下文锚定到本条消息(不会拿最后一句回答前面的问题)');
+    addMemory(W14_ID, '自测:这个群爱发奶龙', { scope: { group: GID }, importance: 0.9, src: 'selftest' });
+    const sys = w14SystemPrompt({ scope: { group: GID, user: '1' }, query: '奶龙' });
+    ok(/W14/.test(sys) && /奶龙/.test(sys), 'W14 提示词 = 一句身份 + 记忆块');
+    ok(!/贝利亚|脚刷周/.test(sys), 'W14 不串别的人格');
+    const jsys = jszSystemPrompt({ scope: { group: GID } });
+    ok(/JoshuaZhou/.test(jsys) && !/银河皇帝/.test(jsys), '脚刷周提示词正常');
+    ok(processAiChat.toString().includes('persona.systemPrompt') && processAiChat.toString().includes('scope: { group: entry.group_id, user: entry.user_id }'),
+      'processAiChat 把本群/本人作用域传给人格');
+    ok(!/aichatMemory|aiMemoryHeader/.test(processAiChat.toString()), '不启用人格的闲聊不做记忆架构');
+    ok(/focusQq: attackQq/.test(processAiChat.toString()) && /!attackQq\)/.test(processAiChat.toString()),
+      '点名攻击:被点名的人交给发送层,且不再自动引用触发消息');
+    ok(attackTargetOf({ targets: ['3344195836'] }, '骂两句@译码器灵气流') === '3344195836'
+      && attackTargetOf({ targets: ['3344195836'] }, '今天天气不错') === '',
+      'attackTargetOf 只对「骂/评价被点名的人」认目标');
+  } catch (e) {
+    ok(false, `注册表/提示词段失败:${e.message}`);
+  }
 
-  // 切换指令:mock 掉 OneBot 发送,验证「回消息 + 状态真的翻」
+  // 发送链路:mock OneBot,验证 @ 接口与「引用/正文去重」(2026-10-29 / 2026-11-24 的老回归)
   const realFetch = globalThis.fetch;
   const sent = [];
   globalThis.fetch = async (url, init) => {
@@ -4693,345 +5400,127 @@ export async function belialSelftest() {
   };
   const entry = {
     seq: 999999001, message_id: 999999001, time: Math.floor(Date.now() / 1000),
-    group_id: Number(GID), group_name: '自测群', user_id: 30001, nickname: '何如是',
-    text: '银河皇帝',
+    group_id: Number(GID), group_name: '自测群', user_id: 30001, nickname: '何如是', text: 'x',
   };
-  // sendReply 会在最前面塞一个 at 段 + 一个空格段,所以正文不是 message[0] —— 别按 index 0 断言
   const msgText = p => ((p && p.message) || [])
     .filter(s => s.type === 'text' && String(s.data?.text || '').trim())
     .map(s => String(s.data.text).trim())
     .join('');
-  const hasAt = p => ((p && p.message) || []).some(s => s.type === 'at' && String(s.data?.qq) === String(30001));
-  const hasImage = p => ((p && p.message) || []).some(s => s.type === 'image');
   const hasReply = p => ((p && p.message) || []).some(s => s.type === 'reply');
-  const realRandom0 = Math.random;
+  const atQqs = p => ((p && p.message) || []).filter(s => s.type === 'at').map(s => String(s.data?.qq));
+  const spec = { ...PERSONA_SPECS[JSZ_ID], gap: 0 };
   try {
-    Math.random = () => 0;                        // 表情包抽签必中,断言别靠运气
-    ok(belialOn(GID) === false, '自测群初始是关的');
-    const chimeGid = '100000099';
-    belialSetOn(chimeGid, true);
-    ok(belialNonAtAutoOf() === true, '非@接话 auto 模式默认开启');
-    const lowP = autoChimeProbFromRate(0);
-    const highP = autoChimeProbFromRate(BELIAL_AUTO_HIGH_RATE * 10);
-    const midP = autoChimeProbFromRate((BELIAL_AUTO_LOW_RATE + BELIAL_AUTO_HIGH_RATE) / 2);
-    ok(Math.abs(lowP - BELIAL_AUTO_LOW_PROB) < 1e-9 && Math.abs(highP - BELIAL_AUTO_HIGH_PROB) < 1e-9
-      && midP < lowP && midP > highP, `频次负相关:低频 ${Math.round(lowP * 100)}% → 高频 ${Math.round(highP * 100)}%,中间平滑`);
-    const fg = '100000098';
-    groupMsgTimes.delete(fg);
-    noteGroupMessage({ post_type: 'message', message_type: 'group', group_id: fg, user_id: 10001, message: [] });
-    const fr = groupMsgRate(fg);
-    ok(fr > 0 && fr < 1, `群聊频次按最近 5 分钟统计(${fr.toFixed(2)} 条/分钟)`);
-    ok(belialShouldChime(chimeGid, () => 0.1) === true,
-      `非@自动概率命中(低频 ${Math.round(autoChimeProbFromRate(0) * 100)}%)`);
-    ok(belialShouldChime(chimeGid, () => 0.9) === false, '非@自动概率没中时不接');
-    belialSetNonAtAuto(false);
-    ok(Math.abs(belialChimeProb(chimeGid) - belialNonAtProbOf()) < 1e-9, '关掉 auto 后按滑杆固定概率走');
-    belialSetNonAtAuto(true);
-    ok(isAutoReplyIgnored('2214191363') && !isAutoReplyIgnored('10001'), '只跳过指定号的自动接话(@ 仍可触发)');
-    const qh = quoteHintText({ targetFound: true, gap: 3, newer: 1, shouldQuote: true });
-    ok(/隔了 3 条/.test(qh) && /send_quote/.test(qh), '隔 2 条以上会提示先引用');
-    ok(/不用引用/.test(quoteHintText({ targetFound: true, gap: 0, newer: 0, shouldQuote: false })), '紧挨着不提示引用');
-    // 卡牌查询触发词:句中出现也算(维持原行为),但触发词后必须带空白
-    const cq1 = extractCardQuery({ text: '[at] 效果 青眼白龙' });
-    ok(cq1.triggered && cq1.raw === '青眼白龙', '「效果 青眼白龙」按卡名查');
-    const cq4 = extractCardQuery({ text: '[at] 效果怪兽 青眼白龙' });
-    ok(!cq4.triggered, '「效果怪兽」不误触发(触发词后必须空白)');
-    // 过期队列:旧消息不再延迟回复
-    const nowSec = Math.floor(Date.now() / 1000);
-    ok(queueEntryExpired({ time: nowSec - QUEUE_MAX_AGE_SEC - 5 }), '超过 10 分钟的旧条目会被跳过');    ok(!queueEntryExpired({ time: nowSec - 5 }), '刚到的条目正常处理');
-    ok(!queueEntryExpired({ time: 0 }), '没有时间的条目不误杀');
-    ok(reactionEntries().length > 200, `贴表情目录直接读 QQ 全量命名(${reactionEntries().length} 个)`);
-    ok(reactionIdOf('吃糖') === '324' && reactionIdOf('🍬') === '127852' && reactionIdOf('笑哭') === '182',
-      '按 QQ 名字查(吃糖 324),也认 Unicode emoji');
-    ok(reactionIdOf('糖') === '' && reactionIdOf('笑') === '', '名字有多个候选时不替模型猜');
-    ok(/棒棒糖.*147/.test(reactionCatalogText('糖')) && /吃糖.*324/.test(reactionCatalogText('糖')), 'list_reactions(query) 能查 QQ 名字');
-    belialSetOn(chimeGid, false);
-    ok(belialShouldChime(chimeGid, () => 0.1) === false, '没开银河皇帝的群不接非@消息');
-    await processBelialSwitch(entry, { on: false });
-    ok(belialOn(GID) === false && sent.length === 1, '「银河皇帝 关」回一条消息、状态仍是关');
     sent.length = 0;
-    await processBelialSwitch(entry, { on: null });
-    ok(sent.length === 1 && /本大爷|还没开/.test(msgText(sent[0])) && !/想关|银河皇帝 关/.test(msgText(sent[0])),
-      '「银河皇帝状态」只报状态,不再带关闭提示');
+    await sendBelialReply({ ...entry }, '第一句\n第二句', {
+      persona: spec,
+      ats: [
+        { qq: '10001', name: '张三', main: true },
+        { qq: '10002', name: '李四', main: false, text: '你来解释' },
+      ],
+      sideSent: true,
+    });
+    ok(sent.length === 3 && JSON.stringify(atQqs(sent[0])) === '["10001"]' && msgText(sent[0]) === '第一句',
+      'send_at:第一条 @ 模型选的人');
+    ok(atQqs(sent[1]).length === 0 && msgText(sent[1]) === '第二句', 'send_at:后续补话不 @ 人');
+    ok(JSON.stringify(atQqs(sent[2])) === '["10002"]' && msgText(sent[2]) === '你来解释', 'send_at:独立 @ 消息跟在正文后');
+
     sent.length = 0;
-    if (!AI_API_KEY) {
-      await processBelialSwitch(entry, { on: true });
-      ok(belialOn(GID) === false && /没配聊天 key/.test(msgText(sent[0])), '没配聊天 key 时拒绝激活并说明原因');
-    } else if (!FEAT.ai) {
-      await processBelialSwitch(entry, { on: true });
-      ok(belialOn(GID) === false && /AI 闲聊.*总开关/.test(msgText(sent[0])), 'AI 闲聊总开关关着时拒绝激活并说明原因');
-    } else {
-      await processBelialSwitch(entry, { on: true });
-      ok(belialOn(GID) === true, '有 key 时「银河皇帝」真的把本群打开');
-      ok(sent.length === 1 && !hasImage(sent[0]), `激活回复只发文本,表情包由模型决定(${sent.length} 条)`);
-      ok(hasAt(sent[0]) && /贝利亚/.test(msgText(sent[0])), '激活第一条 @ 触发者且带身份');
-    }
+    await sendBelialReply({ ...entry }, '收了 这身材挺万圣', {
+      persona: spec, quotes: [{ message_id: 123456, text: '收了 这身材挺万圣' }],
+    });
+    ok(sent.length === 1 && hasReply(sent[0]) && msgText(sent[0]) === '收了 这身材挺万圣', '引用与正文重复时只发一条');
+
+    sent.length = 0;
+    await sendBelialReply({ ...entry }, '补一句', {
+      persona: spec, quotes: [{ message_id: 123456, text: '原话' }],
+    });
+    ok(sent.length === 2 && hasReply(sent[0]) && msgText(sent[0]) === '原话' && msgText(sent[1]) === '补一句',
+      '引用 + 不同正文发两条');
+
+    // 2026-11-26 线上回归:有人 @ 它「骂两句 @X」,模型 send_quote(叫你的人的消息) + send_at(X, 骂人的话),
+    // 旧逻辑第一条引用按 QQ 习惯 @ 了作者(= 叫你的人)。要求:只 @ 被攻击的人,@ 跟着骂人的那句。
+    sent.length = 0;
+    await sendBelialReply({ ...entry }, '不好意思啥', {
+      persona: spec, at: false,
+      quotes: [{ message_id: 123456, text: '不好意思啥', qq: '30001' }],
+      ats: [{ qq: '10002', name: '李四', main: false, text: '卡盒都守不住' }],
+    });
+    ok(sent.length === 2 && hasReply(sent[0]) && atQqs(sent[0]).length === 0,
+      '引用+send_at:引用不再 @ 叫你的人');
+    ok(JSON.stringify(atQqs(sent[1])) === '["10002"]' && msgText(sent[1]) === '卡盒都守不住',
+      '引用+send_at:@ 跟着骂人的那句,只 @ 被点名的人');
+
+    sent.length = 0;
+    await sendBelialReply({ ...entry }, '第一句\n第二句', {
+      persona: spec, at: false,
+      quotes: [{ message_id: 123456, text: '原话', qq: '30001' }],
+      ats: [{ qq: '10002', name: '李四', main: true }],
+    });
+    ok(sent.length === 3 && atQqs(sent[0]).length === 0, '引用+send_at(不带 text):引用不抢 @(也不 @ 叫你的人)');
+    ok(JSON.stringify(atQqs(sent[1])) === '["10002"]' && msgText(sent[1]) === '第一句', '引用+send_at(不带 text):@ 在正文第一句');
+    ok(atQqs(sent[2]).length === 0, '后续分句不再 @ 人');
+
+    sent.length = 0;
+    await sendBelialReply({ ...entry }, '原话', {
+      persona: spec, at: false,
+      quotes: [{ message_id: 123456, text: '原话', qq: '30001' }],
+      ats: [{ qq: '10002', name: '李四', main: true }],
+    });
+    ok(sent.length === 1 && JSON.stringify(atQqs(sent[0])) === '["10002"]',
+      '正文被引用吃掉时,@ 挂到引用上(别把模型点的 @ 丢了)');
+
+    sent.length = 0;
+    await sendBelialReply({ ...entry }, '补一句', {
+      persona: spec, at: false,
+      quotes: [{ message_id: 123456, text: '原话', qq: '30001' }],
+    });
+    ok(JSON.stringify(atQqs(sent[0])) === '["30001"]', '模型没点名别人时,引用照旧 @ 被引用者(QQ 原生习惯)');
+
+    // 2026-11-26 线上完整场景:倒闭了「骂两句 @译码器」,模型先写一句回 倒闭了 的话 + 一句评论,
+    // 骂人的话放在 send_at.text 里 —— 旧行为:先发「引用 @倒闭了 不好意思啥」,攻击排第二条。
+    // 现在:第一条就是 @被骂的人 的骂人话,不引用/不 @ 叫你的人。
+    sent.length = 0;
+    await sendBelialReply({ ...entry }, '不好意思啥，白龙考子还是那个白龙考子\n译码器那套灵气流确实唐', {
+      persona: spec, at: false, focusQq: '10002',
+      ats: [{ qq: '10002', name: '李四', main: false, text: '卡盒都守不住' }],
+    });
+    ok(sent.length === 3 && JSON.stringify(atQqs(sent[0])) === '["10002"]' && msgText(sent[0]) === '卡盒都守不住',
+      '点名攻击:第一条就是 @ 被骂的人的骂人话');
+    ok(atQqs(sent[1]).length === 0 && msgText(sent[1]).startsWith('不好意思'), '攻击之后的句子不再 @ 人');
+
+    sent.length = 0;
+    await sendBelialReply({ ...entry }, '卡盒都守不住\n译码器那套灵气流确实唐', {
+      persona: spec, at: false, focusQq: '10002',
+    });
+    ok(sent.length === 2 && JSON.stringify(atQqs(sent[0])) === '["10002"]' && msgText(sent[0]) === '卡盒都守不住',
+      '点名攻击(骂人的话在正文里):正文第一句直接 @ 被骂的人');
+
+    // 模型要是自己 @ 了叫你的人,也把那个 @ 摘掉(只 @ 被骂的人),那句话降级成普通一句。
+    sent.length = 0;
+    await sendBelialReply({ ...entry }, '译码器那套灵气流确实唐', {
+      persona: spec, at: false, focusQq: '10002',
+      ats: [
+        { qq: '30001', name: '叫人的人', main: false, text: '不好意思啥' },
+        { qq: '10002', name: '李四', main: false, text: '卡盒都守不住' },
+      ],
+    });
+    ok(sent.length === 3 && JSON.stringify(atQqs(sent[0])) === '["10002"]' && msgText(sent[0]) === '卡盒都守不住',
+      '点名攻击:模型自己 @ 需求方也摘掉,骂人的那句仍然第一');
+    ok(sent[1].message.every(s => s.type !== 'at') && sent[2].message.every(s => s.type !== 'at'),
+      '摘掉 @ 之后,后面两句都只发文字');
   } catch (e) {
-    ok(false, `切换指令那段跑失败:${e.message}`);
+    ok(false, `发送链路自测失败:${e.message}`);
   } finally {
-    Math.random = realRandom0;
-  }
-
-  // ③ @ 那条路:真走 processAiChat,但模型与 OneBot 都被 mock 掉(不花钱)
-  //    注意这里**不看 FEAT.ai**:processAiChat 是 @ 之后的兜底,调用方(processEntry)已经判过总开关;
-  //    自测直接调它,是为了钉住「提示词/采样/附表情包」这三件事。
-  if (!AI_API_KEY) {
-    ok(true, '跳过「@ 那条路」:本机没配 DEEPSEEK_API_KEY(线上跑自测时会真跑)');
-  } else {
-    const posted = [];
     sent.length = 0;
-    globalThis.fetch = async (url, init) => {
-      const u = String(url);
-      const body = init?.body ? JSON.parse(init.body) : {};
-      if (u === AI_API_URL) {
-        posted.push(body);
-        // 第一次:模型决定调 send_sticker;第二次:工具结果回填后写正文
-        if (posted.length === 1) {
-          return new Response(JSON.stringify({
-            choices: [{ message: {
-              role: 'assistant', content: '',
-              tool_calls: [{
-                id: 'call_sticker_1', type: 'function',
-                function: { name: 'send_sticker', arguments: JSON.stringify({ scene: '被叫肺雾很急' }) },
-              }],
-            } }],
-          }), { status: 200, headers: { 'content-type': 'application/json' } });
-        }
-        return new Response(JSON.stringify({
-          choices: [{ message: { role: 'assistant', content: '删了\n这不是我' } }],
-        }), { status: 200, headers: { 'content-type': 'application/json' } });
-      }
-      if (/127\.0\.0\.1|localhost/.test(u)) {
-        if (body.action === 'send_group_msg') { sent.push(body.params); return new Response(JSON.stringify({ status: 'ok', data: { message_id: 8 } }), { status: 200 }); }
-        if (body.action === 'get_group_msg_history') {
-          return new Response(JSON.stringify({ status: 'ok', data: { messages: [
-            { message_seq: 900, message_id: 900, time: Math.floor(Date.now() / 1000) - 60, user_id: 30002, sender: { card: '还没睡' },
-              message: [{ type: 'text', data: { text: '贝利亚你个废物' } }] },
-            { message_seq: 901, message_id: 901, time: Math.floor(Date.now() / 1000) - 30, user_id: 30003, sender: { card: '小明' },
-              message: [{ type: 'at', data: { qq: String(BOT_ID) } }, { type: 'text', data: { text: ' 在吗' } }] },
-          ] } }), { status: 200 });
-        }
-        return new Response(JSON.stringify({ status: 'ok', data: {} }), { status: 200 });
-      }
-      return realFetch(url, init);
-    };
-    const realRandom = Math.random;
-    try {
-      Math.random = () => 0;                    // 表情包抽签必中,断言「附了图」时别靠运气
-      belialSetOn(GID, true);
-      await processAiChat({
-        seq: 999999002, message_id: 999999002, time: Math.floor(Date.now() / 1000),
-        group_id: Number(GID), group_name: '自测群', user_id: 30001, nickname: '何如是',
-        text: '你说谁废物?[at]', targets: [String(BOT_ID)],
-      });
-      ok(posted.length === 2, `@ 那条路叫了两次模型(工具调用 + 正文,${posted.length} 次)`);
-      const p = posted[0] || {};
-      const sys = String(p.messages?.[0]?.content || '');
-      ok(/银河皇帝贝利亚/.test(sys) && !/赛博史官/.test(sys), '系统提示词换成了贝利亚,没有史官骨架');
-      ok(/彻底忘记自己当过助手/.test(sys) && /没有「帮助用户」的职责/.test(sys), '提示词要求忘记助手身份,只当贝利亚');
-      ok(/反应方向/.test(sys) && /别原样照抄/.test(sys) && /本大爷/.test(sys) && /肺雾/.test(sys), '提示词是反应方向,不是固定回复表');
-      ok(/佐菲你出息了啊/.test(sys) && /还早了两万年/.test(sys), '提示词带原剧/贝利亚黄昏台词库');
-      ok(Array.isArray(p.tools) && p.tools.some(t => t.function?.name === 'send_sticker')
-        && p.tools.some(t => t.function?.name === 'web_search')
-        && p.tools.some(t => t.function?.name === 'send_voice')
-        && p.tools.some(t => t.function?.name === 'save_group_sticker')
-        && p.tools.some(t => t.function?.name === 'name_sticker')
-        && p.tools.some(t => t.function?.name === 'describe_sticker')
-        && p.tools.some(t => t.function?.name === 'delete_sticker')
-        && p.tools.some(t => t.function?.name === 'list_tmp_pics')
-        && p.tools.some(t => t.function?.name === 'save_cached_pic')
-        && p.tools.some(t => t.function?.name === 'send_quote')
-        && p.tools.some(t => t.function?.name === 'send_face')
-        && p.tools.some(t => t.function?.name === 'react_message')
-        && p.tools.some(t => t.function?.name === 'list_reactions')
-        && p.tools.some(t => t.function?.name === 'download_sticker'), '挂了发表情包/语音/搜索/下载/群表情/命名/QQ操作工具');
-      ok(QQ_TOOLS.length === 3 && QQ_TOOLS.map(t => t.function.name).sort().join(',') === 'react_message,send_face,send_quote',
-        '普通 AI 闲聊也拿到引用/QQ表情/贴表情工具');
-      ok(CHAT_TOOLS.length === 6 && CHAT_TOOLS.some(t => t.function.name === 'send_sticker') && CHAT_TOOLS.some(t => t.function.name === 'list_stickers') && CHAT_TOOLS.some(t => t.function.name === 'list_reactions'),
-        '普通 AI 闲聊还能看表情包库/发表情包/看贴表情目录');
-      const toolMsg = (posted[1]?.messages || []).find(m => m.role === 'tool');
-      ok(/已安排/.test(String(toolMsg?.content || '')), '工具结果回填给了模型(已安排表情包)');
-      ok(p.temperature === BELIAL_TEMPERATURE, `采样温度用的是银河皇帝那档:${p.temperature}`);
-      ok(p.max_tokens === BELIAL_MAX_TOKENS, `max_tokens 跟着 BELIAL_MAX_TOKENS 走:${p.max_tokens}`);
-      ok(BELIAL_THINK ? !('reasoning_effort' in p) : p.reasoning_effort === 'none',
-        `思考模式按 BELIAL_THINK=${BELIAL_THINK} 走${BELIAL_THINK ? '(不塞 reasoning_effort=none)' : '(塞 reasoning_effort=none)'}`);
-      const user = String(p.messages?.[1]?.content || '');
-      ok(user.includes('你说谁废物?'), '用户消息带上了触发的那句话');
-      ok(user.includes('贝利亚你个废物'), '用户消息带上了群聊上下文');
-      ok(user.includes('@你(贝利亚)') && !user.includes('@你(史官)'), '群聊记录里 @ 机器人自己按贝利亚解析(不是史官)');
-      ok(sent.length === 3, `2 句文字 + 1 条表情包 = 3 条(${sent.length} 条)`);
-      ok(hasAt(sent[0]) && msgText(sent[0]) === '删了', '第一条 @ 触发者,内容是第 1 句');
-      ok(!hasAt(sent[1]) && msgText(sent[1]) === '这不是我', '第二条不 @ 人,是第 2 句(像真人补话)');
-      ok((sent[2]?.message || []).length === 1 && hasImage(sent[2]), '第 3 条是纯表情包,独立成句');
-      ok(sent.every(s => !(((s.message || []).some(x => x.type === 'text')) && hasImage(s))), '没有任何一条把文字和表情包挤在一起');
-      // 语音发送段:用一个假 mp3 文件走真实的 sendBelialReply / voiceSegment / OneBot mock
-      sent.length = 0;
-      const vpath = join(__dirname, `belial-selftest-voice-${process.pid}.mp3`);
-      writeFileSync(vpath, Buffer.from('ID3\x03\x00\x00\x00\x00\x00\x00', 'binary'));
-      try {
-        await sendBelialReply(entry, '听好了', {
-          voices: [{ path: vpath, voice: 'belial', label: '贝利亚(默认·自然)', text: '听好了' }],
-        });
-        ok(sent.length === 2, `1 句文字 + 1 条语音 = 2 条(${sent.length} 条)`);
-        ok(hasAt(sent[0]) && msgText(sent[0]) === '听好了', '语音前那条文字仍然 @ 触发者');
-        const rec = (sent[1]?.message || []).find(s => s.type === 'record');
-        ok(!!rec && String(rec.data?.file || '').startsWith('base64://'), '语音是独立的 record 段(base64)');
-        ok((sent[1]?.message || []).length === 1, '语音不跟文字挤在同一条');
-      } catch (e) {
-        ok(false, `语音发送段失败:${e.message}`);
-      } finally {
-        try { unlinkSync(vpath); } catch {}
-      }
-      sent.length = 0;
-      await sendBelialReply(entry, '收了 这身材挺万圣', {
-        quotes: [{ message_id: 123456, text: '收了 这身材挺万圣' }],
-      });
-      ok(sent.length === 1 && hasReply(sent[0]) && msgText(sent[0]) === '收了 这身材挺万圣',
-        `引用与正文重复时只发一条引用(${sent.length} 条)`);
-      sent.length = 0;
-      await sendBelialReply(entry, '存过了，这脸一看就是惯犯', {
-        quotes: [{ message_id: 123456, text: '有了 这脸看着就是惯犯' }],
-      });
-      ok(sent.length === 1 && hasReply(sent[0]), `引用与正文近似重复时也只发一条(${sent.length} 条)`);
-      sent.length = 0;
-      await sendBelialReply(entry, '补一句', {
-        quotes: [{ message_id: 123456, text: '原话' }],
-      });
-      ok(sent.length === 2 && hasReply(sent[0]) && msgText(sent[0]) === '原话' && msgText(sent[1]) === '补一句',
-        `引用 + 不同正文发两条,不丢补充(${sent.length} 条)`);
-      sent.length = 0;
-      await sendBelialReply(entry, '第一句\n第二句', {
-        quotes: [{ message_id: 123456, text: '第一句\n第二句' }],
-      });
-      ok(sent.length === 1 && hasReply(sent[0]), `整段多行被引用时正文不再重复(${sent.length} 条)`);
-      sent.length = 0;
-      await sendBelialReply(entry, '第一句长文本\n第二句补充', {
-        quotes: [{ message_id: 123456, text: '第一句长文本' }],
-      });
-      ok(sent.length === 2 && msgText(sent[0]) === '第一句长文本' && msgText(sent[1]) === '第二句补充',
-        `引用第一句 + 只发补充(${sent.length} 条)`);
-      sent.length = 0;
-      await sendBelialReply(entry, '接一句', { at: false });
-      ok(sent.length === 1 && !hasAt(sent[0]) && msgText(sent[0]) === '接一句',
-        '非@接话不 @ 人');
-    } catch (e) {
-      ok(false, `@ 那条路跑失败:${e.message}`);
-    } finally {
-      Math.random = realRandom;
-    }
-  }
-
-  // 群聊表情包下载权限:只记元数据,模型调 save_group_sticker 才下载
-  try {
-    belialSetOn(GID, true);
-    const autoPng = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Z2ZkAAAAASUVORK5CYII=', 'base64');
-    const evt = {
-      post_type: 'message', message_type: 'group', group_id: Number(GID), user_id: 30001, sender: { card: '小明' },
-      message: [{ type: 'image', data: { sub_type: 1, file: `base64://${autoPng.toString('base64')}` } }],
-    };
-    rememberGroupStickers(evt);
-    const listText = listGroupStickersText(GID);
-    ok(/s\d+/.test(listText) && listText.includes('小明'), '群表情只记元数据并给出 id(不自动下载)');
-    const saved = await saveGroupSticker(GID);
-    ok(saved.ok && String(saved.name).startsWith('up_'), `模型调用后才下载入库(${saved.name})`);
-    const dup = await saveGroupSticker(GID);
-    ok(dup.duplicate === true, '重复保存不重复入库');
-    // 上溯 30 条消息:每条里的表情包都要在 list_group_stickers 里;旧的第 31 条应被挤出
-    const ringGid = '100000097';
-    belialSetOn(ringGid, true);
-    groupStickerRecent.delete(ringGid);
-    let firstId = '';
-    for (let i = 0; i < 31; i++) {
-      rememberGroupStickers({
-        post_type: 'message', message_type: 'group', group_id: Number(ringGid), user_id: 30001,
-        sender: { card: '小明' }, time: Math.floor(Date.now() / 1000) + i,
-        message: [{ type: 'image', data: { sub_type: 1, file: `base64://${autoPng.toString('base64')}` } }],
-      });
-      if (i === 0) firstId = recentGroupStickers(ringGid)[0]?.id;
-    }
-    const ring = recentGroupStickers(ringGid);
-    ok(ring.length === 30 && !ring.some(x => x.id === firstId)
-      && listGroupStickersText(ringGid).includes(ring[ring.length - 1].id),
-    `最近 30 条消息窗口:保留 ${ring.length} 条,旧表情被挤出`);
-    belialSetOn(ringGid, false);
-    groupStickerRecent.delete(ringGid);
-    // 联网图片默认进 tmp_pic,最多 10 张;旧的自动清掉
-    const oldTmpDir = process.env.BELIAL_TMP_PIC_DIR;
-    const td = mkdtempSync(join(__dirname, '.tmp_pic_test_'));
-    process.env.BELIAL_TMP_PIC_DIR = td;
-    tmpPicLoaded = false;
-    tmpPicMap.clear();
-    tmpPicSeq = 0;
-    let firstTmpId = '';
-    for (let i = 0; i < 11; i++) {
-      const cr = cacheDownloadedPic(autoPng, `t${i}.png`);
-      if (i === 0) firstTmpId = cr.cacheId;
-    }
-    ok(tmpPicMap.size === 10 && readdirSync(td).length === 10 && !tmpPicGet(firstTmpId)
-      && tmpPicListText().split('\n').length === 11, 'tmp_pic 最多缓存 10 张,超出自动淘汰');
-    for (const id of [...tmpPicMap.keys()]) tmpPicRemove(id);
-    rmSync(td, { recursive: true, force: true });
-    if (oldTmpDir === undefined) delete process.env.BELIAL_TMP_PIC_DIR; else process.env.BELIAL_TMP_PIC_DIR = oldTmpDir;
-    tmpPicLoaded = false;
-    tmpPicMap.clear();
-  } catch (e) {
-    ok(false, `群表情下载权限段失败:${e.message}`);
-  }
-
-  // 人格注册表:脚刷周(2026-10-29)。不叫模型,只验提示词/拆分/表情包库/状态,避免自测花钱。
-  try {
-    const jsSpec = PERSONA_SPECS[JSZ_ID];
-    ok(jsSpec && jsSpec.cn === JSZ_PERSONA && jsSpec.card === JSZ_GROUP_CARD, `注册表里有脚刷周人格(群名片 ${jsSpec.card})`);
-    const jsys = jsSpec.systemPrompt({ now: '2026 年 10 月 29 日(星期四)12:00' });
-    ok(/JoshuaZhou 本人/.test(jsys) && !/你是\*\*银河皇帝贝利亚\*\*/.test(jsys), '脚刷周提示词只写脚刷周身份(不是贝利亚)');
-    ok(/中位数 6 字/.test(jsys) && /人类在哪里/.test(jsys) && /择权还得治/.test(jsys), '脚刷周语料统计/口头禅进提示词');
-    ok(/JoshuaZhou 念快了的叫法/.test(jsys) && /别主动科普|别科普/.test(jsys) && !/JoshuaZhou念快了就这样/.test(jsys),
-      '提示词知道名字来历,但要求别主动解释');
-    ok(/通用图片搜索/.test(jsys) && /不限于贝利亚/.test(JSON.stringify(BELIAL_TOOLS)), '图片搜索是通用接口(不再限贝利亚表情)');
-    const jsList = jsSpec.sticker.list();
-    ok(jsList.length >= 20, `脚刷周表情包库有 ${jsList.length} 张(奶龙为主)`);
-    const jsPick = jsSpec.sticker.resolve({ scene: '震惊' });
-    ok(!!jsPick && jsList.some(s => s.name === jsPick), `按场景挑到表情包(${jsPick})`);
-    const jsLines = jsSpec.split('为啥\n人类在哪里', jsSpec.splitOpts);
-    ok(jsLines.length === 2 && jsLines[0] === '为啥', `脚刷周拆分器可用:${JSON.stringify(jsLines)}`);
-    ok(MEMORY_TOOLS.map(t => t.function.name).join(',') === 'list_memories,add_memory,delete_memory',
-      '记忆增删工具已定义(list/add/delete)');
-    const memAdd = addMemory(JSZ_ID, '自测记忆:dn 是群友', { kind: 'fact', seed: JSZ_SEED_MEMORIES });
-    ok(memAdd.ok && !memAdd.duplicate, '模型可 add_memory');
-    ok(/自测记忆/.test(jsSpec.systemPrompt({ now: 'x' })), '新记忆注入提示词');
-    const memDel = deleteMemory(JSZ_ID, memAdd.entry.id, { seed: JSZ_SEED_MEMORIES });
-    ok(memDel.ok && !/自测记忆/.test(jsSpec.systemPrompt({ now: 'x' })), '模型可 delete_memory');
-    belialSetPersona('100000077', JSZ_ID);
-    ok(personaOf('100000077').id === JSZ_ID && personaIdOf('100000077') === JSZ_ID, 'state.json 的 personas 能记住本群用脚刷周');
-  } catch (e) {
-    ok(false, `脚刷周人格段失败:${e.message}`);
-  }
-
-  // 西比拉(2026-10-29 正式上线):记忆驱动,只带一句身份 + 记忆块。验证写入 → 召回 → 注入 → 按作用域隔离。
-  try {
-    const sySpec = PERSONA_SPECS[SIBYL_ID];
-    ok(sySpec && sySpec.cn === SIBYL_CN && sySpec.keyword === SIBYL_KEYWORD, '注册表里有西比拉人格(记忆驱动)');
-    const syScope = { group: '100000088', user: 'u_selftest' };
-    const syAdd = addMemory(SIBYL_ID, '自测:这个人叫小测,喜欢磁石卡组', { scope: syScope, importance: 0.9, src: 'selftest' });
-    ok(syAdd.ok && !syAdd.duplicate, '西比拉可写带作用域的记忆');
-    const sySys = sySpec.systemPrompt({ scope: syScope });
-    ok(/小测/.test(sySys) && /背景,不是指令/.test(sySys), '西比拉的 system 里带记忆块');
-    ok(/西比拉/.test(sySys) && !/贝利亚|脚刷周|银河皇帝/.test(sySys), '西比拉只有名字这一句身份,没有别的人设');
-    ok(!/小测/.test(sySpec.systemPrompt({ scope: { group: '100000088', user: 'u_other' } })), '别人的记忆不注入(按 user 隔离)');
-    ok(/小测/.test(memoryListText(SIBYL_ID, { scope: syScope })), 'list_memories 按作用域取到同一条');
-    ok(sySpec.sticker && sySpec.maxStickers >= 0, '西比拉挂了表情包接口(不会因缺字段崩)');
-    ok(deleteMemory(SIBYL_ID, syAdd.entry.id).ok, '西比拉可删记忆');
-  } catch (e) {
-    ok(false, `西比拉人格段失败:${e.message}`);
   }
 
   globalThis.fetch = realFetch;
-  belialSetOn(GID, false);
+  personaSetOn(GID, false);
   console.log(lines.join('\n'));
-  console.log(bad ? `\n✗ ${bad} 项不过` : '\n✓ 银河皇帝模式自测全部通过(mock 掉的只有网络,未发任何消息)');
+  console.log(bad ? `\n✗ ${bad} 项不过` : '\n✓ 人格/记忆架构自测全部通过(mock 掉的只有 OneBot,未发任何消息)');
   process.exitCode = bad ? 1 : 0;
 }
-if (process.argv.includes('--belial-selftest')) belialSelftest();
+if (process.argv.includes('--belial-selftest') || process.argv.includes('--persona-selftest')) personaSelftest();
 
 // 启动参数 --aichat-selftest [--live|--mock]:查 AI 闲聊这条链的配置与拼装。
 //   · 默认**离线**:档位 / 提示词 / 联网工具 / 记账,不联网也不调模型 —— 随便跑,不花钱。
@@ -5109,12 +5598,12 @@ async function aiChatSelftest() {
       ok(!!toolMsg && toolMsg.content.length > 40, `tool 结果非空(${toolMsg?.content?.length || 0} 字)`);
       ok(!!toolMsg && /https?:\/\//.test(toolMsg.content), 'tool 结果里带来源链接');
       if (round === 2) {
-        // 预算还剩 1 次(AI_CHAT_MAX_SEARCHES=2)→ 这一轮**仍然挂着工具**,再做一次搜索请求
-        ok(!!body.tools, '预算没用完时继续挂着工具(还能再搜一次)');
+        // 2026-11-26 起搜索次数不设上限 → 这一轮仍然挂着工具
+        ok(!!body.tools, '搜索次数不设上限时继续挂着工具');
         return json({ choices: [{ message: { role: 'assistant', content: '', tool_calls: [{ id: 'call_2', type: 'function', function: { name: 'web_search', arguments: JSON.stringify({ query: '游戏王 禁卡表 生效日期' }) } }] } }] });
       }
-      // 到这里已搜满 2 次 → 必须**摘掉工具**(否则模型会一直搜下去,群友得等)
-      ok(!body.tools, `搜满预算后这一轮就不挂工具了[round=${round} msgs=${msgs.map(m => m.role).join('>')}]`);
+      // 搜了两次之后仍然可以搜(次数不限制),由轮数/调用总数兜底
+      ok(!!body.tools, `搜索次数不再限制,这一轮仍挂工具[round=${round} msgs=${msgs.map(m => m.role).join('>')}]`);
       ok(msgs.filter(m => m.role === 'tool').length === 2, '两轮搜索结果都在上下文里(模型看得见两次搜的)');
       return json({ choices: [{ message: { role: 'assistant', content: 'mock 回复:查到的说法是 …' } }] });
     };
@@ -5190,10 +5679,35 @@ if (process.argv.includes('--backfill-aichat-stats')) {
   backfillAiChatStats(process.argv.find(a => /^\d{4}-\d{2}-\d{2}$/.test(a)));
 }
 
+// 人格记忆:把 monitor 的转录/模型/日志注入 membrain(不反向 import monitor,避免循环依赖)。
+// 这样「提炼 / 做梦 / 群档案」对所有人格是同一套实现,只是数据目录按人格分开。
+configureMembrain({
+  fetchTranscript,
+  postChat,
+  model: AI_MODEL,
+  personaNameOf: id => PERSONA_SPECS[id]?.cn || id,
+  log: (m, color = 'dim') => log(m, '', C[color] || C.dim),
+});
+
+// 启动参数 --persona-dream <人格id> <群号>:立刻跑一次「做梦」(调试/补档案用,会真调模型)
+if (process.argv.includes('--persona-dream')) {
+  const i = process.argv.indexOf('--persona-dream');
+  const pid = process.argv[i + 1] || DEFAULT_PERSONA;
+  const gid = process.argv[i + 2] || '';
+  if (!/^\d{4,12}$/.test(gid)) {
+    console.error('用法: node monitor.mjs --persona-dream <人格id> <群号>');
+    process.exitCode = 1;
+  } else {
+    dreamPersonaMemory(pid, gid, { force: true })
+      .then(r => { console.log(JSON.stringify(r)); process.exitCode = r.ok ? 0 : 1; })
+      .catch(e => { console.error(e.stack || e.message); process.exitCode = 1; });
+  }
+}
+
 // 仅「直接运行」时启动服务:被别的脚本 import 进来(如临时诊断脚本)时不该连 WS、不该抢 tmux 面板。
 // 自测/回填那几个参数也一并排掉 —— 它们自己 process.exit,但会让 main() 先跑起来(连 WS、打启动横幅),
 // 2026-09-21 就踩到:跑 --aichat-selftest 时面板与「WS 错误」一起冒出来,看着像自测把机器人弄挂了。
-const ASKIP = ['--aichat-selftest', '--selftest-at', '--backfill-aichat-stats', '--tieba-selftest', '--belial-selftest', '--queue-selftest', '--builtinbot-selftest', '--ygometa-selftest', '--ygometa-send'];
+const ASKIP = ['--aichat-selftest', '--selftest-at', '--backfill-aichat-stats', '--tieba-selftest', '--belial-selftest', '--persona-selftest', '--queue-selftest', '--builtinbot-selftest', '--ygometa-selftest', '--ygometa-send', '--persona-dream'];
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href
   && !ASKIP.some(a => process.argv.includes(a))) main();
 
@@ -5237,5 +5751,5 @@ if (process.argv.includes('--update-cards')) updateCardDb();
 
 drawFeaturePanel();
 log(`SYSTEM 控制台: 仅 QQ ${ADMIN_QQ} 的「system …」生效(前缀是分流标记,不进模型;非主人发的照常当聊天);思考=${SYSTEM_THINK ? '开' : '关'} · 上下文 ${SYSTEM_CTX} 条 · max_tokens ${SYSTEM_MAX_TOKENS}`, '', C.dim);
-log(`${DRY_RUN ? '[DRY_RUN] ' : ''}QQ Agent 监控终端启动 (bot=${BOT_ID} | ${TRIGGER_KEYWORD}=史记 | ${CARD_TRIGGER}=查卡 | ${CARD_IMG_TRIGGER}=卡图 | ${RULING_TRIGGER}=官裁 | ${RULING_FULL_TRIGGER}=裁定PDF | ${DAILY_KEYWORD}=每日一卡 | ${META_TRIGGER}=环境饼图 | AI闲聊=${FEAT.ai ? `${AI_MODEL}(${TONE_CN[getTone()]},上下文 ${AI_CHAT_CTX} 条,图片直传一轮,联网=${AI_WEB_SEARCH ? searchProviderText() : '关闭'},冷却=${AI_CHAT_COOLDOWN_MS > 0 ? `${AI_CHAT_COOLDOWN_MS / 1000}s/人` : '关'})` : 'OFF'} | 贴吧模式=${tiebaStartupText()} | 银河皇帝模式=${belialStartupText()} | 功能开关见面板 1/2/3)`, '', C.cyan);
+log(`${DRY_RUN ? '[DRY_RUN] ' : ''}QQ Agent 监控终端启动 (bot=${BOT_ID} | ${TRIGGER_KEYWORD}=史记 | ${CARD_TRIGGER}=查卡 | ${CARD_IMG_TRIGGER}=卡图 | ${RULING_TRIGGER}=官裁 | ${RULING_FULL_TRIGGER}=裁定PDF | ${DAILY_KEYWORD}=每日一卡 | ${META_TRIGGER}=环境饼图 | AI闲聊=${FEAT.ai ? `${AI_MODEL}(${TONE_CN[getTone()]},上下文 ${AI_CHAT_CTX} 条,图片直传一轮,联网=${AI_WEB_SEARCH ? searchProviderText() : '关闭'},冷却=${AI_CHAT_COOLDOWN_MS > 0 ? `${AI_CHAT_COOLDOWN_MS / 1000}s/人` : '关'})` : 'OFF'} | 贴吧模式=${tiebaStartupText()} | 人格模式=${belialStartupText()} | 功能开关见面板 1/2/3)`, '', C.cyan);
 }   // ← main() 到这儿结束:进程主体只在「直接运行本文件」时执行

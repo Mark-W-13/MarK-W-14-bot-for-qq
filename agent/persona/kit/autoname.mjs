@@ -1,14 +1,14 @@
 // 表情包批量 AI 命名:给 up_* 里还没有动态描述/标签的图跑视觉模型,写进 sticker_meta.json。
 // 用法:
-//   node agent/belial/autoname.mjs [--limit 5] [--force]
+//   node agent/persona/kit/autoname.mjs [--limit 5] [--force]
 //   POST /api/belial/stickers/autoname {limit, force}  (WebUI「AI 命名未命名」按钮)
-import './../env.mjs';
+import './../../env.mjs';
 import { readFileSync } from 'node:fs';
 import { basename } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import {
   stickerCatalog, stickerPath, stickerMime, dynamicStickerMeta, setStickerMeta,
-} from './belial.mjs';
+} from './kit.mjs';
 
 const KEY = () => process.env.DEEPSEEK_API_KEY || process.env.AI_CHAT_API_KEY || '';
 const URL = () => process.env.AI_CHAT_API_URL || 'https://api.deepseek.com/chat/completions';

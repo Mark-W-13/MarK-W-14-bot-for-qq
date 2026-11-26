@@ -1,8 +1,8 @@
 # SYSTEM 接口测试控制台
 
 2026-10-28 加。主人在 QQ 群里发 `system <指令>`,这段指令交给一个**带工具**的模型对话,用来测机器人
-对外提供的几个接口:**联网搜索 / 表情包 / 语音**。模型自己决定调哪个接口,调完用文字说结果;
-表情包、语音由 monitor 在文字之后单独发出去。
+对外提供的几个接口:**联网搜索 / 表情包 / 语音 / @ 人**。模型自己决定调哪个接口,调完用文字说结果;
+表情包、语音、独立 @ 消息由 monitor 在文字之后单独发出去。
 
 - 只对 **ADMIN_QQ(默认 `3344195836`)** 生效;别人发 `system …` 照常当群聊。
 - **思考模式默认开**(`SYSTEM_THINK`,独立于贝利亚的 `BELIAL_THINK`);启动横幅会打出 `思考=开/关`、上下文条数与 max_tokens。
@@ -46,6 +46,8 @@ inbox / 贴吧上下文(控制台自己会去拉群聊当上下文,那是只读�
 | `download_sticker(url, name)` | 把图片下载进表情包库(≤5MB) | 1 次 |
 | `list_voices()` | 列出可用声线 | 不限 |
 | `send_voice(text, voice)` | 合成并单独发一条语音(≤120 字) | 1 条 |
+| `list_group_members(query)` | 查本群成员昵称 / QQ(可按名字过滤) | 不限 |
+| `send_at(target, text)` | 单独发一条 @ 消息;`target` 填群昵称或 QQ 号,不填 `text` 则把本次正文第一条改成 @ 他 | 2 次 |
 
 上限沿用银河皇帝模式那套(`BELIAL_MAX_SEARCHES` / `BELIAL_MAX_IMAGE_SEARCHES` /
 `BELIAL_MAX_DOWNLOADS` / `BELIAL_MAX_STICKERS` / `BELIAL_MAX_VOICES`),防一次指令刷爆接口。

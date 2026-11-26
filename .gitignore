@@ -78,3 +78,22 @@ agent/shitpost/seed_memory.json
 data/
 
 agent/mycard/bindings.json
+
+# 人格共用库(2026-11-26 由 belial/ 迁入并改名):运行时开关/名片/概率、上传的表情包、
+# 语音缓存与声线开关、每人格的记忆与做梦状态都不入库;种子表情包入库。
+agent/persona/kit/state.json
+agent/persona/kit/sticker_meta.json
+agent/persona/kit/stickers/up_*
+agent/persona/kit/voice_state.json
+agent/persona/kit/voice_cache/
+agent/persona/mem/
+agent/persona/memory.jsonl.split
+agent/persona/memory.json.migrated
+
+# 服务器上的备份/日志(调试时留下的 .bak-时间戳、运行时日志),不入库
+agent/.env.bak*
+*.bak-*
+agent/**/logs/
+
+# 本地临时目录(同步服务器代码时的中转文件)
+/tmp/

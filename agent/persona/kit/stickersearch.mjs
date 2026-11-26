@@ -10,7 +10,7 @@
 //   · 不信 Content-Type,addSticker 按文件头只认 jpg/png/gif/webp
 import { basename } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { addSticker, MAX_STICKER_BYTES } from './belial.mjs';
+import { addSticker, MAX_STICKER_BYTES } from './kit.mjs';
 
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36';
 const IMG_SEARCH = 'https://image.so.com/j';

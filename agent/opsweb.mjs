@@ -19,7 +19,7 @@ import { createServer } from 'node:http';
 import { execFile } from 'node:child_process';
 import { readFileSync, existsSync, statSync, readdirSync,
          openSync, readSync, closeSync, fstatSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { join, dirname, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { allModes, setMode as setGroupMode, modeOf, MODE_CN, MODES } from './modes.mjs';
@@ -33,24 +33,24 @@ import {
   PROB_DEFAULT as TIEBA_PROB, PROB_AT_DEFAULT as TIEBA_AT_PROB, CTX as TIEBA_CTX, MAX_REPLY as TIEBA_MAX_REPLY,
   MAX_CHARS as TIEBA_MAX_CHARS, NEW_GAP_MS as TIEBA_GAP_MS, MIN_CHARS as TIEBA_MIN_CHARS,
 } from './tieba/tieba.mjs';
-// 银河皇帝模式(2026-10-26):状态、提示词、表情包库都在 belial/belial.mjs。本文件只画界面、
-// 写状态文件、收发上传的图片 —— monitor 每次回复前现读 state.json / 表情包目录,点完立即生效。
+// 人格共用工具库(2026-11-26:belial → persona/kit)。状态/表情包库/开关都在 kit.mjs,
+// 本文件只画界面、写状态文件、收发上传的图片 —— monitor 每次回复前现读,点完立即生效。
 import {
   allOn as belialAll, isOn as belialOn, setOn as belialSetOn, statePath as belialStatePath,
   nonAtProbOf as belialNonAtProbOf, setNonAtProb as belialSetNonAtProb, NONAT_PROB_DEFAULT as BELIAL_NONAT_PROB,
+  reactProbOf as belialReactProbOf, setReactProb as belialSetReactProb, REACT_PROB_DEFAULT as BELIAL_REACT_PROB,
   nonAtAutoOf as belialNonAtAutoOf, setNonAtAuto as belialSetNonAtAuto,
   autoProbsOf as belialAutoProbsOf, setAutoProbs as belialSetAutoProbs,
   stickerCatalog as belialStickerCatalog,
   addSticker as belialAddSticker, deleteSticker as belialDeleteSticker,
   setStickerMeta as belialSetStickerMeta, dynamicStickerMeta as belialDynamicStickerMeta,
   stickerPath as belialStickerPath, stickerMime as belialStickerMime, stickerDir as belialStickerDir,
-  MAX_STICKER_BYTES as BELIAL_MAX_STICKER, FEATURE_CN as BELIAL_CN, KEYWORD as BELIAL_KEYWORD,
-  personaOf as belialPersonaOf, setPersona as belialSetPersona, PERSONA_IDS, PERSONA_LABELS,
-  GROUP_CARD as BELIAL_GROUP_CARD, originalCardOf as belialOriginalCardOf,
-  setOriginalCard as belialSetOriginalCard, clearOriginalCard as belialClearOriginalCard,
-} from './belial/belial.mjs';
-// 脚刷周模式(2026-10-29):第二个人格。表情包库/开关与贝利亚共用同一个面板,
-// 这里只多读一份它的表情包目录,并在 /api/belial 里接 persona 参数。
+  MAX_STICKER_BYTES as BELIAL_MAX_STICKER,
+  personaOf as belialPersonaOf, setPersona as belialSetPersona, PERSONA_IDS, PERSONA_LABELS, DEFAULT_PERSONA,
+  originalCardOf as belialOriginalCardOf, setOriginalCard as belialSetOriginalCard,
+  clearOriginalCard as belialClearOriginalCard, autoReplyOf, setAutoReply,
+} from './persona/kit/kit.mjs';
+// 脚刷周人格(2026-10-29):表情包库/开关与共用工具库同一个面板,这里多读一份它的目录。
 import {
   stickerCatalog as jszStickerCatalog, addSticker as jszAddSticker, deleteSticker as jszDeleteSticker,
   setStickerMeta as jszSetStickerMeta, dynamicStickerMeta as jszDynamicStickerMeta,
@@ -58,16 +58,19 @@ import {
   MAX_STICKER_BYTES as JSZ_MAX_STICKER, PERSONA_CN as JSZ_CN, KEYWORD as JSZ_KEYWORD,
   PERSONA_ID as JSZ_ID, GROUP_CARD as JSZ_GROUP_CARD, SEED_MEMORIES as JSZ_SEED_MEMORIES,
 } from './jiaoshuazhou/jiaoshuazhou.mjs';
-// 西比拉(2026-10-29 正式上线):记忆驱动人格,系统提示只有一句身份 + 记忆块。
+// W14(2026-11-26 由「西比拉」改名):记忆驱动人格,系统提示只有一句身份 + 记忆块。
 import {
-  PERSONA_ID as SIBYL_ID, PERSONA_CN as SIBYL_CN, GROUP_CARD as SIBYL_GROUP_CARD,
-} from './persona/sibyl.mjs';
+  PERSONA_ID as W14_ID, PERSONA_CN as W14_CN, GROUP_CARD as W14_GROUP_CARD, KEYWORD as W14_KEYWORD,
+} from './persona/w14.mjs';
 import {
   addMemory as personaAddMemory, deleteMemory as personaDeleteMemory, updateMemory as personaUpdateMemory,
-  listMemories as personaListMemories, memoryStats,
+  listMemories as personaListMemories, memoryStats, memoryPathOf,
 } from './persona/memory.mjs';
-import { readVoiceMode, setVoiceMode, voiceCatalog, voiceModeLabel } from './belial/voice.mjs';
-import { autonameStickers } from './belial/autoname.mjs';
+import {
+  personaMemoryBlock, profileOf as personaProfileOf, personaDataDir, dreamGroup as personaDream,
+} from './persona/membrain.mjs';
+import { readVoiceMode, setVoiceMode, voiceCatalog, voiceModeLabel } from './persona/kit/voice.mjs';
+import { autonameStickers } from './persona/kit/autoname.mjs';
 // ⚠ 这一行只是把 env.mjs **加载**进来 —— 它**被 import 的那一刻**就自己把 agent/.env 读进
 //   process.env 了(env.mjs 文件末尾有 loadEnvFile())。所以本文件**不要再自己调一次** loadEnvFile():
 //   那时 .env 的键已经在 process.env 里,再调会因为「已存在」而全部跳过、返回空数组,
@@ -286,9 +289,9 @@ async function groupsWithTieba() {
   return { all: st.all, groups: rows, opened: rows.filter(r => r.tieba).length, file: tiebaStatePath(), updatedAt: st.updatedAt };
 }
 
-// ---------- 人格面板(2026-10-26 银河皇帝,2026-10-29 加脚刷周后改名) ----------
-// 与贴吧模式同一套群列表与开关交互:状态读 belial/state.json(monitor 用的同一个文件),
-// 所以这里显示的就是线上正在生效的状态。每群在「贝利亚 / 脚刷周」里二选一;表情包库也按人格分开。
+// ---------- 人格面板(2026-10-26 起;2026-11-26 只剩脚刷周 / W14) ----------
+// 与贴吧模式同一套群列表与开关交互:状态读 persona/kit/state.json(monitor 用的同一个文件),
+// 所以这里显示的就是线上正在生效的状态。每群在「脚刷周 / W14」里二选一;表情包库按人格分开。
 async function groupsWithBelial() {
   const st = belialAll();
   const nameOf = new Map();
@@ -299,15 +302,16 @@ async function groupsWithBelial() {
     .map(([groupId, name]) => {
       const on = belialOn(groupId);
       const persona = belialPersonaOf(groupId);
-      return { groupId, name, belial: on, on, persona };
+      return { groupId, name, belial: on, on, persona, autoReply: autoReplyOf(groupId) };
     })
     .sort((a, b) => Number(b.belial) - Number(a.belial)
       || String(a.name || a.groupId).localeCompare(String(b.name || b.groupId), 'zh'));
   const opened = rows.filter(r => r.belial).length;
   const jszCount = rows.filter(r => r.belial && r.persona === JSZ_ID).length;
+  const w14Count = rows.filter(r => r.belial && r.persona === W14_ID).length;
   return {
     all: st.all, groups: rows, opened,
-    belialCount: opened - jszCount, jszCount,
+    jszCount, w14Count,
     personas: st.personas || {},
     nonAtProb: st.nonAtProb, nonAtAuto: st.nonAtAuto !== false,
     autoMaxProb: st.autoMaxProb, autoMinProb: st.autoMinProb, file: belialStatePath(), updatedAt: st.updatedAt,
@@ -315,12 +319,12 @@ async function groupsWithBelial() {
 }
 
 /** 人格 → 群名片(群昵称) */
-const PERSONA_GROUP_CARD = { belial: BELIAL_GROUP_CARD, [JSZ_ID]: JSZ_GROUP_CARD, [SIBYL_ID]: SIBYL_GROUP_CARD };
+const PERSONA_GROUP_CARD = { [JSZ_ID]: JSZ_GROUP_CARD, [W14_ID]: W14_GROUP_CARD };
 const BOT_UIN = () => String(process.env.BOT_ID || '3757588606');
 
 /**
  * 切人格时同步群名片(2026-10-29 用户要求):
- *   贝利亚 → 「贝利亚大王」,脚刷周 → 「脚刷周」;关掉时恢复切换前的名片。
+ *   脚刷周 → 「脚刷周」,W14 → 「W14」;关掉时恢复切换前的名片。
  * 第一次切之前把原名片记进 belial/state.json 的 cards,monitor 与 opsweb 共用。
  * 群名片是「尽力而为」:OneBot 失败只影响这一项,不影响开关。
  */
@@ -412,7 +416,7 @@ function stickerApiFor(persona) {
     };
   }
   return {
-    id: 'belial', cn: PERSONA_LABELS.belial, dir: belialStickerDir, catalog: belialStickerCatalog,
+    id: 'shared', cn: '共用表情包', dir: belialStickerDir, catalog: belialStickerCatalog,
     add: belialAddSticker, remove: belialDeleteSticker, path: belialStickerPath, mime: belialStickerMime,
     setMeta: belialSetStickerMeta, dynamicMeta: belialDynamicStickerMeta,
     maxBytes: BELIAL_MAX_STICKER,
@@ -480,6 +484,50 @@ async function accountInfo() {
   if (Date.now() - acctCache.at < 60000) return acctCache.val;
   acctCache = { at: Date.now(), val: await onebot('get_login_info') };
   return acctCache.val;
+}
+
+// ---------- 记忆文件树(2026-11-26) ----------
+// 给 WebUI 的「记忆」页:每个人格一个独立目录,列出笔记/群档案/做梦状态,附可点的相对路径。
+// 只读文件元数据,不解析大文件内容(notes.jsonl 只取 stat,条数走 memoryStats)。
+function fileMeta(p) {
+  try { const s = statSync(p); return { size: s.size, mtime: s.mtimeMs }; } catch { return null; }
+}
+function memoryTree() {
+  const rootDir = join(AGENT, 'persona', 'mem');
+  return {
+    root: 'agent/persona/mem',
+    personas: PERSONA_IDS.map(id => {
+      const dir = join(rootDir, id);
+      const seed = id === JSZ_ID ? JSZ_SEED_MEMORIES : [];
+      const stat = (() => { try { return memoryStats(id, { seed }); } catch { return { dynamic: 0, total: 0, max: 300, rejected: 0, byScope: { global: 0, group: 0, user: 0 } }; } })();
+      const notes = fileMeta(join(dir, 'notes.jsonl'));
+      const dream = fileMeta(join(dir, 'dream_state.json'));
+      const groups = [];
+      try {
+        for (const f of readdirSync(join(dir, 'profiles'))) {
+          if (!f.endsWith('.json')) continue;
+          const p = join(dir, 'profiles', f);
+          const j = readJson(p) || {};
+          groups.push({
+            file: `${id}/profiles/${f}`,
+            group: String(j.group || f.replace(/\.json$/, '')),
+            name: String(j.name || ''),
+            summary: String(j.summary || ''),
+            updatedAt: Number(j.updatedAt) || 0,
+            size: (fileMeta(p) || {}).size || 0,
+          });
+        }
+      } catch { /* 还没有 profiles 目录 */ }
+      groups.sort((a, b) => b.updatedAt - a.updatedAt);
+      return {
+        id, cn: PERSONA_LABELS[id] || id, dir: `agent/persona/mem/${id}`,
+        stats: stat,
+        notes: notes ? { file: `${id}/notes.jsonl`, ...notes } : null,
+        dream: dream ? { file: `${id}/dream_state.json`, ...dream } : null,
+        groups,
+      };
+    }),
+  };
 }
 
 async function buildStatus() {
@@ -553,28 +601,27 @@ async function buildStatus() {
         stickerDirJsz: jszStickerDir(),
         maxStickerBytes: BELIAL_MAX_STICKER,
         maxStickerBytesJsz: JSZ_MAX_STICKER,
-        keyword: BELIAL_KEYWORD,
+        keyword: JSZ_KEYWORD,
         keywordJsz: JSZ_KEYWORD,
-        cn: BELIAL_CN,
+        cn: JSZ_CN,
         cnJsz: JSZ_CN,
         personas: b.personas || {},
         personaOptions: [
-          { id: 'belial', cn: BELIAL_CN, short: '贝利亚', keyword: BELIAL_KEYWORD, count: belialStickerCatalog().length },
           { id: JSZ_ID, cn: JSZ_CN, short: '脚刷周', keyword: JSZ_KEYWORD, count: jszStickerCatalog().length },
-          { id: SIBYL_ID, cn: SIBYL_CN, short: '西比拉', keyword: '西比拉', count: 0 },
+          { id: W14_ID, cn: W14_CN, short: 'W14', keyword: W14_KEYWORD, count: belialStickerCatalog().length },
         ],
-        // 人格记忆库(2026-10-29):群聊里模型自己 add/delete,这里给面板看/删/补
+        // 人格记忆库:群聊里模型自己 add/delete,这里给面板看/删/补。每个人格独立目录。
         memories: {
-          belial: personaListMemories('belial', { includeSeed: true }),
           [JSZ_ID]: personaListMemories(JSZ_ID, { seed: JSZ_SEED_MEMORIES, includeSeed: true }),
-          [SIBYL_ID]: personaListMemories(SIBYL_ID, { includeSeed: true }),
+          [W14_ID]: personaListMemories(W14_ID, { includeSeed: true }),
         },
         memoryStats: {
-          belial: memoryStats('belial'),
           [JSZ_ID]: memoryStats(JSZ_ID, { seed: JSZ_SEED_MEMORIES }),
-          [SIBYL_ID]: memoryStats(SIBYL_ID),
+          [W14_ID]: memoryStats(W14_ID),
         },
         nonAtProb: belialNonAtProbOf(),
+        reactProb: belialReactProbOf(),
+        reactProbEnv: BELIAL_REACT_PROB,
         nonAtAuto: belialNonAtAutoOf(),
         autoMaxProb: belialAutoProbsOf().max,
         autoMinProb: belialAutoProbsOf().min,
@@ -590,7 +637,13 @@ async function buildStatus() {
       };
     })(),
     account: info?.data ? { uin: String(info.data.user_id), nickname: info.data.nickname } : null,
-    cards: { mtime: cardsMtime, count: cards ? Object.keys(cards).length : 0, images: countImages() },
+    cards: {
+      mtime: cardsMtime,
+      count: cards ? Object.keys(cards).length : 0,
+      // 超先行卡(萌卡先行库并入的,见 ygocard/superpre.mjs):百鸽还没收录、已经能查的新卡
+      superpre: cards ? Object.values(cards).filter(c => c && c.src === 'superpre').length : 0,
+      images: countImages(),
+    },
     host: { ...host, disk, uptimeText: fmtDuration(host.uptimeS) },
     aiChat: {
       rows: aiRows,
@@ -598,6 +651,7 @@ async function buildStatus() {
       updatedAt: aiStat.updatedAt || 0,
       approximateSince: aiStat.approximateSince || '',
     },
+    memory: memoryTree(),
     lastRequest: lastMatch(lines, /★ @请求/),
     lastSend: lastMatch(lines, /已发送 message_id=/),
   };
@@ -764,6 +818,22 @@ button.mini{min-height:28px;padding:4px 10px;font-size:12px;border-radius:7px}
 .blitem .bx{position:absolute;top:3px;right:3px;width:20px;height:20px;line-height:18px;text-align:center;border-radius:50%;background:rgba(0,0,0,.55);color:#fff;font-size:14px;cursor:pointer;border:0;padding:0;min-height:0}
 .blitem .bx:hover{background:var(--bad)}
 .blupload{display:flex;align-items:center;gap:8px;margin-bottom:8px;flex-wrap:wrap}
+/* 站内书签(2026-11-26):顶部 tab 切页,单页仍保持原来的卡片网格;记忆层级图用 <details> 折叠。 */
+#tabs{position:sticky;top:57px;z-index:4;background:var(--card);border-bottom:1px solid var(--line);padding:7px 12px;display:flex;gap:6px;flex-wrap:wrap;justify-content:center}
+#tabs button{min-height:28px;padding:3px 13px;font-size:12px;border-radius:999px}
+#tabs button.on{background:var(--acc);color:#fff;border-color:var(--acc)}
+.page{display:contents}
+.page:not(.on){display:none}
+.memtree{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;line-height:1.9;margin-top:8px}
+.memtree a{color:var(--acc);text-decoration:none}
+.memtree a:hover{text-decoration:underline}
+.memtree .muted{color:var(--mut)}
+.memtree details{margin:2px 0 2px 10px}
+.memtree summary{cursor:pointer;padding:2px 0}
+.memlayers{display:flex;gap:6px;flex-wrap:wrap;align-items:stretch;margin:10px 0}
+.memlayers .lay{flex:1 1 150px;border:1px solid var(--line);border-radius:9px;padding:8px 10px;background:#fafafa;font-size:12px}
+.memlayers .arr{align-self:center;color:var(--mut);font-size:16px}
+.memlayers .lay b{display:block;margin-bottom:3px}
 </style></head><body>
 
 <div id="login"><div class="box">
@@ -779,22 +849,34 @@ button.mini{min-height:28px;padding:4px 10px;font-size:12px;border-radius:7px}
   <button onclick="logout()" style="min-height:30px;padding:4px 10px">退出</button>
 </header>
 
+<nav id="tabs">
+  <button class="on" data-tab="overview" onclick="showTab('overview')">概览</button>
+  <button data-tab="persona" onclick="showTab('persona')">人格</button>
+  <button data-tab="memory" onclick="showTab('memory')">记忆</button>
+  <button data-tab="aichat" onclick="showTab('aichat')">闲聊</button>
+  <button data-tab="system" onclick="showTab('system')">系统</button>
+  <button data-tab="logs" onclick="showTab('logs')">日志</button>
+</nav>
+
 <div class="wrap" id="app">
+<section class="page on" id="page-overview">
   <div class="card"><h2>功能开关</h2><div id="feats"></div>
-    <div class="mut" style="margin-top:8px">切换即时生效,不重启 bot(走 tmux 面板按键)</div></div>
+    <div class="mut" style="margin-top:8px">切换即时生效,不重启 bot</div></div>
 
   <div class="card wide"><h2>游戏模式 <span class="mut" style="font-weight:400">(按群)</span></h2>
     <div id="modes"></div>
     <div class="mut" style="margin-top:8px;font-size:11px">决定该群「效果 / 卡图 / 每日一卡 / 卡组」按哪个游戏走(默认游戏王);群友发「mode 炉石」「mode 游戏王」也能改,与此处同步。</div></div>
 
-  <div class="card"><h2>贴吧模式 <span class="mut" style="font-weight:400">(按群)</span></h2>
+  <div class="card wide"><h2>贴吧模式 <span class="mut" style="font-weight:400">(按群)</span></h2>
     <div id="tieba"></div>
     <div style="margin-top:10px"><button onclick="openTieba()">选择群…</button>
       <span class="mut" style="margin-left:8px" id="tiebanote"></span></div>
     <div class="mut" style="margin-top:8px;font-size:11px">开了之后<strong>不用 @ 也会接话</strong>(脏话全开、短句、可连发、不 @ 人),而且 <strong>@ 它也归它管</strong>:那个群的兜底闲聊会被同一套人格覆盖(不答疑、不帮忙、只骂人)。
       <br>⚠ 默认全部关闭:只对这里点开的群生效;群友发「贴吧模式 开 / 关」也能切。</div></div>
+</section>
 
-  <div class="card"><h2>人格面板 <span class="mut" style="font-weight:400">(按群)</span></h2>
+<section class="page" id="page-persona">
+  <div class="card wide"><h2>人格面板 <span class="mut" style="font-weight:400">(按群)</span></h2>
     <div id="belial"></div>
     <div style="margin-top:10px"><button onclick="openBelial()">打开控制台…</button>
       <span class="mut" style="margin-left:8px" id="belialnote"></span></div>
@@ -802,25 +884,32 @@ button.mini{min-height:28px;padding:4px 10px;font-size:12px;border-radius:7px}
       <span class="mut" style="font-size:11px">默认声线</span>
       <div id="blquickvoices" style="display:flex;gap:6px"></div>
     </div>
-    <div class="mut" style="margin-top:8px;font-size:11px">群友 <strong>@我 说「银河皇帝」</strong>切「银河皇帝贝利亚」,说 <strong>「脚刷周模式」</strong>切「脚刷周」(JoshuaZhou 的音译;再发「银河皇帝 关 / 脚刷周 关」切回);
-      每群二选一,只改被 @ 时的口吻,不碰游戏功能。点开控制台可按群切人格、<strong>查看/删除/上传两个人的表情包</strong>。</div></div>
+    <div class="mut" style="margin-top:8px;font-size:11px">现在只有<strong>脚刷周</strong>和 <strong>W14</strong> 两个人格。群友 @我 说「脚刷周模式」切脚刷周,说「脚刷周 关」切回;W14 只能在面板切。
+      每群二选一,只改被 @ 时的口吻,不碰游戏功能。点开控制台可按群切人格、<strong>查看/删除/上传各自的图片</strong>。</div></div>
+</section>
 
-  <div class="card"><h2>服务</h2><div id="svcs"></div></div>
+<section class="page" id="page-memory">
+  <div class="card wide"><h2>记忆架构 <span class="mut" style="font-weight:400" id="memroot"></span></h2>
+    <div class="mut" style="font-size:11px">每个人格一套独立目录,四层结构相同:转录(不落盘)→ 笔记 → 群档案 → 注入层。点文件名可打开原文检查。</div>
+    <div class="memlayers">
+      <div class="lay"><b>① 转录</b><span class="mut">群聊记录<br>monitor 现取,不落盘</span></div>
+      <span class="arr">→</span>
+      <div class="lay"><b>② 笔记</b><span class="mut">notes.jsonl<br>add_memory / 提炼</span></div>
+      <span class="arr">→</span>
+      <div class="lay"><b>③ 群档案</b><span class="mut">profiles/群号.json<br>做梦时校准/沉淀</span></div>
+      <span class="arr">→</span>
+      <div class="lay"><b>④ 注入层</b><span class="mut">每次回复前<br>档案摘要 + 相关笔记</span></div>
+    </div>
+    <div id="memtree" class="memtree"><div class="mut">读取中…</div></div>
+    <div class="mut" style="margin-top:8px;font-size:11px">笔记是只追加的事件日志(删改也是追加一条),不会丢历史;群档案由「做梦」按群聊记录校准,别人格的私事不会串进来。</div></div>
+</section>
 
-  <div class="card"><h2>账号</h2><div id="acct"></div></div>
-
-  <div class="card"><h2>卡库</h2><div id="cards"></div>
-    <div style="margin-top:10px"><button class="pri" onclick="doUpdate()">更新卡库</button>
-      <span class="mut" style="margin-left:8px">联网拉卡库,随后自动补缺失卡图</span></div>
-    <div id="upbox"><div id="uphead"></div><div id="upmsg"></div><pre id="uprog"></pre></div></div>
-
-  <div class="card"><h2>主机</h2><div id="host"></div></div>
-
+<section class="page" id="page-aichat">
   <div class="card wide"><h2>AI 闲聊 · 提示词档位 <span class="mut" style="font-weight:400" id="tonenote"></span></h2>
     <div id="tones"></div>
-    <div class="mut" style="margin-top:8px;font-size:11px">决定机器人「能聊什么」:板正档守着原来的政治/色情红线,熟人群聊档(默认)把它们放开,放开档连引战也接。<strong>点了即时生效,不用重启</strong>(monitor 每次回复前现读档位文件)。</div></div>
+    <div class="mut" style="margin-top:8px;font-size:11px">决定机器人「能聊什么」:板正档守着原来的政治/色情红线,熟人群聊档(默认)把它们放开,放开档连引战也接。<strong>点了即时生效,不用重启</strong>。</div></div>
 
-  <div class="card"><h2>AI 闲聊 · 联网 <span class="mut" style="font-weight:400" id="netsnote"></span></h2>
+  <div class="card wide"><h2>AI 闲聊 · 联网 <span class="mut" style="font-weight:400" id="netsnote"></span></h2>
     <div id="nets"></div>
     <div class="mut" style="margin-top:8px;font-size:11px">联网是本地工具调用:模型自己判断该不该搜,搜到的标题/摘要/链接连日期一起喂回去(事实性问题才搜,纯闲聊不搜)。<br>换源/开关:agent/.env 的 AI_CHAT_WEB_SEARCH、SEARCH_PROVIDER、SEARCH_COUNT(改完重启 monitor 生效)。</div></div>
 
@@ -829,14 +918,26 @@ button.mini{min-height:28px;padding:4px 10px;font-size:12px;border-radius:7px}
     <div class="aicols" id="aichat2" style="display:none"></div>
     <div id="aichatmore" style="margin-top:7px"></div>
     <div class="mut" style="margin-top:6px;font-size:11px">口径:按回复实际发给谁计;冷却跳过不计,失败另标。悬停看完整名字。</div></div>
+</section>
 
+<section class="page" id="page-system">
+  <div class="card"><h2>服务</h2><div id="svcs"></div></div>
+  <div class="card"><h2>账号</h2><div id="acct"></div></div>
+  <div class="card"><h2>卡库</h2><div id="cards"></div>
+    <div style="margin-top:10px"><button class="pri" onclick="doUpdate()">更新卡库</button>
+      <span class="mut" style="margin-left:8px">联网拉卡库,随后自动补缺失卡图</span></div>
+    <div id="upbox"><div id="uphead"></div><div id="upmsg"></div><pre id="uprog"></pre></div></div>
+  <div class="card"><h2>主机</h2><div id="host"></div></div>
+</section>
+
+<section class="page" id="page-logs">
   <div class="card wide"><h2>QQ 消息日志 <span class="mut" style="font-weight:400" id="snowfile"></span>
     <label class="mut" style="margin-left:auto;font-weight:400"><input type="checkbox" id="snowall"> 全部(含调试)</label></h2>
     <pre id="snowlog"></pre></div>
-
   <div class="card wide"><h2>日志 <span class="mut" style="font-weight:400">(monitor 面板最近 300 行)</span>
     <label class="mut" style="margin-left:auto;font-weight:400"><input type="checkbox" id="auto" checked> 自动刷新</label></h2>
     <pre id="log"></pre></div>
+</section>
 </div>
 
 <div id="toast"></div>
@@ -887,8 +988,18 @@ button.mini{min-height:28px;padding:4px 10px;font-size:12px;border-radius:7px}
   <div class="mut" style="font-size:11px;margin:-2px 0 8px">自动模式默认开启:按本群最近 5 分钟消息频次平滑调整,
     低频约 <strong>35%</strong>、高频约 <strong>5%</strong>;关掉「自动」才用滑杆固定值(0 = 完全不自动接话,1 = 每句都接)。
     上面两个百分比就是 auto 的<strong>低频上限 / 高频下限</strong>,可改。</div>
+  <div class="tbprob">
+    <span class="tbpc">只贴表情概率</span>
+    <input type="range" id="blreactprob" min="0" max="1" step="0.01" value="0.06"
+      oninput="blReactProbInput(this.value)" onchange="blReactProbSave(this.value)">
+    <input type="number" id="blreactprobn" min="0" max="1" step="0.01" value="0.06"
+      onchange="blReactProbSave(this.value)">
+    <span class="tbpc" id="blreactprobv">6%</span>
+  </div>
+  <div class="mut" style="font-size:11px;margin:-2px 0 8px">独立概率:命中后<strong>让模型判断这条值不值得贴</strong>(不是关键词匹配);
+    值得才贴,最多 3 个 笑哭(好笑)、棒棒糖(唐/弱智)、鲸鱼(懒得喷),不发文字;一般 1 个就够,不凑数。</div>
   <div id="blbody"></div>
-  <div class="mut" style="margin-top:8px;font-size:11px">切人格会同时改机器人在本群的<strong>群名片</strong>:贝利亚 →「贝利亚大王」,脚刷周 →「脚刷周」;关掉人格时恢复切换前的名片(第一次切之前自动记下)。</div>
+  <div class="mut" style="margin-top:8px;font-size:11px">切人格会同时改机器人在本群的<strong>群名片</strong>:脚刷周 →「脚刷周」,W14 →「W14」;关掉人格时恢复切换前的名片(第一次切之前自动记下)。</div>
   <div style="margin-top:14px;border-top:1px solid var(--line);padding-top:10px">
     <div style="display:flex;align-items:center;gap:8px">
       <strong style="font-size:13px">默认声线</strong>
@@ -932,11 +1043,40 @@ button.mini{min-height:28px;padding:4px 10px;font-size:12px;border-radius:7px}
     </div>
   </div>
   <div class="mut" style="margin-top:10px;font-size:11px">开关/人格是<strong>每群各记各的</strong>,点了立刻生效(monitor 每次回复前现读状态文件,不用重启)。<br>
-    群里的等价指令:@我 说「银河皇帝」或「脚刷周模式」召唤,说「银河皇帝 关」/「脚刷周 关」收起;这个模式不在 /help 里。</div>
+    群里的等价指令:@我 说「脚刷周模式」召唤,说「脚刷周 关」收起;W14 只能在面板切。这个模式不在 /help 里。</div>
 </div></div>
 
 <script>
 function h(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
+// 站内书签(2026-11-26):用 hash 切页,刷新/分享都落到同一页;页面内容仍是每 5 秒轮询的全量状态。
+function showTab(name){
+  var pages=document.querySelectorAll('.page'),tabs=document.querySelectorAll('#tabs button'),i;
+  for(i=0;i<pages.length;i++)pages[i].className='page'+(pages[i].id==='page-'+name?' on':'');
+  for(i=0;i<tabs.length;i++)tabs[i].className=(tabs[i].getAttribute('data-tab')===name?'on':'');
+  if(location.hash!=='#'+name)history.replaceState(null,'','#'+name);
+}
+function memLink(file,label,pretty){
+  return '<a target="_blank" rel="noopener" href="/api/mem/file?path='+encodeURIComponent(file)+(pretty?'&pretty=1':'')+'">'+h(label)+'</a>';
+}
+// 记忆文件层级图:每个人格一个折叠块,笔记/群档案/做梦状态都挂原文链接。
+function renderMemory(m){
+  var box=document.getElementById('memtree'),note=document.getElementById('memroot');
+  if(!box)return;
+  if(note)note.textContent=m&&m.root?('('+m.root+')'):'';
+  if(!m||!m.personas){box.innerHTML='<div class="mut">读不到记忆目录</div>';return}
+  var html='';
+  m.personas.forEach(function(p,pi){
+    html+='<details'+(pi===0?' open':'')+'><summary><b>'+h(p.cn)+'</b> <span class="muted">'+h(p.dir)+'/ · '+p.stats.dynamic+' 条笔记 · '+p.groups.length+' 个群档案</span></summary>';
+    html+='<div>├─ 笔记 '+(p.notes?memLink(p.notes.file,'notes.jsonl',1)+' <span class="muted">('+p.stats.dynamic+' 条 · '+fmtBytes(p.notes.size)+')</span>':'<span class="muted">(还没有,攒够消息会自动提炼)</span>')+'<br>';
+    html+='├─ 群档案/ <span class="muted">'+p.groups.length+' 个</span><br>';
+    p.groups.forEach(function(g){
+      html+='│&nbsp;&nbsp;├─ '+memLink(g.file,g.group+'.json',1)+' <span class="muted">'+h(g.name||'')+(g.summary?' · '+h(g.summary):'')+'</span><br>';
+    });
+    html+='└─ 做梦状态 '+(p.dream?memLink(p.dream.file,'dream_state.json',1)+' <span class="muted">'+fmtBytes(p.dream.size)+'</span>':'<span class="muted">(还没跑过)</span>')+'</div>';
+    html+='</details>';
+  });
+  box.innerHTML=html||'<div class="mut">还没有记忆目录</div>';
+}
 function toast(m){var t=document.getElementById('toast');t.textContent=m;t.className='show';clearTimeout(t._h);t._h=setTimeout(function(){t.className=''},3600)}
 function doLogin(){
   var v=document.getElementById('tk').value;
@@ -1002,12 +1142,29 @@ function renderTieba(force){
 // 人格面板(2026-10-29:银河皇帝 + 脚刷周):主页面只露一个「打开控制台…」按钮;
 // 弹窗里是分群开关 + 每群人格选择 + 折叠的表情包库(两个人格各一个库)。
 // 状态来自 /api/status 的 belial(读的就是 monitor 正在用的 state.json),所以显示与生效永远一致。
-var blData={groups:[],all:false,opened:0,stickers:[],stickersJsz:[],personas:{},personaOptions:[],memories:{belial:[],jiaoshuazhou:[]},memoryStats:{belial:{dynamic:0,total:0,max:120},jiaoshuazhou:{dynamic:0,total:0,max:120}},voiceMode:'belial',voiceOptions:[],nonAtProb:0.4,nonAtAuto:true,autoMaxProb:0.35,autoMinProb:0.05}, blOpen=false, blStickersOpen=false, blStickerSig='', blStickerPersona='belial';
+var blData={groups:[],all:false,opened:0,stickers:[],stickersJsz:[],personas:{},personaOptions:[],memories:{jiaoshuazhou:[],W14:[]},memoryStats:{jiaoshuazhou:{dynamic:0,total:0,max:300},W14:{dynamic:0,total:0,max:300}},voiceMode:'belial',voiceOptions:[],nonAtProb:0.4,nonAtAuto:true,autoMaxProb:0.35,autoMinProb:0.05}, blOpen=false, blStickersOpen=false, blStickerSig='', blStickerPersona='jiaoshuazhou';
 function openBelial(){blOpen=true;syncBlProb(blData);renderBelial(true);document.getElementById('blmodal').className='show'}
 function closeBelial(){blOpen=false;document.getElementById('blmodal').className=''}
 function setBelial(groupId,on){act('belial',{groupId:groupId,on:on})}
 function setPersona(groupId,persona){act('belial',{groupId:groupId,persona:persona})}
-function personaName(id){var o=(blData.personaOptions||[]).find(function(x){return x.id===id});return o?o.short:(id==='jiaoshuazhou'?'脚刷周':'贝利亚')}
+function personaName(id){var o=(blData.personaOptions||[]).find(function(x){return x.id===id});return o?o.short:(id==='jiaoshuazhou'?'脚刷周':id)}
+function blReactProbInput(v){document.getElementById('blreactprobv').textContent=Math.round(Number(v)*100)+'%'}
+function blReactProbSave(v){
+  var n=Number(v);
+  if(!isFinite(n))return;
+  n=Math.min(1,Math.max(0,n));
+  blReactProbInput(n);
+  document.getElementById('blreactprob').value=n;
+  document.getElementById('blreactprobn').value=n;
+  act('belial',{reactProb:n});
+}
+function syncBlReactProb(b){
+  if(!b||b.reactProb===undefined)return;
+  var s=document.getElementById('blreactprob'),n2=document.getElementById('blreactprobn');
+  if(s)s.value=b.reactProb;
+  if(n2)n2.value=b.reactProb;
+  blReactProbInput(b.reactProb);
+}
 function blProbInput(v){document.getElementById('blprobv').textContent=Math.round(Number(v)*100)+'%'}
 function blProbSave(v){
   var a=document.getElementById('blauto');
@@ -1073,14 +1230,14 @@ function renderVoiceSwitch(){
   if(note)note.textContent='当前:'+blVoiceName(cur);
 }
 function blRow(r){
-  var cur=r.persona||'belial';
+  var cur=r.persona||'jiaoshuazhou';
   var open=!!r.belial;
   var pbtn=function(id,label){
     return '<button class="mini'+(cur===id?' pri':'')+'" style="min-height:24px;padding:1px 8px;font-size:11px" onclick="setPersona(\\''+r.groupId+'\\',\\''+id+'\\')">'+label+'</button>';
   };
   return '<div class="blrow"><span class="tk" title="'+h(r.groupId)+'">'+h(r.name||('群 '+r.groupId))+
     '<div class="tsub">'+h(r.groupId)+' · '+(open?('当前:'+personaName(cur)):'关闭(点人格即开启)')+'</div></span>'+
-    '<span style="display:flex;gap:4px;align-items:center">'+pbtn('belial','贝利亚')+pbtn('jiaoshuazhou','脚刷周')+'</span>'+
+    '<span style="display:flex;gap:4px;align-items:center">'+pbtn('jiaoshuazhou','脚刷周')+pbtn('W14','W14')+'</span>'+
     '<div class="sw'+(open?' on':'')+'" onclick="setBelial(\\''+r.groupId+'\\','+(open?'false':'true')+')"><i></i></div></div>';
 }
 function renderBelial(force){
@@ -1092,9 +1249,9 @@ function renderBelial(force){
   if(note)note.textContent='';
   var sum=document.getElementById('belial');
   if(sum){
-    var belN=b.belialCount||0, jszN=b.jszCount||0;
+    var jszN=b.jszCount||0, w14N=b.w14Count||0;
     sum.innerHTML='<div class="row"><span class="dot '+(anyOn?'ok':'')+'"></span><span class="k">'+onText+
-      '<div class="sub">贝利亚 '+belN+' · 脚刷周 '+jszN+' · 表情包 '+((b.stickers||[]).length)+'+'+((b.stickersJsz||[]).length)+' 张 · 非@ '+probText+'</div></span></div>';
+      '<div class="sub">脚刷周 '+jszN+' · W14 '+w14N+' · 表情包 '+((b.stickers||[]).length)+'+'+((b.stickersJsz||[]).length)+' 张 · 非@ '+probText+'</div></span></div>';
   }
   renderVoiceSwitch();
   if(!force&&!blOpen)return;
@@ -1103,14 +1260,16 @@ function renderBelial(force){
     &&document.activeElement!==document.getElementById('blprobn')
     &&document.activeElement!==document.getElementById('blautohi')
     &&document.activeElement!==document.getElementById('blautolo'))syncBlProb(b);
+  if(document.activeElement!==document.getElementById('blreactprob')
+    &&document.activeElement!==document.getElementById('blreactprobn'))syncBlReactProb(b);
   var hint=document.getElementById('blhint');
   if(hint){
     var warn='';
     if(b.aiOn===false)warn=' ⚠ AI 闲聊总开关关着,开了也不会回';
     else if(b.hasKey===false)warn=' ⚠ 没配聊天 key,开了也不会回';
-    hint.textContent='共 '+((b.groups||[]).length)+' 个群;已开 '+((b.opened)||0)+'(贝利亚 '+(b.belialCount||0)+' / 脚刷周 '+(b.jszCount||0)+
+    hint.textContent='共 '+((b.groups||[]).length)+' 个群;已开 '+((b.opened)||0)+'(脚刷周 '+(b.jszCount||0)+' / W14 '+(b.w14Count||0)+
       ');表情包 '+((b.stickers||[]).length)+'+'+((b.stickersJsz||[]).length)+' 张;非@ '+probText+
-      ';群里 @我 说「银河皇帝」或「脚刷周模式」切人格,说「银河皇帝 关 / 脚刷周 关」收起'+warn;
+      ';贴表情 '+Math.round((b.reactProb ?? 0.06)*100)+'%;群里 @我 说「脚刷周模式」切人格,说「脚刷周 关」收起;W14 只能在面板切'+warn;
   }
   var box=document.getElementById('blbody');
   if(!box)return;
@@ -1124,7 +1283,7 @@ function renderBelial(force){
 function fmtBytes(n){n=Number(n)||0;return n>=1048576?((n/1048576).toFixed(1)+'MB'):(Math.max(1,Math.round(n/1024))+'KB')}
 function toggleStickers(){blStickersOpen=!blStickersOpen;renderStickers()}
 function setStickerPersona(id){blStickerPersona=id;blStickerSig='';renderPersonaTabs();renderStickers();renderMemories()}
-function memPersona(){var ids=(blData.personaOptions||[]).map(function(o){return o.id});return ids.indexOf(blStickerPersona)>=0?blStickerPersona:'belial'}
+function memPersona(){var ids=(blData.personaOptions||[]).map(function(o){return o.id});return ids.indexOf(blStickerPersona)>=0?blStickerPersona:'jiaoshuazhou'}
 function renderMemories(){
   var box=document.getElementById('blmemlist');
   if(!box)return;
@@ -1135,7 +1294,7 @@ function renderMemories(){
   if(note)note.textContent='('+personaName(p)+' · 动态 '+st.dynamic+' / 共 '+st.total+' · 上限 '+st.max+')';
   box.innerHTML=list.length?list.map(function(m){
     return '<div class="blrow"><span class="tk" style="font-size:12px;word-break:break-all">'+h(m.text)+
-      '<div class="tsub">'+h(m.id)+' · '+(m.kind==='style'?'风格':'事实')+(m.seed?' · 内置只读':'')+'</div></span>'+
+      '<div class="tsub">'+h(m.id)+' · '+(m.kind==='style'?'风格':m.kind==='joke'?'玩笑':'事实')+(m.seed?' · 内置只读':'')+(m.src==='auto-summary'?' · 自动摘要':(m.src==='auto-consolidated'?' · 压缩记忆':(m.src==='dream'?' · 做梦':(m.src==='dream-joke'?' · 做梦(玩笑)':''))))+'</div></span>'+
       (m.seed?'':'<button class="mini" title="修改这条记忆" onclick="editMemory(\\''+encodeURIComponent(m.id)+'\\',\\''+encodeURIComponent(m.text)+'\\')">改</button>'+
         '<button class="mini" title="删除这条记忆" onclick="delMemory(\\''+encodeURIComponent(m.id)+'\\')">×</button>')+'</div>';
   }).join(''):'<div class="mut" style="font-size:12px">还没有记忆。群里让 bot「记住…」,或下面手动加一条。</div>';
@@ -1176,8 +1335,8 @@ function renderPersonaTabs(){
   var box=document.getElementById('blpersontabs');
   if(!box)return;
   var opts=(blData.personaOptions&&blData.personaOptions.length)?blData.personaOptions:[
-    {id:'belial',short:'贝利亚',count:(blData.stickers||[]).length},
-    {id:'jiaoshuazhou',short:'脚刷周',count:(blData.stickersJsz||[]).length}
+    {id:'jiaoshuazhou',short:'脚刷周',count:(blData.stickersJsz||[]).length},
+    {id:'W14',short:'W14',count:(blData.stickers||[]).length}
   ];
   box.innerHTML=opts.map(function(o){
     return '<button class="mini'+(blStickerPersona===o.id?' pri':'')+'" onclick="setStickerPersona(\\''+o.id+'\\')">'+h(o.short)+
@@ -1188,7 +1347,7 @@ function renderStickers(){
   var b=blData||{};
   var isJsz=blStickerPersona==='jiaoshuazhou';
   var list=isJsz?(b.stickersJsz||[]):(b.stickers||[]);
-  var who=isJsz?'脚刷周':'贝利亚';
+  var who=isJsz?'脚刷周':'共用(贝利亚图库)';
   var note=document.getElementById('blstickernote');
   if(note)note.textContent='('+who+' · '+list.length+' 张)';
   var btn=document.getElementById('blstickerbtn');
@@ -1319,7 +1478,7 @@ function tick(){
 
     var c=s.cards;
     document.getElementById('cards').innerHTML=
-      '<div class="row"><span class="k">卡牌数<div class="sub">cards.json</div></span><b>'+c.count+'</b></div>'+
+      '<div class="row"><span class="k">卡牌数<div class="sub">cards.json'+(c.superpre?'（含超先行卡 '+c.superpre+' 张）':'')+'</div></span><b>'+c.count+'</b></div>'+
       '<div class="row"><span class="k">卡图数<div class="sub">cards_img/</div></span><b>'+c.images+'</b></div>'+
       '<div class="row"><span class="k mut">卡库更新时间<div class="sub">'+(c.mtime?h(c.mtime.replace('T',' ').slice(0,19)):'未知')+'</div></span></div>';
 
@@ -1331,6 +1490,7 @@ function tick(){
       '<div class="row"><span class="k">已运行<div class="sub">服务器开机时长</div></span><b>'+h(H.uptimeText)+'</b></div>'+
       '<div class="row"><span class="k mut">最近请求<div class="sub">'+h(s.lastRequest||'暂无')+'</div></span></div>';
     aichatChart(s.aiChat);
+    renderMemory(s.memory);
     return s;
   }).catch(function(){});
 }
@@ -1455,6 +1615,8 @@ function doUpdate(){
    .then(function(){for(var i=0;i<bs.length;i++)bs[i].disabled=false});
 }
 function boot(){
+  var H=(location.hash||'#overview').slice(1);
+  showTab(['overview','persona','memory','aichat','system','logs'].indexOf(H)>=0?H:'overview');
   tick();logs();snowlog();uprog();
   setInterval(tick,5000);setInterval(logs,5000);setInterval(uprog,5000);
   setInterval(snowlog,5000);
@@ -1514,6 +1676,28 @@ const server = createServer(async (req, res) => {
     }
 
     if (path === '/api/status' && req.method === 'GET') return json(res, 200, await buildStatus());
+
+    // 记忆文件原文(2026-11-26):给「记忆」页的层级图做超链接,点开直接看文件内容。
+    // 只允许 agent/persona/mem 下面的文件;json/jsonl 加 pretty=1 时排好版,方便人读。
+    if (path === '/api/mem/file' && req.method === 'GET') {
+      const rel = String(url.searchParams.get('path') || '');
+      const rootDir = resolve(join(AGENT, 'persona', 'mem'));
+      const abs = resolve(rootDir, rel);
+      if (!abs.startsWith(rootDir + sep)) return json(res, 400, { message: '路径不合法' });
+      let text = '';
+      try { text = readFileSync(abs, 'utf8'); } catch { return json(res, 404, { message: '文件不存在' }); }
+      if (url.searchParams.get('pretty') === '1') {
+        if (/\.jsonl$/i.test(abs)) {
+          text = text.split('\n').filter(l => l.trim())
+            .map((l, i) => `# ${i + 1}\n${(() => { try { return JSON.stringify(JSON.parse(l), null, 1); } catch { return l; } })()}`)
+            .join('\n\n');
+        } else if (/\.json$/i.test(abs)) {
+          try { text = JSON.stringify(JSON.parse(text), null, 2); } catch { /* 保持原样 */ }
+        }
+      }
+      res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' });
+      return res.end(text);
+    }
 
     if (path === '/api/log' && req.method === 'GET') {
       const n = Math.min(Math.max(Number(url.searchParams.get('n')) || 300, 20), 3000);
@@ -1595,7 +1779,7 @@ const server = createServer(async (req, res) => {
     // 人格面板(2026-10-26 银河皇帝,2026-10-29 加脚刷周):① 分群开关 ② 每群人 格 ③ 表情包库
     // 开关/人格直接写 belial/state.json —— monitor 每次回复前现读,点一下立即生效,不用重启。
     if (path === '/api/belial' && req.method === 'POST') {
-      const { groupId, on, prob, auto, autoMax, autoMin, persona } = await readBody(req);
+      const { groupId, on, prob, reactProb, auto, autoMax, autoMin, persona } = await readBody(req);
       const messages = [];
       if (auto !== undefined) {
         if (typeof auto !== 'boolean') return json(res, 400, { message: 'auto 必须是布尔值' });
@@ -1612,6 +1796,11 @@ const server = createServer(async (req, res) => {
         const rp = belialSetNonAtProb(prob);
         if (!rp.ok) return json(res, 400, { message: rp.message || '概率设置失败' });
         messages.push(`非@接话概率已改为 ${Math.round(rp.prob * 100)}%`);
+      }
+      if (reactProb !== undefined) {
+        const rr = belialSetReactProb(reactProb);
+        if (!rr.ok) return json(res, 400, { message: rr.message || '贴表情概率设置失败' });
+        messages.push(`独立贴表情概率已改为 ${Math.round(rr.prob * 100)}%`);
       }
       if (persona !== undefined) {
         const g = String(groupId ?? '').trim();

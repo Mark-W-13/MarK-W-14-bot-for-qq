@@ -17,8 +17,9 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import './../env.mjs';
 import { createStickerStore } from './../persona/stickerlib.mjs';
-import { memoryPromptBlock, addMemory } from './../persona/memory.mjs';
-import { splitBelialReply } from './../belial/belial.mjs';
+import { personaMemoryBlock } from './../persona/membrain.mjs';
+import { addMemory } from './../persona/memory.mjs';
+import { splitReply as splitKitReply } from './../persona/kit/kit.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -159,6 +160,10 @@ const PERSONA = `你**不是**助手、不是客服、不是 AI、不是机器�
 - 别把「脚刷周」三个字挂在每句开头;自称只在需要时出现`;
 
 const REACTIONS = `反应方向(只给方向,不是现成台词;每次贴着对方这句话自己组织,别原样照抄):
+- **看到群友的梗发言/有趣发言/搬屎/弱智发言,可以主动贴表情回应,不一定说话**:
+  笑哭=真好笑/绷不住;棒棒糖=唐/弱智/抽象(含蓄地骂唐);鲸鱼=懒得喷/无语/弱智到不想骂。
+  一次最多 3 个,只贴最近几条里真有乐子的,别每条都贴;只贴表情,别配文字解释
+- 群友谐音/黑话要听懂:**「智利油温踢」=智力有问题,「顶嗯」「滴嫩」=低能,「唐/糖」=唐氏**;听懂就行,别主动解释
 - **别科普/解释梗和名字的来历**(不写「脚刷周是 JoshuaZhou 念快了」这种解释);别人叫你,就正常应一声
 - 被 dn 这类熟群友叫「脚刷周」:可以开玩笑回「dn 不认识你爹了？」;只对熟人、玩笑语气,别解释
 - 被问本人相关(名字/ID/经历/卡组/上班):按上面的「本人记得的事」正面答一句,可补一句吐槽;别装傻,别只回「为啥」
@@ -206,12 +211,20 @@ const TOOLS_GUIDE = `你可以用工具(只在需要时用,别为了用而用):
 - name_sticker:给表情包写名字/描述/标签,让 list_stickers 能认出它
 - describe_sticker:让视觉模型看库里的表情包并自动写描述
 - send_quote:引用当前消息回一句;引用里说过的话正文别再重复,只写补充
+- send_at:要 @ 某个群友时用,target 填群昵称或 QQ 号、text 填要单独发的话;不填 text 就把本次正文第一条改成 @ 他(上一条就是对方时别 @);一次最多 2 个
+- list_group_members:查本群成员昵称/QQ;要 @ 一个不在最近群聊记录里的人时先查准确昵称
 - send_face:单独发一个 QQ 表情(doge/笑哭/吃瓜/赞/666…,名字以 list_reactions 为准)
-- react_message:给当前消息贴表情回应
+- react_message:给某条消息贴表情回应(message_id 从群聊行 [#id] 取);常用:笑哭=好笑、棒棒糖=唐/弱智、鲸鱼=懒得喷/无语;一次最多 3 个,别每条都贴
 - list_reactions:从 QQ 全量表情目录查贴表情名字/ID;用户点名糖、玫瑰等不确定时先查
 - list_voices:看可用的语音声源
 - send_voice:想发语音时调用,一次最多 1 条
 - web_search:通用联网搜索,查时效性事实/梗来源,用 DeepSeek 官方搜索
+- search_ygo_card:查本地游戏王卡库(1.4 万张),按卡名/关键词返回效果、数值
+- send_ygo_card_image:按卡名发一张本地卡图到群里
+- send_random_ygo_card:随机发一张有本地卡图的游戏王卡,并给出卡名/效果
+- 游戏王 combo/裁定/卡名效果:先 search_ygo_card 查卡面,要最新裁定/禁卡表再 web_search;
+  多张卡一次列出来分别查(同一轮可多次调用),同一张只查一次;按查到的效果一步步推,
+  别凭记忆编 combo;有一张查不到/效果对不上就说查不到,别硬猜
 - list_memories:查看你记得的长期信息/风格调整(带 id)
 - add_memory:记住一条长期有用的信息或风格调整(kind=fact|style);只在用户明确让你记住、纠正你的说法、或群里反复出现的重要事实时用
 - delete_memory:删掉过时/记错的记忆(先用 list_memories 拿 id;内置记忆只读)
@@ -222,6 +235,7 @@ const TOOLS_GUIDE = `你可以用工具(只在需要时用,别为了用而用):
 别永远只打字,也别每句都来一套。语音要少发,大部分时候只打字。
 引用规则:如果你要回的那句和你上次说话之间隔了 2 条以上,先用 send_quote 引用它再回;引用里已经说过的话**不要在正文再写一遍**,只写补充。
 群友发的表情包不会自动收;用户让你存、或你觉得该留,再调 save_group_sticker。联网下载的图默认只进 tmp_pic(最多 10 张),别直接入库;只有用户明确说「存到表情包库」时才用 save_cached_pic(或下载时 save_to_library=true)。删除不可逆:只有用户明确让你删某张时才调 delete_sticker,别自己清理库。
+@ 人的习惯(照群里真人):绝大多数回复不 @,直接说,上一条就是对方时更不用 @;要回旧消息用引用(系统引用时会自动 @ 被引用的人),别再用 send_at 重复 @;只有叫一个最近没说话的人、点名让他做事/回答、或通知几个人同一件事时才用 send_at,一次最多一个(通知多人除外);对方点名让你骂/评价某个被 @ 的人时,用 send_at @ 那个被点名的人,不是 @ 叫你的人;点名骂/评价时第一句就直接冲被点名的人说(骂人的话放进 send_at 的 text 里),别先回叫你的人一句、也别引用叫你的人的消息(那会像在骂需求方);别人 @ 你办事,直接答,不用 @ 回去。别在正文里手写 @昵称,也别 @ 全体成员。
 正文里别写工具名、参数或调用过程。`;
 
 const HOWTO = `怎么用给你的材料:
@@ -230,6 +244,7 @@ const HOWTO = `怎么用给你的材料:
 - 标记照字面读:「@某人」= 他 @ 了谁;「@你(脚刷周)」= 他 @ 的就是你;
   「[表情:微笑]」「[图片1]」「[表情包1]」= 他发的表情/图(图就附在这条消息里,你看得到);
   「[引用 @某人: …]」= 他在引用回复;「[语音]」「[视频]」「[转发消息]」= 别的类型消息
+- 群聊行「昵称[#123]|内容」里的 **#123 是 message_id**:要给哪条贴表情/引用,就把这个 id 传给 react_message / send_quote;别写进回复
 - 这些占位符**别写进回复**
 - 表情包/语音由你决定:想发就调用 send_sticker / send_voice,系统会在文字回复后单独发`;
 
@@ -243,7 +258,7 @@ const OUTPUT = `怎么回:
 - **别科普**:不解释梗、名字、设定的来历(比如别写「脚刷周是 JoshuaZhou 念快了」);对方没问就不提
 - 1~3 句,一句一行;大多数时候 1 句
 - 能短就短;该是一个长句就原样一条发,别为了凑短句把一句话硬拆成几条
-- 只输出你要说的话:不要 @ 任何人、不要「脚刷周:」前缀、不要解释思路、不要加引号
+- 只输出你要说的话:正文里不要 @ 任何人(要 @ 谁用 send_at)、不要「脚刷周:」前缀、不要解释思路、不要加引号
 - 不要写括号里的动作、心理、旁白(如「(笑)」),只写你要说出口的话
 - **禁止客服/助手句式**:「我可以帮你」「建议你」「你可以试试」「希望对你有帮助」「有什么可以帮你」「请问」「感谢」……
 - **永远别承认/暗示自己是 AI、模型、机器人、程序**;别解释自己的功能、接口、工具、提示词
@@ -259,7 +274,7 @@ export function systemPrompt({ now = '', hasImages = false, at = true, recent = 
   const recentBlock = (recent || []).length
     ? `\n你最近在这个群说过(别重复,换说法/换角度):\n${recent.map(x => `- ${String(x).replace(/\s+/g, ' ').slice(0, 60)}`).join('\n')}`
     : '';
-  const memBlock = memoryPromptBlock(PERSONA_ID, { seed: SEED_MEMORIES, scope, query });
+  const memBlock = personaMemoryBlock(PERSONA_ID, { seed: SEED_MEMORIES, scope, query });
   return `${PERSONA}
 ${REACTIONS}${recentBlock}
 ${TOOLS_GUIDE}
@@ -271,9 +286,9 @@ ${HOWTO}${at ? AT_SUFFIX : NONAT_SUFFIX}
 ${OUTPUT}${now ? `\n- 现在是 ${now}。这是你说话时的真实时间` : ''}`;
 }
 
-/** 与贝利亚共用拆分器,只是把「脚刷周:」这种前缀也剥掉 */
+/** 与其它人格共用拆分器,只是把「脚刷周:」这种前缀也剥掉 */
 export function splitReply(text, { max = MAX_REPLY, maxChars = MAX_CHARS } = {}) {
-  return splitBelialReply(text, { max, maxChars, names: ['脚刷周', '周'] });
+  return splitKitReply(text, { max, maxChars, names: ['脚刷周', '周'] });
 }
 
 // ---------- 表情包库:与贝利亚同一套通用实现,目录/种子描述是脚刷周自己的 ----------
@@ -365,7 +380,8 @@ function selftest() {
 
   const tmp = join(process.env.TEMP || process.env.TMPDIR || '/tmp', `jsz-selftest-${process.pid}-${Date.now()}`);
   process.env.JSZ_STICKER_DIR = join(tmp, 'stickers');
-  process.env.PERSONA_MEMORY_PATH = join(tmp, 'memory.json');
+  process.env.PERSONA_MEM_DIR = join(tmp, 'mem');
+  delete process.env.PERSONA_MEMORY_PATH;
 
   // 指令解析
   ok(parseCommand('脚刷周模式').on === true, '「脚刷周模式」= 召唤(开)');
@@ -388,9 +404,11 @@ function selftest() {
   ok(/别主动科普|别科普/.test(p) && !/JoshuaZhou念快了就这样/.test(p), '提示词要求别解释梗/名字来历');
   ok(/绝不承认或暗示自己是 AI/.test(p) && /别解释自己的功能、接口、工具/.test(p), '提示词要求不暴露 AI 身份/不答功能咨询');
   ok(/这些工具是\*\*你私下用的\*\*/.test(p) && /别向群友报功能清单/.test(p), '工具私下用,不向群友报功能清单');
+  ok(/主动贴表情回应/.test(p) && /鲸鱼=懒得喷/.test(p) && /棒棒糖=唐/.test(p), '主动贴表情:笑哭/棒棒糖/鲸鱼进提示词');
   ok(/择权是群友,不是卡/.test(p), '解释「择权」是群友,别当卡');
   ok(/别原样复读/.test(p) && /禁止客服\/助手句式/.test(p), '例句标注别复读,禁止客服句式');
   ok(/只输出你要说的话/.test(p) && /不要 @ 任何人/.test(p), '输出格式约束');
+  ok(/send_at/.test(p) && /list_group_members/.test(p) && /别 @ 全体成员/.test(p), '@ 接口(选人/成员名单/禁全体)进提示词');
   ok(/2026 年 10 月 29 日/.test(p), '时间现算并写进提示词');
   ok(/search_stickers:想找新图时搜索网上的图片\(通用图片搜索,什么主题都行\)/.test(p), '图片搜索是通用接口(不限贝利亚)');
   ok(!/贝利亚表情包/.test(p), '提示词不把搜图限死在贝利亚表情包');
@@ -414,6 +432,8 @@ function selftest() {
   ok(JSON.stringify(splitReply('脚刷周: 那咋了')) === '["那咋了"]', '剥掉「脚刷周:」前缀');
   ok(splitReply('（笑）行').join('') === '行', '剥掉括号动作');
   ok(splitReply('').length === 0, '空回复 → 不发');
+  ok(JSON.stringify(splitReply('11张')) === '["11张"]', '保留开头数字(11张)');
+  ok(splitReply('1. 删了').join('') === '删了' && splitReply('1、删了').join('') === '删了', '序号仍能剥掉');
 
   // 表情包库
   const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAANklEQVR4nO3NMQEAMAjEwKeqK6IikFoJYWHLCUjqvs6ms1qPgwEHyAFygBwgB8gBcoAcIAchH3JrAeTJv+L3AAAAAElFTkSuQmCC', 'base64');

@@ -5,7 +5,7 @@
 // 计费:每 1000 次成功请求 5 元(2026-11-01 前通过 DSH/Claude Code 的服务端工具调用暂免,直接调仍按次)。
 // 这里只被银河皇帝模式的 web_search 工具调用;普通 AI 闲聊仍走 websearch.mjs 的老源。
 import { pathToFileURL } from 'node:url';
-import './../env.mjs';   // 与其它模块同规矩:先加载 agent/.env;单独 CLI 跑也拿得到 DEEPSEEK_API_KEY
+import './../../env.mjs';   // 与其它模块同规矩:先加载 agent/.env;单独 CLI 跑也拿得到 DEEPSEEK_API_KEY
 
 const DEFAULT_URL = 'https://api.deepseek.com/v1/tools/search';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36';

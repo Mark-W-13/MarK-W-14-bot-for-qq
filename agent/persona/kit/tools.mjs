@@ -6,7 +6,7 @@
 //
 // 工具执行在 monitor.mjs 的 aiChatBelial 里(要拿到群号、发图、记账),这里只定义 schema
 // 和给模型看的「表情包目录」文本。
-import { stickerCatalog } from './belial.mjs';
+import { stickerCatalog } from './kit.mjs';
 
 const fn = (name, description, properties = {}, required = []) => ({
   type: 'function',
@@ -24,6 +24,20 @@ export const BELIAL_TOOLS = [
       ori_question: { type: 'string', description: '用户原始问题(可选,帮助搜索理解意图)' },
     },
     ['query']),
+
+  fn('search_ygo_card',
+    '查游戏王卡牌(本地卡库,1.4 万张):按卡名、别名或空格分隔的关键词查,返回卡名、种类、攻守和效果。有人问某张卡的效果/数值/是不是某张卡时用。',
+    { query: { type: 'string', description: '卡名或关键词,如 青眼白龙 / 闪刀 交闪 / 灰流丽' } },
+    ['query']),
+
+  fn('send_ygo_card_image',
+    '发一张游戏王卡图(本地卡图库):按卡名查最匹配的一张,直接把卡图发到群里。有人要「卡图/长什么样/发张图」时用;没本地卡图会说明。',
+    { query: { type: 'string', description: '卡名或关键词,如 青眼白龙 / 闪刀姬' } },
+    ['query']),
+
+  fn('send_random_ygo_card',
+    '随机发一张有本地卡图的游戏王卡,并返回卡名/种类/效果。有人说「随机来张卡/随便发张卡」时用。',
+    {}, []),
 
   fn('list_stickers',
     '列出当前表情包库(文件名、描述、标签)。想发图但不知道有哪些时先调用。',
@@ -104,16 +118,29 @@ export const BELIAL_TOOLS = [
     },
     ['text']),
 
+  fn('send_at',
+    '给指定的群友发一条 @ 消息。target 填群昵称(群聊记录里显示的名字;不确定就先 list_group_members 查)或 QQ 号;text 只写额外要说的短句,**不要把本次正文再抄一遍**(正文已经说过的再塞进 text 会发两遍,系统会去掉重复的)。不填 text 时,把本次回复的第一条改成 @ 这个人(系统默认谁都不 @,调了才 @)。只在确实要叫某个人(最近没说话/点名让他做事)、或通知几个人同一件事时用;上一条就是对方时别 @;对方点名让你骂/评价某个被 @ 的人时,target 填那个被点名的人(不是叫你的人),骂人的话放进 text —— 系统会把它当成第一条发出去并 @ 他,别先回/引用叫你的人;一次最多 2 个,不能 @ 全体成员。',
+    {
+      target: { type: 'string', description: '群昵称或 QQ 号,如 张三 / 123456789;不要填 all/全体成员' },
+      text: { type: 'string', description: '额外要对他说的一句短话(别抄正文);不填=只把本次回复开头改成 @ 谁(可选)' },
+    },
+    ['target']),
+
+  fn('list_group_members',
+    '查本群成员名单(昵称 + QQ),可按昵称/QQ 过滤。要 @ 一个不在最近群聊记录里的人时,先查准确昵称。',
+    { query: { type: 'string', description: '按昵称或 QQ 过滤;不填列前 40 个(可选)' } },
+    []),
+
   fn('send_face',
     '单独发一个 QQ 表情(不是表情包图片)。face 填 QQ 表情目录里的名字或数字 id,如 doge / 微笑 / 笑哭 / 吃瓜 / 赞;不确定先 list_reactions 查名字。',
     { face: { type: 'string', description: 'QQ 表情名或数字 id,如 doge / 179 / 笑哭 / 182' } },
     ['face']),
 
   fn('react_message',
-    '给当前消息贴一个表情回应(QQ 的“贴表情”)。emoji 用 QQ 表情目录里的名字(如 吃糖/笑哭/玫瑰/doge)、emoji 或数字 id;用户说糖就查「吃糖」,别默认笑哭;不确定先 list_reactions(query)。',
+    '给某条消息贴一个表情回应(QQ 的“贴表情”)。emoji 可用常用名或数字 id:笑哭(好笑/绷不住)、棒棒糖(唐/弱智/抽象)、鲸鱼(懒得喷/无语)、吃糖、玫瑰、doge;message_id 从群聊记录的 [#id] 里取,不填默认当前消息;一次最多 3 个;不确定先 list_reactions(query)。',
     {
       emoji: { type: 'string', description: 'QQ 表情名 / emoji / 数字 id,默认 赞' },
-      message_id: { type: 'string', description: '要贴的消息 id(可选,默认当前消息)' },
+      message_id: { type: 'string', description: '要贴的消息 id(从 [#id] 取;可选,默认当前消息)' },
     },
     []),
 
@@ -137,13 +164,13 @@ export const BELIAL_TOOLS = [
     ['text']),
 ];
 
-/** 普通 AI 闲聊也能用的 QQ 操作工具(引用/QQ表情/贴表情);发送与护栏和贝利亚共用 */
+/** 普通 AI 闲聊也能用的 QQ 操作工具(引用/QQ表情/贴表情/@);发送与护栏和贝利亚共用 */
 export const QQ_TOOLS = BELIAL_TOOLS.filter(t =>
-  ['send_quote', 'send_face', 'react_message'].includes(t.function.name));
+  ['send_quote', 'send_face', 'react_message', 'send_at'].includes(t.function.name));
 
-/** 普通 AI 闲聊的完整聊天工具:QQ 操作 + 看表情包库/发表情包 */
+/** 普通 AI 闲聊的完整聊天工具:QQ 操作 + 看成员/表情包库/发表情包 */
 export const CHAT_TOOLS = BELIAL_TOOLS.filter(t =>
-  ['send_quote', 'send_face', 'react_message', 'list_reactions', 'list_stickers', 'send_sticker'].includes(t.function.name));
+  ['send_quote', 'send_face', 'react_message', 'send_at', 'list_group_members', 'list_reactions', 'list_stickers', 'send_sticker'].includes(t.function.name));
 
 /** 给 list_stickers 工具返回的目录文本(默认贝利亚库;别的人格传自己的 catalog 函数) */
 export function stickerCatalogText(catalog = stickerCatalog) {

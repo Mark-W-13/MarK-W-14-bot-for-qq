@@ -106,6 +106,18 @@ export function extractZipCardJson(zipBuf) {
   return out.toString('utf8');
 }
 
+// 随机一张卡(默认只挑本地有卡图的);本地图库可能缺图,多试几次
+export function randomCard({ withImage = true } = {}) {
+  loadCards();
+  const all = Object.values(cards);
+  if (!all.length) return null;
+  for (let i = 0; i < 120; i++) {
+    const c = all[Math.floor(Math.random() * all.length)];
+    if (!withImage || cardImagePath(c)) return c;
+  }
+  return null;
+}
+
 function cardNames(c) {
   return NAME_FIELDS.map(f => c[f]).filter(Boolean);
 }
