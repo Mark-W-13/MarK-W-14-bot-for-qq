@@ -123,6 +123,12 @@ import { parseArenaCommand, isArenaCommandText, processArenaCommand } from './my
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
+// ---------- 单实例锁(2026-11-26)----------
+// 事故:更新时 systemd 停了、手动 node monitor.mjs 还挂着,两个实例都连 WS、都写 inbox、都回话,
+// 同一条消息被回了 4 次(13:14「你以后都要用霸总性格」的回复 3538530~3538533)。
+// 这里用目录锁占位:已有活着的 monitor 就等它退出;等不到就退出,绝不并发跑两个。
+const MONITOR_LOCK_DIR = join(__dirname, '.monitor.lock');
+
 // ---------- 配置 ----------
 // .env 的加载挪到了 env.mjs(第一行 import),理由见那个文件的注释 —— 顶层读 env 的模块
 // (rulings / shitpost / kuangshen)必须先看到 .env,否则拿不到 CHROME_PATH / API_TOKEN。
@@ -599,6 +605,13 @@ async function fetchTranscript(groupId, count = 100, { botName = '史官', inclu
   if (anchorId) { params.message_id = anchorId; params.reverse_order = true; }
   let { data } = await api('get_group_msg_history', params);
   let msgs = data?.messages || [];
+  // 刚到的消息可能还没落库(WS 先到、历史库后到):返回页里找不到本条锚点时等 300ms 重拉,
+  // 否则上下文停在上一句,模型容易把上一条问题再答一遍(2026-11-26 重复回答的诱因之一)。
+  if (anchorId && !msgs.some(m => String(m.message_id) === String(anchorId))) {
+    await new Promise(r => setTimeout(r, 300));
+    const again = await api('get_group_msg_history', params);
+    if (again?.data?.messages?.length) msgs = again.data.messages;
+  }
   // 锚点失效时退回最新一页,再按 seq/时间裁掉这条之后的消息。
   // 2026-10-29 修:真实 SnowLuma 历史消息**不一定带 message_seq**,只看 seq 会把 Q2/Q3 留在上下文里
   // (模型就拿最后一句回答 Q1);这里没有 seq 时改用 time 兜底。
@@ -1579,6 +1592,20 @@ function ygoResearchHint(text) {
     + '需要最新裁定/禁卡表/新卡再 web_search;按查到的效果一步步推,查不到或效果对不上就直说查不到,别凭记忆编 combo。';
 }
 
+// 人格回复的上下文**必须带上机器人自己说过的话**(2026-11-26 线上回归):
+// fetchTranscript 默认把 bot 自己的消息剔掉,模型只看到「一堆没人回答的问题」;群里连着几个人问
+// 同一件事时,它会把已经答过的那条当成还没答、又答一遍(线上实例:两次「查询好感度」的回复被剔掉,
+// 下一句「你要死了」仍回「wb-100 你+100」)。顺带把条数翻倍:自己的回复也占窗口,不补回来真人
+// 发言会被挤掉一半。
+function personaTranscriptPlan(baseCount) {
+  const n = Math.max(0, Number(baseCount) || 0);
+  return { count: n ? n * 2 : 0, includeBot: true };
+}
+
+// 上下文里能看到「你」的回复后,再补一句。小模型不会自己从「你最近在这个群说过」的列表
+// 反推哪些问题已经答过,必须明说「只回最后这条、别补答旧问题」。
+const STALE_ANSWER_HINT = '\n\n【只回最后这条】群聊记录里带「你」的行是你自己说过的话;更早的问题后面已经有你的回复,就是已经答过了,不要再答;也不要写「至于XX那个」去接前面的问题。只回最后 TA 的话(同一个问题再问就照常答)。';
+
 async function processAiChat(entry) {
   const uid = String(entry.user_id);
   // 人格模式(银河皇帝 / 脚刷周):本群开着 + 有聊天 key。**必须在拼消息之前定** —— 提问正文里的
@@ -1598,16 +1625,19 @@ async function processAiChat(entry) {
   }
   let ctx = '';
   let names = null;
-  if (AI_CHAT_CTX > 0) {
+  // 人格路要看见自己的回复;普通 AI 闲聊保持原样(不带,省 token、也避免学旧助手腔)。
+  const ctxPlan = personaOn ? personaTranscriptPlan(AI_CHAT_CTX) : { count: AI_CHAT_CTX, includeBot: false };
+  if (ctxPlan.count > 0) {
     try {   // 取不到上下文不致命,退化成只按这句话回答
-      const { lines, names: n } = await fetchTranscript(entry.group_id, AI_CHAT_CTX, {
+      const { lines, names: n } = await fetchTranscript(entry.group_id, ctxPlan.count, {
         botName: personaBotName,
         anchorId: entry.message_id,
         beforeSeq: entry.seq,
         beforeTime: entry.time,
         withIds: !!personaOn,
+        includeBot: ctxPlan.includeBot,
       });
-      if (lines) ctx = `群聊记录(最近 ${AI_CHAT_CTX} 条,格式 "HH:MM 昵称|内容";带「昨天/前天/M-D」前缀的是更早的消息,不是刚发生):\n${lines}\n\n`;      names = n;
+      if (lines) ctx = `群聊记录(最近 ${ctxPlan.count} 条,格式 "HH:MM 昵称|内容";带「昨天/前天/M-D」前缀的是更早的消息,不是刚发生):\n${lines}\n\n`;      names = n;
     } catch (e) {
       log('  AI 闲聊取上下文失败(改为裸答):', e.message, C.yellow);
     }
@@ -1649,7 +1679,7 @@ async function processAiChat(entry) {
         recent: belialRecent.get(String(entry.group_id)) || [],
         scope: { group: entry.group_id, user: entry.user_id },   // 长期记忆按「这个群 + 这个人」取
         query: q,                                               // 用这句话做关键词召回(知识类记忆靠它排序)
-      }), `${ctx}@你的人: ${entry.nickname}\nTA 的话: ${q}${gapHint}${ygoResearchHint(q)}`, images, persona);
+      }), `${ctx}@你的人: ${entry.nickname}\nTA 的话: ${q}${gapHint}${ygoResearchHint(q)}${STALE_ANSWER_HINT}`, images, persona);
       // 点名让攻击/评价某人:这个人是本次「被攻击/被评价」的对象,不管模型有没有自己 @ 人,都记下来。
       // (1) 模型没 @ 人 → 补一条 mainAt,第一条正文直接 @ 他(2026-11-24);
       // (2) 模型 @ 了人 → focusQq 交给 sendBelialReply 把骂人的那句提到第一条(2026-11-26)。
@@ -2610,24 +2640,15 @@ async function sendBelialReply(entry, text, { persona = PERSONA_SPECS[JSZ_ID], s
   const stickerApi = persona.sticker;
   const focus = String(focusQq || '').trim();
   const quoted = (quotes || []).slice(0, 2);
-  // 点名骂/评价 @X 时,**绝不 @ 叫你的人**(即使模型自己 @ 了他):把他的 @ 摘掉,带 text 的降级成普通一句。
-  const protectRequester = !!focus && focus !== String(BOT_ID) && focus !== String(entry.user_id);
-  const requesterAtTexts = [];
-  const atsSafe = (ats || []).filter(a => {
-    if (a && a.qq && protectRequester && String(a.qq) === String(entry.user_id)) {
-      if (a.text) requesterAtTexts.push(String(a.text));
-      log('  ✂ 去掉对需求方的 @:', `${a.name || a.qq}${a.text ? `(${String(a.text).slice(0, 20)})` : ''}`, C.yellow);
-      return false;
-    }
-    return true;
-  });
-  const mainAts = atsSafe.filter(a => a?.main && a.qq);
-  const textAts = atsSafe.filter(a => a && !a.main && a.text);
+  // 2026-11-26(晚):不再「事后摘 @」。@ 谁只由模型调 send_at 决定,系统不替它改;
+  // 系统自己补 @ 的地方(引用、第一条回退)**一律不 @ 叫人的人** —— 这才是「攻击时只 @ 被攻击者」的正解。
+  const mainAts = (ats || []).filter(a => a?.main && a.qq);
+  const textAts = (ats || []).filter(a => a && !a.main && a.text);
   // 先把正文算出来:引用会把正文里重复的那句吃掉;「正文没了」时模型指定的 @ 要挂到引用上。
   const cleanText = stripQuotedText(text, quoted.map(q => q.text));
   const rawLines = cleanText ? persona.split(cleanText, persona.splitOpts) : [];
   const quotedTexts = quoted.map(q => q.text);
-  const lines = dedupeReplyLines(rawLines, quotedTexts).concat(requesterAtTexts.map(s => String(s).trim()).filter(Boolean));
+  const lines = dedupeReplyLines(rawLines, quotedTexts);
   const keptAts = dedupeReplyAts(lines, quotedTexts, mainAts, textAts);
   // 2026-11-26 用户报「复合调用引用 + @ 攻击时 @ 错人」:有人发「骂两句 @X」,模型引用了**叫你的人**的
   // 消息、又用 send_at(text=骂人的话) @ 了 X;旧逻辑只认 mainAts,引用就按 QQ 原生习惯补了作者(@ 到
@@ -2698,7 +2719,7 @@ async function sendBelialReply(entry, text, { persona = PERSONA_SPECS[JSZ_ID], s
       await sendReply(entry, lines[i], { atQqs: firstQqs });
       for (const qq of firstQqs) carriedQqs.add(String(qq));
       atCarried = true;
-    } else if (i === 0 && !atCarried && at) {
+    } else if (i === 0 && !atCarried && at && !focus) {   // 点名攻击时,系统不回退去 @ 叫人的人
       await sendReply(entry, lines[i]);
     } else {
       await sendGroupText(gid, lines[i]);                // 已经 @ 过 / 后续补话都不 @
@@ -2797,17 +2818,19 @@ async function belialOnMessage(j) {
   try {
     if (isDeadGroup(gid)) return false;
     let ctx = '', names = null;
-    if (BELIAL_NONAT_CTX > 0) {
+    const ctxPlan = personaTranscriptPlan(BELIAL_NONAT_CTX);
+    if (ctxPlan.count > 0) {
       try {
-        const tr = await fetchTranscript(gid, BELIAL_NONAT_CTX, {
+        const tr = await fetchTranscript(gid, ctxPlan.count, {
           botName: persona.parseName,
           anchorId: entry.message_id,
           beforeSeq: entry.seq,
           beforeTime: entry.time,
           withIds: true,
+          includeBot: ctxPlan.includeBot,
         });
         if (tr?.lines) {
-          ctx = `群聊记录(最近 ${BELIAL_NONAT_CTX} 条,格式 "HH:MM 昵称|内容";带「昨天/前天/M-D」前缀的是更早的消息,不是刚发生):\n${tr.lines}\n\n`;
+          ctx = `群聊记录(最近 ${ctxPlan.count} 条,格式 "HH:MM 昵称|内容";带「昨天/前天/M-D」前缀的是更早的消息,不是刚发生):\n${tr.lines}\n\n`;
           names = tr.names;
         }
       } catch (e) { log('  人格非@取上下文失败(裸答):', e.message, C.yellow); }
@@ -2833,7 +2856,7 @@ async function belialOnMessage(j) {
       scope: { group: entry.group_id, user: entry.user_id },
       query: q,
     });
-    const result = await aiChatBelial(entry, system, `${ctx}刚说话的人: ${entry.nickname}\nTA 的话: ${q}`, images, persona, { at: false });
+    const result = await aiChatBelial(entry, system, `${ctx}刚说话的人: ${entry.nickname}\nTA 的话: ${q}${STALE_ANSWER_HINT}`, images, persona, { at: false });
     const ageMs = Date.now() - (Number(entry.time) || 0) * 1000;
     if (entry.time && ageMs > BELIAL_NONAT_MAX_AGE_MS) {
       log(`  ${persona.cn}(非@)回复过期,跳过:`, `${Math.round(ageMs / 1000)}s > ${Math.round(BELIAL_NONAT_MAX_AGE_MS / 1000)}s`, C.dim);
@@ -4618,12 +4641,18 @@ function giveUpEntry(entry, why) {
 async function processQueue() {
   if (processing) return;
   const pending = [];
+  const pendingSeqs = new Set();          // inbox 里同一 seq 可能有多行(两个实例各写一遍/补漏重写)
   const expired = [];
   if (existsSync(INBOX)) {
     for (const line of readFileSync(INBOX, 'utf8').split('\n')) {
       if (!line.trim()) continue;
       const entry = JSON.parse(line);
       if (processedSeen.has(entry.seq)) continue;
+      if (pendingSeqs.has(entry.seq)) {
+        log('  跳过重复队列条目', `seq=${entry.seq}(inbox 里同一 seq 有多行)`, C.dim);
+        continue;
+      }
+      pendingSeqs.add(entry.seq);
       if (!(entry.text || '').trim()) {
         processedSeen.add(entry.seq); // 纯@ 无文字,忽略
         continue;
@@ -4673,8 +4702,87 @@ async function processQueue() {
   processing = false;
 }
 
+// ---------- 单实例锁(2026-11-26)----------
+function pidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
+}
+// Linux 上再核对一下 cmdline,别把复用了这个 pid 的别的程序当成 monitor;Windows 没有 /proc,只能信 pidAlive。
+function isMonitorPid(pid) {
+  try { return readFileSync(`/proc/${pid}/cmdline`, 'utf8').includes('monitor.mjs'); }
+  catch (e) { return e.code !== 'ENOENT'; }
+}
+// 旧版本的 monitor 不认目录锁,只认 /proc 里还有没有别的 node monitor.mjs。
+// 只认「argv 里有 node 可执行文件 + monitor.mjs 脚本」的进程,排除 tmux/sh -c 那串长命令和自测/dream。
+function otherMonitorPids() {
+  const out = [];
+  if (process.platform !== 'linux') return out;
+  try {
+    for (const d of readdirSync('/proc')) {
+      if (!/^\d+$/.test(d)) continue;
+      const pid = Number(d);
+      if (pid === process.pid) continue;
+      try {
+        const argv = readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0').filter(Boolean);
+        const isNode = argv[0] === 'node' || /\/node$/.test(argv[0] || '');
+        const hasScript = argv.some(a => a.includes('monitor.mjs'));
+        if (isNode && hasScript && !argv.some(a => a.startsWith('--'))) out.push(pid);
+      } catch {}
+    }
+  } catch {}
+  return out;
+}
+function releaseMonitorLock() {
+  try {
+    const pidFile = join(MONITOR_LOCK_DIR, 'pid');
+    if (Number(readFileSync(pidFile, 'utf8')) === process.pid) rmSync(MONITOR_LOCK_DIR, { recursive: true, force: true });
+  } catch {}
+}
+async function acquireMonitorLock() {
+  if (process.argv.includes('--force')) { log('⚠ 跳过单实例锁(--force)', '', C.yellow); return true; }
+  // 旧版本没有目录锁:先扫 /proc,别和游离的 monitor 并存(线上事故就是手动进程还挂着)。
+  for (let i = 0; i < 60; i++) {
+    const others = otherMonitorPids();
+    if (!others.length) break;
+    if (i === 0) log('✗ 发现其它 monitor 进程', `pid=${others.join(',')};不会并发回话,等它退出(最多 60s)`, C.red);
+    await new Promise(r => setTimeout(r, 1000));
+    if (i === 59) { log('✗ 其它 monitor 还在', '杀掉旧进程后再启动(或加 --force)', C.red); return false; }
+  }
+  const pidFile = join(MONITOR_LOCK_DIR, 'pid');
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      mkdirSync(MONITOR_LOCK_DIR);                 // 目录创建是原子的:两个进程只有一个能成功
+      writeFileSync(pidFile, String(process.pid));
+      process.on('exit', releaseMonitorLock);
+      return true;
+    } catch {
+      let old = 0;
+      try { old = Number(readFileSync(pidFile, 'utf8')); } catch {}
+      if (!old) {   // 另一个实例刚 mkdir、还没写 pid:等一下再读,别把它的锁删了
+        await new Promise(r => setTimeout(r, 300));
+        try { old = Number(readFileSync(pidFile, 'utf8')); } catch {}
+      }
+      if (old && old !== process.pid && pidAlive(old) && isMonitorPid(old)) {
+        log('✗ 已有 monitor 在跑', `pid=${old};不会并发回话,等它退出(最多 60s)`, C.red);
+        for (let i = 0; i < 60; i++) {
+          await new Promise(r => setTimeout(r, 1000));
+          if (!pidAlive(old) || !isMonitorPid(old)) break;
+        }
+        if (pidAlive(old) && isMonitorPid(old)) {
+          log('✗ 旧 monitor 还在', `pid=${old};本进程退出。确认没用的旧进程就 kill ${old}(或加 --force)`, C.red);
+          return false;
+        }
+      }
+      try { rmSync(MONITOR_LOCK_DIR, { recursive: true, force: true }); } catch {}   // 过期锁
+    }
+  }
+  log('✗ 拿不到单实例锁', MONITOR_LOCK_DIR, C.red);
+  return false;
+}
+
 // ---------- 退出 ----------
 async function shutdown(stopSnowLuma) {
+  releaseMonitorLock();
   log('正在退出 ...', '', C.yellow);
   for (const pid of claudeChildren) {
     try { process.kill(pid, 'SIGKILL'); } catch {}
@@ -5026,6 +5134,10 @@ function queueSelftest() {
   // ⑤ 放弃阈值本身
   ok(ENTRY_MAX_FAILS >= 1, `连续失败上限 ENTRY_MAX_FAILS=${ENTRY_MAX_FAILS}(≥1,可用 env 调)`);
   ok(typeof entryFails.get === 'function', 'entryFails 计数表就绪(processQueue 用它判「放弃」)');
+  ok(processQueue.toString().includes('pendingSeqs.has(entry.seq)'),
+    'inbox 同一 seq 多行时只处理一次(多实例写重不会重复回)');
+  ok(typeof acquireMonitorLock === 'function' && MONITOR_LOCK_DIR.includes('.monitor.lock'),
+    '有单实例目录锁(两个 monitor 不会同时回话)');
 
   console.log(bad ? `\n✗ ${bad} 项不过` : '\n✓ 队列护栏自测全部通过');
   process.exit(bad ? 1 : 0);
@@ -5380,6 +5492,18 @@ export async function personaSelftest() {
     ok(attackTargetOf({ targets: ['3344195836'] }, '骂两句@译码器灵气流') === '3344195836'
       && attackTargetOf({ targets: ['3344195836'] }, '今天天气不错') === '',
       'attackTargetOf 只对「骂/评价被点名的人」认目标');
+
+    const plan20 = personaTranscriptPlan(20);
+    ok(plan20.count === 40 && plan20.includeBot === true, `人格上下文带上自己的回复,条数翻倍(${plan20.count})`);
+    ok(personaTranscriptPlan(0).count === 0, '上下文数为 0 时不硬取');
+    ok(processAiChat.toString().includes('anchorId: entry.message_id')
+      && processAiChat.toString().includes('beforeSeq: entry.seq'),
+      '上下文锚定到本条消息(不会拿最后一句回答前面的问题)');
+    ok(processAiChat.toString().includes('includeBot: ctxPlan.includeBot')
+      && belialOnMessage.toString().includes('includeBot: ctxPlan.includeBot'),
+      '两条人格路都把 includeBot 传给 fetchTranscript');
+    ok(STALE_ANSWER_HINT.includes('不要再答') && STALE_ANSWER_HINT.includes('只回最后'),
+      '提示词明确「已答过不要再答」');
   } catch (e) {
     ok(false, `注册表/提示词段失败:${e.message}`);
   }
@@ -5393,11 +5517,36 @@ export async function personaSelftest() {
       sent.push(body.params);
       return new Response(JSON.stringify({ status: 'ok', data: { message_id: 7 } }), { status: 200 });
     }
+    if (/127\.0\.0\.1|localhost/.test(String(url)) && body.action === 'get_group_msg_history') {
+      const now = Math.floor(Date.now() / 1000);
+      return new Response(JSON.stringify({ status: 'ok', data: { messages: [
+        { user_id: Number(BOT_ID), sender: { card: '脚刷周' }, time: now, message_seq: 2, message_id: 2,
+          message: [{ type: 'text', data: { text: '已经答过的话' } }] },
+        { user_id: 30001, sender: { card: '何如是' }, time: now, message_seq: 1, message_id: 1,
+          message: [{ type: 'text', data: { text: '旧问题' } }] },
+      ] } }), { status: 200 });
+    }
     if (/127\.0\.0\.1|localhost/.test(String(url))) {
       return new Response(JSON.stringify({ status: 'ok', data: {} }), { status: 200 });
     }
     return realFetch(url, init);
   };
+  try {
+    const nowSec = Math.floor(Date.now() / 1000);
+    const trWith = await fetchTranscript(GID, 10, {
+      botName: '脚刷周', anchorId: 2, beforeSeq: 2, beforeTime: nowSec, includeBot: true,
+    });
+    ok(/你\(脚刷周\)\|已经答过的话/.test(trWith?.lines || ''),
+      'includeBot=true:群聊记录里能看到自己的回复(模型才知道哪些问题答过了)');
+    const trWithout = await fetchTranscript(GID, 10, {
+      botName: '脚刷周', anchorId: 2, beforeSeq: 2, beforeTime: nowSec,
+    });
+    ok(!/你\(脚刷周\)/.test(trWithout?.lines || ''),
+      '普通闲聊不传 includeBot 时仍剔除自己的回复(不改变原行为)');
+  } catch (e) {
+    ok(false, `群聊上下文自测失败:${e.message}`);
+  }
+
   const entry = {
     seq: 999999001, message_id: 999999001, time: Math.floor(Date.now() / 1000),
     group_id: Number(GID), group_name: '自测群', user_id: 30001, nickname: '何如是', text: 'x',
@@ -5495,7 +5644,8 @@ export async function personaSelftest() {
     ok(sent.length === 2 && JSON.stringify(atQqs(sent[0])) === '["10002"]' && msgText(sent[0]) === '卡盒都守不住',
       '点名攻击(骂人的话在正文里):正文第一句直接 @ 被骂的人');
 
-    // 模型要是自己 @ 了叫你的人,也把那个 @ 摘掉(只 @ 被骂的人),那句话降级成普通一句。
+    // 2026-11-26(晚):系统不再事后摘模型点的 @。系统的职责只是**自己不 @ 叫人的人**;
+    // 模型要是自己点名了需求方,就照它给的发(那属于模型的选择,不是系统该偷偷改的)。
     sent.length = 0;
     await sendBelialReply({ ...entry }, '译码器那套灵气流确实唐', {
       persona: spec, at: false, focusQq: '10002',
@@ -5504,10 +5654,10 @@ export async function personaSelftest() {
         { qq: '10002', name: '李四', main: false, text: '卡盒都守不住' },
       ],
     });
-    ok(sent.length === 3 && JSON.stringify(atQqs(sent[0])) === '["10002"]' && msgText(sent[0]) === '卡盒都守不住',
-      '点名攻击:模型自己 @ 需求方也摘掉,骂人的那句仍然第一');
-    ok(sent[1].message.every(s => s.type !== 'at') && sent[2].message.every(s => s.type !== 'at'),
-      '摘掉 @ 之后,后面两句都只发文字');
+    ok(JSON.stringify(atQqs(sent[0])) === '["10002"]' && msgText(sent[0]) === '卡盒都守不住',
+      '点名攻击:骂人的那句仍然第一,@ 的是被骂的人');
+    ok(JSON.stringify(atQqs(sent[2])) === '["30001"]' && msgText(sent[2]) === '不好意思啥',
+      '模型自己点的 @ 需求方照发(系统不再事后摘)');
   } catch (e) {
     ok(false, `发送链路自测失败:${e.message}`);
   } finally {
@@ -5717,8 +5867,9 @@ export async function groupTranscript(groupId, count = 10) {
   return r ? r.lines : '';
 }
 
-function main() {
-connect();
+async function main() {
+  if (!(await acquireMonitorLock())) process.exit(1);
+  connect();
 
 // 纯文本 @ 识别用昵称:启动时拉取当前 QQ 昵称加入集合
 api('get_login_info').then(r => {
